@@ -66,6 +66,101 @@ def mksub(path="/x", uuid="-", parent="-", received="-", ro=True,
     )
 
 
+# ==========================================================================
+# Retention test infrastructure (Part A — pure-logic, no filesystem).
+#   - mktarget: a synthetic *target* Subvol whose dated name matches what
+#     send_receive writes and list_target_snapshots parses, so bucketing sees
+#     the same instant the name encodes. Render the name in LOCAL time, so call
+#     mktarget INSIDE the relevant use_tz(...) block.
+#   - mksource: the correlated *source* Subvol (for pin / Option B scenarios).
+#   - gen_history: emit a target history at a chosen cadence.
+#   - oracle_keep: an INDEPENDENT, group-based reference implementation of the
+#     GFS keep-set, structurally different from the engine's iterative counter,
+#     used to assert _bucket_keep exactly (oracle ≡ engine for every scenario).
+# ==========================================================================
+from datetime import timezone as _timezone, timedelta as _td   # noqa: E402
+
+_UTC = _timezone.utc
+
+
+def mktarget(dt_utc_naive, num, *, source_uuid=None, recv="/recv/host/home"):
+    """A received target at instant `dt_utc_naive` (naive-UTC, as `when` returns).
+    The wrapper name is <localdate>-<offset>-<num>-<short_uuid>; the target carries
+    received_uuid = source uuid so a matching mksource() correlates with it."""
+    uuid = source_uuid or f"{num:08x}-0000-0000-0000-000000000000"
+    short = uuid.split("-")[0]
+    aware = dt_utc_naive.replace(tzinfo=_UTC).astimezone()         # -> system local
+    name = f"{aware.strftime('%Y%m%d-%H%M%z')}-{num}-{short}"
+    return mksub(path=f"{recv}/{name}/snapshot", uuid=uuid, received=uuid,
+                 ro=True, num=num, info_time=dt_utc_naive)
+
+
+def mksource(num, *, source_uuid=None, typ=None, pre=None):
+    """The source snapshot correlated with mktarget(num) (same uuid)."""
+    uuid = source_uuid or f"{num:08x}-0000-0000-0000-000000000000"
+    return mksub(path=f"/.snapshots/{num}/snapshot", uuid=uuid, received="-",
+                 ro=True, num=num, typ=typ, pre=pre)
+
+
+def gen_history(start_utc, end_utc, step, recv="/recv/host/home"):
+    """Targets at `step` cadence over [start, end), numbered 1..N oldest→newest.
+    Call inside use_tz(...) (mktarget renders local-time names)."""
+    out, t, n = [], start_utc, 1
+    while t < end_utc:
+        out.append(mktarget(t, n, recv=recv))
+        t += step
+        n += 1
+    return out
+
+
+def oracle_keep(targets, kd, kw, km, tz):
+    """Reference GFS keep-set: keep the newest target of each of the most recent
+    `lim` POPULATED buckets per class (day/week/month), union; undatable always
+    kept. Group-based — deliberately a different shape from di._bucket_keep's
+    newest-first counter, so agreement is meaningful."""
+    keep, datable = set(), []
+    for t in targets:
+        (keep.add(t.path) if t.when is None else datable.append(t))
+    datable.sort(key=lambda t: t.when, reverse=True)
+
+    def keyset(w):
+        loc = w.replace(tzinfo=_UTC).astimezone() if tz == "local" else w
+        iso = loc.isocalendar()
+        return {"d": (loc.year, loc.month, loc.day),
+                "w": (iso[0], iso[1]),
+                "m": (loc.year, loc.month)}
+
+    for cls, lim in (("d", kd), ("w", kw), ("m", km)):
+        if lim <= 0:
+            continue
+        order, newest = [], {}
+        for t in datable:                      # newest-first
+            b = keyset(t.when)[cls]
+            if b not in newest:
+                newest[b] = t                  # first seen in a bucket = its newest
+                order.append(b)
+        for b in order[:lim]:                  # most-recent `lim` populated buckets
+            keep.add(newest[b].path)
+    return keep
+
+
+def _label(t):
+    """The wrapper dir name (…-<num>-<uuid>) for a target subvol path."""
+    return os.path.basename(os.path.dirname(t.path))
+
+
+_REPORT = bool(os.environ.get("SNAPSEND_REPORT"))
+
+
+def _report(scenario, targets, keep):
+    if not _REPORT:
+        return
+    datable = [t for t in targets if t.when is not None]
+    print(f"\n[retention-report] {scenario}: {len(targets)} targets "
+          f"({len(datable)} datable) -> {len(keep)} kept / "
+          f"{len(targets) - len(keep)} pruned")
+
+
 # --------------------------------------------------------------------------
 # Rule 1 — validity of a received subvolume
 # --------------------------------------------------------------------------
@@ -937,6 +1032,304 @@ class TestPrePost(unittest.TestCase):
 #     If a future btrfs-progs leaves a DIFFERENT signature (e.g. no subvol, or
 #     readonly set), adjust Subvol.is_garbled / is_valid_received to match.
 # ==========================================================================
+
+
+# ==========================================================================
+# PART A — exhaustive pure-logic retention coverage (no filesystem).
+# Each scenario asserts the engine's keep-set EXACTLY against an independent
+# group-based oracle, under BOTH timezone="local" (Australia/Brisbane, UTC+10,
+# no DST) and "utc", plus hand-reasoned spot checks. TZ is pinned for
+# determinism. `_bucket_keep` is the GFS decision; `apply_retention` adds the
+# pin + Option B + pre/post.
+# ==========================================================================
+BNE = "Australia/Brisbane"        # UTC+10, no DST — local != UTC, simple offset
+LON = "Europe/London"             # DST zone for the transition scenarios
+
+
+class TestRetentionExhaustive(unittest.TestCase):
+    """GFS keep-set (`_bucket_keep`) across long spans + irregular cadences."""
+
+    def _assert_matches_oracle(self, targets, kd, kw, km, tz, scenario):
+        nf = sorted(targets, key=lambda t: t.when, reverse=True)
+        keep = di._bucket_keep(nf, kd, kw, km, tz)
+        self.assertEqual(keep, oracle_keep(targets, kd, kw, km, tz),
+                         f"{scenario} [{tz}]: engine keep-set != oracle")
+        _report(f"{scenario} [{tz}] kd={kd} kw={kw} km={km}", targets, keep)
+        return keep
+
+    def _newest_of_each(self, targets, keyfn, tz):
+        """Map bucket-key -> the newest target in that bucket (oracle helper)."""
+        nf = sorted(targets, key=lambda t: t.when, reverse=True)
+        best = {}
+        for t in nf:
+            loc = (t.when.replace(tzinfo=_UTC).astimezone() if tz == "local" else t.when)
+            k = keyfn(loc)
+            best.setdefault(k, t)
+        return best
+
+    # (1) Multi-year dense hourly --------------------------------------------
+    def test_multi_year_hourly(self):
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                hist = gen_history(datetime(2024, 1, 1, 0, 0),
+                                   datetime(2026, 1, 1, 0, 0), _td(hours=1))
+                keep = self._assert_matches_oracle(hist, 14, 8, 6, tz, "multi-year-hourly")
+            # union never exceeds the sum of class limits, and is >= the largest class
+            self.assertLessEqual(len(keep), 14 + 8 + 6)
+            self.assertGreaterEqual(len(keep), 14)
+            # the newest snapshot is always kept (newest day+week+month)
+            newest = max(hist, key=lambda t: t.when)
+            self.assertIn(newest.path, keep)
+            # exactly 14 distinct local/utc days are represented among kept dailies
+            day = (lambda loc: (loc.year, loc.month, loc.day))
+            kept_days = {day(t.when.replace(tzinfo=_UTC).astimezone() if tz == "local" else t.when)
+                         for t in hist if t.path in keep}
+            self.assertGreaterEqual(len(kept_days), 14)   # >=14 (weekly/monthly add older days)
+
+    # (2) Sporadic — every ~3 weeks (empty buckets must not consume quota) ----
+    def test_sporadic_every_three_weeks(self):
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                hist = gen_history(datetime(2024, 1, 1, 12, 0),
+                                   datetime(2026, 1, 1, 0, 0), _td(weeks=3))
+                keep = self._assert_matches_oracle(hist, 0, 8, 6, tz, "sporadic-3wk")
+            # each snapshot is alone in its week -> weekly keeps the 8 most recent
+            # POPULATED weeks (not "8 calendar weeks then stop"): so 8 newest kept by weekly.
+            nf = sorted(hist, key=lambda t: t.when, reverse=True)
+            weekly_expected = {t.path for t in nf[:8]}
+            self.assertTrue(weekly_expected <= keep,
+                            "the 8 most recent (each its own week) must all survive")
+            # monthly adds up to 6 more older populated months; nothing in the kept
+            # window is dropped because a neighbouring week is empty.
+
+    # (3) Sporadic — every ~2 months ----------------------------------------
+    def test_sporadic_every_two_months(self):
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                hist = gen_history(datetime(2023, 1, 15, 9, 0),
+                                   datetime(2026, 1, 1, 0, 0), _td(days=61))
+                keep = self._assert_matches_oracle(hist, 3, 4, 6, tz, "sporadic-2mo")
+            nf = sorted(hist, key=lambda t: t.when, reverse=True)
+            # monthly keeps the 6 most recent populated months; union with daily/weekly
+            # never deletes something monthly should keep.
+            monthly_expected = {t.path for t in nf[:6]}
+            self.assertTrue(monthly_expected <= keep)
+
+    # (4) Sporadic — yearly-ish over 5+ years --------------------------------
+    def test_sporadic_yearly_ish(self):
+        with use_tz(BNE):
+            # one every ~10 months across ~6 years
+            hist = gen_history(datetime(2020, 3, 10, 8, 0),
+                               datetime(2026, 1, 1, 0, 0), _td(days=305))
+            for tz in ("local", "utc"):
+                keep = self._assert_matches_oracle(hist, 2, 3, 6, tz, "yearly-ish")
+                nf = sorted(hist, key=lambda t: t.when, reverse=True)
+                # "don't nuke my only yearly backup": the 6 newest (each its own
+                # month) survive via monthly; the very oldest beyond all limits prune.
+                self.assertTrue({t.path for t in nf[:6]} <= keep)
+                self.assertNotIn(nf[-1].path, keep)       # oldest, beyond all classes
+
+    # (5) Mixed cadence: hourly recent, daily prior, monthly old -------------
+    def test_mixed_cadence(self):
+        with use_tz(BNE):
+            recent = gen_history(datetime(2025, 12, 1, 0, 0),
+                                 datetime(2026, 1, 1, 0, 0), _td(hours=1))
+            daily = gen_history(datetime(2025, 6, 1, 12, 0),
+                                datetime(2025, 12, 1, 0, 0), _td(days=1))
+            monthly = gen_history(datetime(2023, 1, 1, 12, 0),
+                                  datetime(2025, 6, 1, 0, 0), _td(days=30))
+            hist = recent + daily + monthly
+            for tz in ("local", "utc"):
+                self._assert_matches_oracle(hist, 14, 8, 6, tz, "mixed-cadence")
+
+    # (6) Boundary precision -------------------------------------------------
+    def test_boundary_local_midnight(self):
+        # Two instants in the UTC-day-boundary window for UTC+10 (00:00–10:00 BNE):
+        #   A = 23:00 UTC Jun26 -> 09:00 BNE Jun27
+        #   B = 16:00 UTC Jun27 -> 02:00 BNE Jun28
+        # Same NOTHING in common UTC-day grouping vs local. keep_daily=1.
+        a = datetime(2026, 6, 26, 23, 0)
+        b = datetime(2026, 6, 27, 16, 0)
+        with use_tz(BNE):
+            A, B = mktarget(a, 1), mktarget(b, 2)
+            keep_local = di._bucket_keep([B, A], 1, 0, 0, "local")
+        keep_utc = di._bucket_keep([B, A], 1, 0, 0, "utc")
+        # local: A is Jun27, B is Jun28 -> different local days; keep_daily=1 keeps
+        # only the newest local day (B).
+        self.assertEqual(keep_local, {B.path})
+        # utc: A is Jun26, B is Jun27 -> different utc days too; newest utc day (B).
+        self.assertEqual(keep_utc, {B.path})
+        # The DIFFERENCE shows with keep_daily=2 when local & utc disagree on grouping:
+        # add C = 13:00 UTC Jun27 (= 23:00 BNE Jun27, same local day as A, same utc day as B)
+        with use_tz(BNE):
+            C = mktarget(datetime(2026, 6, 27, 13, 0), 3)
+            kl = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 2, 0, 0, "local")
+        ku = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 2, 0, 0, "utc")
+        # local days: Jun27 {A(09:00),C(23:00)} -> newest C ; Jun28 {B} -> B.  keep {C,B}
+        self.assertEqual(kl, {C.path, B.path})
+        # utc days:   Jun26 {A} ; Jun27 {C(13:00),B(16:00)} -> newest B.  keep {B,A}
+        self.assertEqual(ku, {B.path, A.path})
+
+    def test_boundary_month_edge(self):
+        # 31 Jan 23:30 BNE vs 01 Feb 00:30 BNE -> different local months.
+        jan = datetime(2026, 1, 31, 13, 30)   # 23:30 BNE Jan31
+        feb = datetime(2026, 1, 31, 14, 30)   # 00:30 BNE Feb01
+        with use_tz(BNE):
+            J, F = mktarget(jan, 1), mktarget(feb, 2)
+            keep = di._bucket_keep([F, J], 0, 0, 2, "local")   # keep_monthly=2
+        # distinct local months Jan + Feb -> both kept
+        self.assertEqual(keep, {J.path, F.path})
+
+    def test_boundary_iso_week_edge(self):
+        # Sunday vs Monday straddle an ISO-week boundary (UTC here for clarity).
+        sun = datetime(2026, 6, 28, 12, 0)    # Sunday  -> ISO week 26
+        mon = datetime(2026, 6, 29, 12, 0)    # Monday  -> ISO week 27
+        S, M = mktarget(sun, 1), mktarget(mon, 2)
+        keep = di._bucket_keep([M, S], 0, 2, 0, "utc")        # keep_weekly=2
+        self.assertEqual(keep, {S.path, M.path})              # distinct ISO weeks
+        keep1 = di._bucket_keep([M, S], 0, 1, 0, "utc")
+        self.assertEqual(keep1, {M.path})                     # newest week only
+
+    def test_boundary_leap_day(self):
+        # 29 Feb 2024 must bucket as its own day and not be dropped/duplicated.
+        leap = datetime(2024, 2, 29, 12, 0)
+        before = datetime(2024, 2, 28, 12, 0)
+        after = datetime(2024, 3, 1, 12, 0)
+        targets = [mktarget(before, 1), mktarget(leap, 2), mktarget(after, 3)]
+        keep = di._bucket_keep(sorted(targets, key=lambda t: t.when, reverse=True),
+                               3, 0, 0, "utc")
+        self.assertEqual(len(keep), 3)                        # 3 distinct days kept
+        self.assertEqual(keep, {t.path for t in targets})
+
+    def test_boundary_dst_transition_no_overprune(self):
+        # Europe/London spring-forward 2026-03-29 and fall-back 2026-10-25.
+        # Hourly across both; assert the engine matches the oracle (the documented
+        # cosmetic ±1/day) and never prunes beyond policy or crashes.
+        with use_tz(LON):
+            hist = gen_history(datetime(2026, 3, 1, 0, 0),
+                               datetime(2026, 11, 1, 0, 0), _td(hours=1))
+            nf = sorted(hist, key=lambda t: t.when, reverse=True)
+            keep = di._bucket_keep(nf, 14, 8, 6, "local")
+            # oracle must convert under the SAME pinned zone -> assert inside the block
+            self.assertEqual(keep, oracle_keep(hist, 14, 8, 6, "local"))
+        self.assertLessEqual(len(keep), 14 + 8 + 6 + 1)       # at most a 1-day cosmetic excess
+        _report("dst-transition [local]", hist, keep)
+
+    # (10) Zero-limit / disabled classes ------------------------------------
+    def test_zero_limit_classes(self):
+        with use_tz(BNE):
+            hist = gen_history(datetime(2025, 1, 1, 0, 0),
+                               datetime(2025, 3, 1, 0, 0), _td(days=1))
+        nf = sorted(hist, key=lambda t: t.when, reverse=True)
+        # only weekly enabled
+        self.assertEqual(di._bucket_keep(nf, 0, 4, 0, "utc"),
+                         oracle_keep(hist, 0, 4, 0, "utc"))
+        # all-zero -> nothing kept by GFS (pin/source-backed are added by
+        # apply_retention, not here)
+        self.assertEqual(di._bucket_keep(nf, 0, 0, 0, "utc"), set())
+
+    # (11) Undatable safety --------------------------------------------------
+    def test_undatable_never_deleted_amid_history(self):
+        with use_tz(BNE):
+            hist = gen_history(datetime(2025, 1, 1, 0, 0),
+                               datetime(2025, 2, 1, 0, 0), _td(days=1))
+        bad = mksub(path="/recv/host/home/garbled-name/snapshot", uuid="g", info_time=None)
+        nf = sorted(hist + [bad], key=lambda t: (t.when or datetime.min), reverse=True)
+        keep = di._bucket_keep(nf, 7, 2, 1, "utc")
+        self.assertIn(bad.path, keep)                         # never delete the unparseable one
+        self.assertEqual(keep, oracle_keep(hist + [bad], 7, 2, 1, "utc"))
+
+
+class TestRetentionApplyInteractions(unittest.TestCase):
+    """End-to-end `apply_retention` with the remote calls stubbed: exact prune-set
+    including the pin (Rule 3), Option B source-backed, and root pre/post pairs."""
+
+    def setUp(self):
+        import subprocess as sp
+        self._orig_remote = di.run_remote
+        self._orig_latest = di._update_latest_symlink
+        self.deleted = []          # wrapper paths that got `subvolume delete`
+
+        def fake_remote(cfg, cmd, *, check=True):
+            if "subvolume delete" in cmd:
+                self.deleted.append(cmd)
+            return sp.CompletedProcess(["ssh"], 0, "", "")
+
+        di.run_remote = fake_remote
+        di._update_latest_symlink = lambda *a, **k: None
+
+    def tearDown(self):
+        di.run_remote = self._orig_remote
+        di._update_latest_symlink = self._orig_latest
+
+    def _cfg(self, kd, kw, km, tz="utc"):
+        return di.Config(server_host="h", retention_timezone=tz, retention={
+            "default": {"keep_daily": kd, "keep_weekly": kw, "keep_monthly": km}})
+
+    def _run(self, name, sources, targets, kd, kw, km, tz="utc"):
+        self.deleted = []
+        di.apply_retention(self._cfg(kd, kw, km, tz), name, sources, targets, "/recv/host/home")
+        deleted = {t.path for t in targets if any(t.path in c for c in self.deleted)}
+        kept = {t.path for t in targets} - deleted
+        _report(f"apply:{name}", targets, kept)
+        return kept, deleted
+
+    # (7) Pin (Rule 3): pinned parent kept even when GFS would drop it --------
+    def test_pin_kept_even_when_gfs_would_drop(self):
+        with use_tz(BNE):
+            # two snapshots same day; GFS keep_daily=1 would keep only the newer.
+            older = mktarget(datetime(2026, 6, 27, 1, 0), 1)   # older, same day
+            newer = mktarget(datetime(2026, 6, 27, 9, 0), 2)   # newer, same day
+        # source exists ONLY for the older one -> it is the newest correlated pair
+        # (the pin) AND source-backed; assert it survives though GFS prefers `newer`.
+        src_older = mksource(1)
+        kept, deleted = self._run("home", [src_older], [newer, older], 1, 0, 0)
+        self.assertIn(older.path, kept)            # pinned parent kept
+        self.assertNotIn(older.path, deleted)
+        self.assertIn(newer.path, kept)            # GFS daily rep also kept
+
+    # (8) Option B (source-backed) ------------------------------------------
+    def test_option_b_steady_state_prunes_nothing(self):
+        with use_tz(BNE):
+            hist = gen_history(datetime(2026, 1, 1, 0, 0),
+                               datetime(2026, 1, 11, 0, 0), _td(days=1))
+        sources = [mksource(t.snapper_num) for t in hist]      # every target source-backed
+        kept, deleted = self._run("home", sources, hist, 1, 0, 0)
+        self.assertEqual(deleted, set())                       # nothing pruned
+
+    def test_option_b_long_tail_prunes_but_keeps_source_backed(self):
+        with use_tz(BNE):
+            hist = gen_history(datetime(2026, 1, 1, 0, 0),
+                               datetime(2026, 1, 11, 0, 0), _td(days=1))   # 10 daily
+        # source still holds only the 3 newest; the older 7 are long tail.
+        nf = sorted(hist, key=lambda t: t.when, reverse=True)
+        live = nf[:3]
+        sources = [mksource(t.snapper_num) for t in live]
+        kept, deleted = self._run("home", sources, hist, 2, 0, 0)   # keep_daily=2
+        for t in live:
+            self.assertIn(t.path, kept)                        # all source-backed kept
+        # long tail (sources gone) beyond keep_daily=2 is pruned; the GFS-kept
+        # newest-2-days overlap the live set, so pruned = the 7 old ones minus any
+        # the pin protects. The very oldest must be gone:
+        self.assertIn(nf[-1].path, deleted)
+        # server stays bounded: at least some long-tail pruning happened
+        self.assertTrue(deleted)
+
+    # (9) Pre/post pairs (root) ---------------------------------------------
+    def test_prepost_pair_not_orphaned(self):
+        with use_tz(BNE):
+            # pre #3 and post #4 on the same day; a newer #5 next day.
+            t_pre = mktarget(datetime(2026, 6, 27, 8, 0), 3)
+            t_post = mktarget(datetime(2026, 6, 27, 8, 1), 4)
+            t_new = mktarget(datetime(2026, 6, 28, 9, 0), 5)
+        # sources: pre/post pair (no source for #5 -> long tail), so without the
+        # nicety GFS(keep_daily=1) would keep only #5 and drop the pair.
+        s_pre = mksource(3, typ="pre")
+        s_post = mksource(4, typ="post", pre=3)
+        kept, deleted = self._run("root", [s_pre, s_post], [t_new, t_post, t_pre], 1, 0, 0)
+        # pre & post are source-backed (their sources exist) -> both kept, pair intact
+        self.assertIn(t_pre.path, kept)
+        self.assertIn(t_post.path, kept)
 
 
 if __name__ == "__main__":

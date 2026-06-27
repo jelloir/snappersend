@@ -471,7 +471,8 @@ class TestLoadConfig(unittest.TestCase):
         self.assertFalse(cfg.use_mbuffer)
         self.assertFalse(cfg.boot_backup_enabled)
         self.assertEqual(cfg.boot_paths, ("/boot",))
-        self.assertEqual(cfg.subvols["home"]["recv_dir"], "/srv/snapshots-recv/home")
+        self.assertEqual(cfg.subvols["home"]["mountpoint"], "/home")
+        self.assertNotIn("recv_dir", cfg.subvols["home"])   # composed, not stored
         self.assertEqual(cfg.retention_for("home")["keep_daily"], 9)
 
     def test_retention_default_injected_when_absent(self):
@@ -536,8 +537,11 @@ class TestSendReceive(unittest.TestCase):
         di.run_remote = fake_remote
         di._update_latest_symlink = lambda cfg, rd, name: self.latest_updated.append(name)
         self.cfg = di.Config(server_host="h", use_mbuffer=False)
+        # known source timestamp -> dated name 20260627-1300-7-a2159d69
         self.snap = mksub(path="/home/.snapshots/7/snapshot",
-                          uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd", num=7)
+                          uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd", num=7,
+                          info_time=datetime(2026, 6, 27, 13, 0, 0))
+        self.expected_name = "20260627-1300-7-a2159d69"
 
     def tearDown(self):
         for k, v in self._orig.items():
@@ -567,7 +571,7 @@ class TestSendReceive(unittest.TestCase):
         self.assertTrue(ok)
         self._no_mv_anywhere()
         self.assertEqual(self._count("subvolume delete"), 1)  # only the pre-clean
-        self.assertEqual(self.latest_updated, ["7-a2159d69"]) # <num>-<short_uuid>
+        self.assertEqual(self.latest_updated, [self.expected_name])  # <date>-<num>-<short_uuid>
 
     def test_receive_target_is_the_final_dir(self):
         # The btrfs receive (in the ssh argv handed to the pipe) targets the FINAL
@@ -579,10 +583,10 @@ class TestSendReceive(unittest.TestCase):
         self.assertEqual(len(self.pipe_ssh), 1)
         joined = " ".join(self.pipe_ssh[0])
         self.assertIn("sudo btrfs receive", joined)
-        self.assertIn("/srv/snapshots-recv/home/7-a2159d69", joined)
+        self.assertIn(f"/srv/snapshots-recv/home/{self.expected_name}", joined)
         # and the mkdir prepares exactly that final dir
-        self.assertTrue(any("mkdir -p" in c and "/srv/snapshots-recv/home/7-a2159d69" in c
-                            and c.endswith("7-a2159d69") for c in self.remote_cmds))
+        self.assertTrue(any("mkdir -p" in c and f"/srv/snapshots-recv/home/{self.expected_name}" in c
+                            and c.endswith(self.expected_name) for c in self.remote_cmds))
 
     def test_garble_is_cleaned_up_and_fails(self):
         self._capture_pipe(True)
@@ -628,10 +632,10 @@ class TestTargetLayout(unittest.TestCase):
             setattr(di, k, v)
 
     def test_enumeration_reads_name_snapshot_and_parses_num(self):
-        # `ls -1 recv_dir` lists wrapper dirs + the .latest symlink.
-        recv = "/srv/snapshots-recv/root"
+        # `ls -1 recv_dir` lists dated wrapper dirs + the .latest symlink.
+        recv = "/srv/snapshots-recv/millionaire/root"
         di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
-            ["ssh"], 0, "3-aabbccdd\n7-11223344\nroot.latest\n", "")
+            ["ssh"], 0, "20260627-1300-3-aabbccdd\n20260627-1500-7-11223344\nroot.latest\n", "")
         asked = []
 
         def fake_show(cfg, path):
@@ -642,25 +646,138 @@ class TestTargetLayout(unittest.TestCase):
         out = di.list_target_snapshots(self.cfg, recv)
 
         # The subvol is read one level DOWN, at <name>/snapshot ...
-        self.assertIn(f"{recv}/3-aabbccdd/snapshot", asked)
-        self.assertIn(f"{recv}/7-11223344/snapshot", asked)
+        self.assertIn(f"{recv}/20260627-1300-3-aabbccdd/snapshot", asked)
+        self.assertIn(f"{recv}/20260627-1500-7-11223344/snapshot", asked)
         # ... the .latest symlink is skipped ...
         self.assertFalse(any("latest" in p for p in asked))
-        # ... and the snapper_num is recovered from the DIRECTORY name.
+        # ... snapper_num recovered from the 3rd field of the DIRECTORY name ...
         self.assertEqual(sorted(s.snapper_num for s in out), [3, 7])
+        # ... and the date prefix is parsed into `when` for ordering.
+        by_num = {s.snapper_num: s for s in out}
+        self.assertEqual(by_num[3].when, datetime(2026, 6, 27, 13, 0))
+        self.assertEqual(by_num[7].when, datetime(2026, 6, 27, 15, 0))
 
     def test_latest_symlink_targets_the_snapshot_subvol(self):
-        recv = "/srv/snapshots-recv/root"
+        recv = "/srv/snapshots-recv/millionaire/root"
         issued = []
         di.run_remote = lambda cfg, cmd, *, check=True: (
             issued.append(cmd) or self.sp.CompletedProcess(["ssh"], 0, "", ""))
-        di._update_latest_symlink(self.cfg, recv, "7-11223344")
+        di._update_latest_symlink(self.cfg, recv, "20260627-1500-7-11223344")
         self.assertEqual(len(issued), 1)
         cmd = issued[0]
         self.assertIn("ln -sfn", cmd)
         # link target is the SUBVOL (…/snapshot), not the wrapper dir
-        self.assertIn(f"{recv}/7-11223344/snapshot", cmd)
+        self.assertIn(f"{recv}/20260627-1500-7-11223344/snapshot", cmd)
         self.assertIn(f"{recv}/root.latest", cmd)
+
+
+# --------------------------------------------------------------------------
+# Per-host destination + dated folder names (SPEC §4/§5.2/§8):
+#   <recv_base>/<hostname>/<subvol>/<YYYYMMDD-HHMM>-<num>-<short_uuid>/snapshot
+# --------------------------------------------------------------------------
+class TestPerHostDatedLayout(unittest.TestCase):
+    def setUp(self):
+        import subprocess as sp
+        self.sp = sp
+        self._orig = {k: getattr(di, k) for k in
+                      ("run_remote", "_run_pipe", "show_remote", "_update_latest_symlink")}
+        self.latest = []
+        self.pipe_ssh = []
+        di.run_remote = lambda cfg, cmd, *, check=True: sp.CompletedProcess(["ssh"], 0, "", "")
+        di._update_latest_symlink = lambda cfg, rd, name: self.latest.append(name)
+
+        def _pipe(send_argv, ssh_argv, use_mbuffer):
+            self.pipe_ssh.append(" ".join(ssh_argv))
+            return True
+        di._run_pipe = _pipe
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(di, k, v)
+
+    def _send_name(self, snap, recv_dir="/srv/snapshots-recv/millionaire/home"):
+        """Run send_receive (mocked) and return the wrapper-dir name it chose.
+        The received subvol is a valid clean receive (readonly + received_uuid set)
+        regardless of the source uuid, so the sentinel cases still succeed."""
+        di.show_remote = lambda cfg, p: mksub(path=p, uuid="srv", received="rcv-ok")
+        cfg = di.Config(server_host="h", use_mbuffer=False)
+        ok = di.send_receive(cfg, snap, recv_dir, None)
+        self.assertTrue(ok)
+        return self.latest[-1]
+
+    # (1) path composition --------------------------------------------------
+    def test_recv_dir_composition_per_host(self):
+        cfg = di.Config(server_host="h")                 # default recv_base
+        self.assertEqual(cfg.recv_dir_for("millionaire", "home"),
+                         "/srv/snapshots-recv/millionaire/home")
+        self.assertEqual(cfg.recv_dir_for("server2", "root"),
+                         "/srv/snapshots-recv/server2/root")
+
+    def test_host_segment_derived_from_gethostname(self):
+        # the host segment is socket.gethostname() — derived, never configured
+        orig = di.socket.gethostname
+        di.socket.gethostname = lambda: "millionaire"
+        try:
+            host = di.socket.gethostname()
+            cfg = di.Config(server_host="h", recv_base="/data/recv")
+            self.assertEqual(cfg.recv_dir_for(host, "home"), "/data/recv/millionaire/home")
+        finally:
+            di.socket.gethostname = orig
+
+    # (2) dated name format -------------------------------------------------
+    def test_dated_name_format_no_colon(self):
+        snap = mksub(path="/home/.snapshots/8/snapshot",
+                     uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd", num=8,
+                     info_time=datetime(2026, 6, 27, 13, 0, 0))
+        name = self._send_name(snap)
+        self.assertEqual(name, "20260627-1300-8-a2159d69")
+        self.assertNotIn(":", name)                       # colon-free is mandatory
+        # the receive target is <recv_dir>/<name> (subvol lands as .../snapshot)
+        self.assertTrue(any(name in s and "sudo btrfs receive" in s for s in self.pipe_ssh))
+
+    # (3) nodate / nouuid sentinels ----------------------------------------
+    def test_sentinels_when_no_timestamp_or_uuid(self):
+        snap = mksub(path="/home/.snapshots/9/snapshot", uuid="-", num=9, info_time=None)
+        name = self._send_name(snap)
+        self.assertEqual(name, "nodate-9-nouuid")          # no crash, still unique-ish
+        self.assertNotIn(":", name)
+
+    # (4) enumeration round-trip -------------------------------------------
+    def test_enumeration_round_trip(self):
+        recv = "/srv/snapshots-recv/millionaire/home"
+        di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
+            ["ssh"], 0, "20260627-1300-8-a2159d69\n", "")
+        di.show_remote = lambda cfg, p: mksub(path=p, uuid="x", received="src", ro=True)
+        out = di.list_target_snapshots(di.Config(server_host="h"), recv)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].snapper_num, 8)
+        self.assertEqual(out[0].when, datetime(2026, 6, 27, 13, 0))
+
+    # (5) ordering by date across a day boundary ---------------------------
+    def test_ordering_by_date_across_day_boundary(self):
+        recv = "/srv/snapshots-recv/millionaire/root"
+        # deliberately listed out of order; nums do NOT match chronological order
+        listing = ("20260628-0100-2-bbbb\n"     # newest (next day, 01:00)
+                   "20260627-2300-9-aaaa\n"     # older  (prev day, 23:00)
+                   "20260627-0900-5-cccc\n")    # oldest (prev day, 09:00)
+        di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
+            ["ssh"], 0, listing, "")
+        di.show_remote = lambda cfg, p: mksub(path=p, uuid="x", received="src", ro=True)
+        out = di.list_target_snapshots(di.Config(server_host="h"), recv)
+        newest_first = sorted(out, key=lambda t: t.when, reverse=True)
+        self.assertEqual([t.snapper_num for t in newest_first], [2, 9, 5])
+
+    # (6) .latest -> .../snapshot under the dated name ---------------------
+    def test_latest_resolves_to_snapshot_under_dated_name(self):
+        recv = "/srv/snapshots-recv/millionaire/home"
+        issued = []
+        di.run_remote = lambda cfg, cmd, *, check=True: (
+            issued.append(cmd) or self.sp.CompletedProcess(["ssh"], 0, "", ""))
+        # use the real _update_latest_symlink (setUp stubbed it for the send tests)
+        self._orig["_update_latest_symlink"](di.Config(server_host="h"), recv,
+                                             "20260627-1300-8-a2159d69")
+        self.assertIn(f"{recv}/20260627-1300-8-a2159d69/snapshot", issued[0])
+        self.assertIn(f"{recv}/home.latest", issued[0])
 
 
 # --------------------------------------------------------------------------

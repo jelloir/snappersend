@@ -193,30 +193,50 @@ long on server). The single invariant (Rule 3 / §3) — keep at least one share
 snapshot as parent — is guaranteed by hourly operation against a 48-hourly
 Snapper window.
 
-### Server-side naming scheme (decided)
+### Server-side layout & naming scheme (decided)
 
-Each received snapshot lives in a per-transfer **directory**, with the subvol one
-level down (the subvol is always named `snapshot` by `btrfs receive` — §5.2):
+Every tier lives under a **per-host** subtree, so multiple machines share one
+server with zero collision. The host segment is `socket.gethostname()` — derived
+automatically, never configured (it's a fact about the machine, not a preference),
+and shared by the snapshot tiers and the boot tier so they never diverge:
 
 ```
-<recv_dir>/<snapper_num>-<short_uuid>/snapshot      e.g.  root/24-a2159d69/snapshot
+<recv_base>/                                         e.g. /srv/snapshots-recv
+└── <hostname>/                                           millionaire/
+    ├── home/<date>-<num>-<short_uuid>/snapshot           home/20260627-1300-8-a2159d69/snapshot
+    ├── root/<date>-<num>-<short_uuid>/snapshot
+    ├── boot/                                             (boot tier — §11)
+    └── boot-efi/
 ```
 
-- `snapper_num`: the source Snapper number **at send time** — human-readable,
-  mirrors how Snapper presents snapshots (the "keep the numbering" goal).
-- `short_uuid`: first 8 hex chars of the source `uuid` — guarantees uniqueness
-  on the server even as laptop numbers churn/repeat over months, and ties the
-  directory name to the correlation key.
+A subvol's destination is composed at runtime as
+`<recv_base>/<hostname>/<subvol_name>`; each received snapshot then lives in a
+per-transfer **directory** named `<date>-<num>-<short_uuid>`, with the subvol one
+level down (`btrfs receive` always names it `snapshot` — §5.2):
 
-The wrapper directory `<snapper_num>-<short_uuid>` mirrors Snapper's own
-`<N>/snapshot` layout and lets every snapshot be received directly into its final
-home (no subvolume `mv` — §5.2). Enumeration reads the subvol at `<name>/snapshot`
-but recovers `snapper_num` from the **directory** name; retention deletes the
-subvol then `rmdir`s the wrapper.
+- `date`: the **source snapshot's own** timestamp (`Subvol.when`: info.xml date,
+  else btrfs creation time), formatted `%Y%m%d-%H%M` — **colon-free** by design
+  (ISO `HH:MM` colons are legal on Linux but break tooling and are awful to type;
+  do NOT use `datetime.isoformat()`). The date **leads** so `ls` of the receive
+  area sorts chronologically. A missing timestamp falls back to the literal
+  `nodate`.
+- `num`: the source Snapper number **at send time** — human-readable, mirrors how
+  Snapper presents snapshots.
+- `short_uuid`: first 8 hex chars of the source `uuid` — guarantees uniqueness on
+  the server even as laptop numbers churn/repeat over months, and ties the
+  directory name to the correlation key. Falls back to `nouuid` if absent.
+
+The wrapper directory mirrors Snapper's own `<N>/snapshot` layout and lets every
+snapshot be received directly into its final home (no subvolume `mv` — §5.2).
+Enumeration reads the subvol at `<name>/snapshot`, recovers `num` from the
+directory name, and parses the leading `<date>` into the subvol's `when` so
+ordering/retention key on the **source-snapshot time** (robust against btrfs
+receive-time running out of order across re-sends); retention deletes the subvol
+then `rmdir`s the wrapper.
 
 The `<recv_dir>/<subvol>.latest` symlink always points at the newest received
-subvol `<num>-<short_uuid>/snapshot` (by send order), giving restic a stable
-target. This is our own equivalent of btrbk's `latest` pointer.
+subvol `<date>-<num>-<short_uuid>/snapshot`, giving restic a stable target. This
+is our own equivalent of btrbk's `latest` pointer.
 
 ### Pre/post pair handling (root only)
 
@@ -254,8 +274,9 @@ btrfs send -p P.path SRC | [mbuffer |] ssh SERVER "sudo btrfs receive RECV_DIR"
    literally named `snapshot`, so `btrfs receive DIR` always writes a child
    subvol named `DIR/snapshot`. To keep each received snapshot uniquely named on
    the server, receive each one directly into its **own final per-transfer
-   directory**:
-   - `final_dir = RECV_DIR/<num>-<short_uuid>`
+   directory** (`RECV_DIR = <recv_base>/<hostname>/<subvol>`, composed at runtime
+   — §4):
+   - `final_dir = RECV_DIR/<date>-<num>-<short_uuid>`  (date = `%Y%m%d-%H%M`, §4)
    - `ssh ... sudo mkdir -p final_dir`
    - `btrfs send [-p P] SRC | [mbuffer |] ssh ... sudo btrfs receive final_dir`
    - the subvol lands as `final_dir/snapshot` and is **never moved**.
@@ -402,21 +423,24 @@ ssh_port = 22
 user     = "snapsend"
 ssh_key  = "/etc/snapsend/ssh/id_ed25519"
 use_mbuffer = true
+# Single base for ALL tiers. Each tier is composed at runtime as
+# <recv_base>/<hostname>/...  (hostname = socket.gethostname(), derived — §4):
+#   snapshots -> <recv_base>/<hostname>/<subvol>/<date>-<num>-<short_uuid>/snapshot
+#   boot      -> <recv_base>/<hostname>/{boot,boot-efi}
+recv_base = "/srv/snapshots-recv"
 
 # Non-Btrfs boot tier (rsync mirror, not versioned — see §11).
 [boot]
 enabled   = true
 paths     = ["/boot", "/boot/efi"]   # efi nested last
-recv_base = "/srv/snapshots-recv"    # -> /<hostname>/{boot,boot-efi}
 
-# One table per replicated subvolume.
+# One table per replicated subvolume — `mountpoint` only. The destination is
+# composed from [server].recv_base + hostname + the table name (no recv_dir here).
 [subvolumes.home]
 mountpoint = "/home"          # where Snapper's .snapshots lives
-recv_dir   = "/srv/snapshots-recv/home"
 
 [subvolumes.root]
 mountpoint = "/"
-recv_dir   = "/srv/snapshots-recv/root"
 
 # TARGET-side retention only (source is Snapper-owned — Decision 1). GFS thinning
 # applies ONLY to the long tail (snapshots the source has aged out); every target
@@ -440,7 +464,7 @@ has no CLI equivalent — it is file-only policy.
 
 The server receive directory and `.latest` contract are identical to the
 btrbk-send design, so the **restic-on-server** component (next milestone) can
-point at `/srv/snapshots-recv/<subvol>/<subvol>.latest` regardless of which
+point at `<recv_base>/<hostname>/<subvol>/<subvol>.latest` regardless of which
 sender is in use. This keeps the downstream restic tier decoupled from this
 decision.
 
@@ -521,8 +545,10 @@ server, and from a separate bash helper into a Python function.
 ### Behaviour
 
 - `rsync -aAX --delete` each boot path to
-  `/srv/snapshots-recv/<hostname>/<name>/`, where `/boot -> boot/` and
-  `/boot/efi -> boot-efi/` (matches the original naming).
+  `<recv_base>/<hostname>/<name>/`, where `/boot -> boot/` and
+  `/boot/efi -> boot-efi/` (matches the original naming). The `<recv_base>` and
+  the resolved `<hostname>` are the **same** ones the snapshot tiers use (§4), so
+  the full per-host subtree is consistent: `<host>/{home,root,boot,boot-efi}`.
 - Runs over SSH with `--rsync-path "sudo rsync"` so the remote side can write
   the receive area as the unprivileged `snapsend` transport user.
 - **Single current copy only.** No versioning here — and it doesn't need any,
@@ -546,7 +572,7 @@ server, and from a separate bash helper into a Python function.
   that existing recovery flow — no new restore code needed.
 
 Encoded as: `boot_backup(cfg, hostname)` + the `[boot]` config table +
-`Config.boot_backup_enabled/boot_paths/boot_recv_base`.
+`Config.boot_backup_enabled/boot_paths` + the shared `Config.recv_base`.
 
 ---
 

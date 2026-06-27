@@ -143,17 +143,44 @@ parent (Rule 3) is always kept regardless of the numbers.
 
 ## Server layout & the restore pointer
 
-Received subvolumes are named `<snapper_num>-<short_uuid>` (e.g. `24-a2159d69`),
-and `<recv_dir>/<subvol>.latest` always points at the newest received subvol —
-the stable target for the downstream **restic-on-server** tier, regardless of
-which sender produced it.
+Every tier lands under a **per-host** subtree, so several machines can share one
+server with zero collision. The host segment is derived automatically
+(`socket.gethostname()`), not configured:
+
+```
+/srv/snapshots-recv/                 # = [server].recv_base
+└── <hostname>/                      # e.g. millionaire/
+    ├── home/<date>-<num>-<short_uuid>/snapshot   # e.g. 20260627-1300-8-a2159d69
+    ├── root/<date>-<num>-<short_uuid>/snapshot
+    ├── boot/                        # boot tier (rsync mirror)
+    └── boot-efi/
+```
+
+Received subvolumes are named `<date>-<num>-<short_uuid>` — the **date leads**
+(`%Y%m%d-%H%M`, colon-free) so `ls` of a subvol's directory sorts chronologically;
+`<num>` mirrors Snapper's number and `<short_uuid>` ties the name to the
+correlation key. `<recv_base>/<hostname>/<subvol>/<subvol>.latest` always points at
+the newest received subvol's `…/snapshot` — the stable target for the downstream
+**restic-on-server** tier.
 
 The boot tier (`/boot` ext4, `/boot/efi` FAT32) is mirrored with
-`rsync -aAX --delete` to `/srv/snapshots-recv/<hostname>/{boot,boot-efi}` — a
-single current copy, not versioned here (restic versions the receive area for
-free). The **restore side already exists** in `di-btrfs-recovery.sh`, which
-formats EFI/boot and restores both, then chroots to rebuild initramfs + GRUB;
-this tool only *feeds* that flow.
+`rsync -aAX --delete` to `<recv_base>/<hostname>/{boot,boot-efi}` — a single
+current copy, not versioned here (restic versions the receive area for free), and
+under the **same** `<hostname>/` as the snapshot tiers. The **restore side already
+exists** in `di-btrfs-recovery.sh`, which formats EFI/boot and restores both, then
+chroots to rebuild initramfs + GRUB; this tool only *feeds* that flow.
+
+> **Layout changed in this version — re-seed the receive area.** The destination
+> moved to `<recv_base>/<hostname>/<subvol>/<date>-<num>-<uuid>/snapshot` (per-host
+> segment + dated names). There is no automatic migration of subvols already on
+> the server. If you have an older receive area, delete the old subvols and let
+> di-snapsend rebuild from empty, e.g. on the server:
+> ```sh
+> # for each old <subvol>/<wrapper> holding a `snapshot` subvol:
+> sudo btrfs subvolume delete /srv/snapshots-recv/<subvol>/*/snapshot
+> sudo rm -rf /srv/snapshots-recv/<subvol> /srv/snapshots-recv/<old-hostname-dirs>
+> ```
+> then re-run `sudo di-snapsend` — the next run does full sends into the new layout.
 
 ## Tests
 

@@ -128,6 +128,19 @@ next run, and already-transferred snapshots are kept.
 Precedence for operational settings is **CLI flag > env var > config file**.
 Retention is policy and lives only in the config file.
 
+## Retention policy (the server is a superset of the laptop)
+
+Retention prunes the **server only** (Snapper owns the laptop). The server is a
+**superset** of the laptop: while a snapshot still exists on the laptop, its
+server copy is always kept. The `keep_daily/keep_weekly/keep_monthly` GFS numbers
+thin only the **long tail** — server snapshots whose laptop original has already
+aged out. So don't be surprised if the server holds **more** than `keep_daily`
+implies: it mirrors every current laptop snapshot plus a GFS-thinned tail of older
+ones. This is intentional (cheap on COW storage, and the right DR-mirror
+behaviour) and it is what prevents pointless re-send/re-prune churn — di-snapsend
+never deletes a server copy only to re-send it next run. The pinned incremental
+parent (Rule 3) is always kept regardless of the numbers.
+
 ## Server layout & the restore pointer
 
 Received subvolumes are named `<snapper_num>-<short_uuid>` (e.g. `24-a2159d69`),

@@ -886,9 +886,18 @@ def apply_retention(
     Prune the TARGET ONLY (Decision 1) per the per-subvol policy from config.
     Source snapshots are NEVER pruned here — Snapper owns local retention.
 
+    SUPERSET MODEL (Option B): the server is a superset of the source. A target is
+    pruned only if it is BOTH outside the GFS keep set AND its source counterpart
+    is already gone. While the laptop still holds a snapshot, the server keeps its
+    copy — so GFS thinning applies only to the "long tail" of source-deleted
+    snapshots. This eliminates re-send/re-prune churn by construction: the
+    snapshots replicate_subvol would re-send (still on source, missing on target)
+    are exactly the ones protected from pruning here.
+
     PIN the newest correlated pair so the next incremental's parent survives
-    (Rule 3), keep the GFS daily/weekly/monthly set, and (for root) keep pre/post
-    pairs together. Everything else on the target is deleted.
+    (Rule 3), keep the GFS daily/weekly/monthly set, keep every target whose
+    source still exists, and (for root) keep pre/post pairs together. Everything
+    else on the target (the GFS-thinned long tail) is deleted.
     """
     policy = cfg.retention_for(subvol_name)
     kd = int(policy.get("keep_daily", 0))
@@ -915,10 +924,24 @@ def apply_retention(
     if subvol_name == "root":
         keep_paths |= _keep_prepost_partners(keep_paths, source_snaps, target_snaps)
 
+    # Option B: never prune a target whose SOURCE snapshot still exists. While the
+    # laptop holds a snapshot, the server keeps its copy (the server is a superset
+    # of the source). GFS thinning applies only to the long tail — targets whose
+    # source has already aged out. This prevents re-send/re-prune churn, because
+    # the snapshots replicate_subvol would re-send are exactly these still-on-
+    # source ones, now protected. Applied AFTER the GFS/pin/pre-post keep set so it
+    # only ever widens it.
+    source_backed = {
+        t.path
+        for t in target_snaps
+        if any(is_correlated(s, t) for s in source_snaps)
+    }
+    keep_paths |= source_backed
+
     to_delete = [t for t in target_snaps if t.path not in keep_paths]
+    log_info(f"[{subvol_name}] retention: {len(source_backed)} target(s) kept "
+             f"(source still present), {len(to_delete)} long-tail pruned.")
     if not to_delete:
-        log_info(f"[{subvol_name}] retention: nothing to prune "
-                 f"({len(target_snaps)} kept).")
         return
 
     for t in to_delete:

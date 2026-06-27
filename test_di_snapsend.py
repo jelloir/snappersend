@@ -349,6 +349,18 @@ class TestApplyRetention(unittest.TestCase):
                              received=f"src{i}", creation=d, num=(n - i)))
         return out
 
+    def _cfg(self, keep_daily, keep_weekly=0, keep_monthly=0):
+        return di.Config(server_host="h", retention={"default": {
+            "keep_daily": keep_daily, "keep_weekly": keep_weekly,
+            "keep_monthly": keep_monthly}})
+
+    @staticmethod
+    def _source_for(target):
+        """A source snapshot correlated with `target` (its uuid == target's
+        received_uuid → is_correlated clause 1)."""
+        return mksub(path=f"/s-{target.snapper_num}", uuid=target.received_uuid,
+                     num=target.snapper_num)
+
     def test_prunes_beyond_policy_but_pins_parent(self):
         targets = self._targets(5)  # days 27,26,25,24,23 ; nums 5..1
         # A source whose uuid == the OLDEST target's received_uuid correlates
@@ -369,6 +381,54 @@ class TestApplyRetention(unittest.TestCase):
             "default": {"keep_daily": 1, "keep_weekly": 0, "keep_monthly": 0}})
         di.apply_retention(cfg, "home", [], self._targets(4), "/recv")
         self.assertEqual(self.deleted, [])
+
+    # --- Option B (superset model): no re-send/re-prune churn ---------------
+    def test_no_churn_when_all_targets_source_backed(self):
+        # Regression for the churn bug: every target's SOURCE still exists, so —
+        # even with keep_daily=1 across distinct days — NOTHING is pruned. These
+        # are exactly the snapshots replicate_subvol would otherwise re-send.
+        targets = self._targets(3)                 # days 27,26,25 ; nums 3,2,1
+        sources = [self._source_for(t) for t in targets]
+        di.apply_retention(self._cfg(1), "home", sources, targets, "/recv")
+        self.assertEqual(self.deleted, [])
+
+    def test_long_tail_prunes_when_source_gone(self):
+        # Source has aged out #1 and #2 (only #3 remains). Their target copies are
+        # no longer source-backed and fall beyond keep_daily=1 → pruned. Without
+        # this path the server would grow unbounded.
+        targets = self._targets(3)                 # days 27,26,25 ; nums 3,2,1
+        sources = [self._source_for(targets[0])]   # only newest (#3) still on source
+        di.apply_retention(self._cfg(1), "home", sources, targets, "/recv")
+        deleted = " ".join(self.deleted)
+        self.assertNotIn(targets[0].path, deleted)  # newest + source-backed + pinned
+        self.assertIn(targets[1].path, deleted)     # source gone, beyond GFS
+        self.assertIn(targets[2].path, deleted)
+
+    def test_long_tail_still_honours_gfs_keep(self):
+        # Source dropped everything but #5; GFS keep_daily=3 still keeps the 3
+        # newest distinct-day targets out of the source-dropped tail, prunes older.
+        targets = self._targets(5)                 # days 27..23 ; nums 5..1
+        sources = [self._source_for(targets[0])]   # only #5 still on source
+        di.apply_retention(self._cfg(3), "home", sources, targets, "/recv")
+        deleted = " ".join(self.deleted)
+        self.assertNotIn(targets[0].path, deleted)  # day 27 (source-backed)
+        self.assertNotIn(targets[1].path, deleted)  # day 26 (GFS daily)
+        self.assertNotIn(targets[2].path, deleted)  # day 25 (GFS daily)
+        self.assertIn(targets[3].path, deleted)     # day 24 (beyond keep_daily=3)
+        self.assertIn(targets[4].path, deleted)     # day 23
+
+    def test_pinned_parent_kept_even_in_long_tail(self):
+        # Source holds ONLY the OLDEST snapshot (#1 == targets[4]); that makes its
+        # target the newest correlated pair → pinned, yet it is the oldest day so
+        # it falls outside keep_daily=1's GFS set. It must still survive. (In
+        # steady state the pin is always a subset of source_backed; this asserts
+        # the Rule-3 pin guarantee holds regardless of how the keep set is built.)
+        targets = self._targets(5)                 # days 27..23 ; nums 5..1
+        sources = [self._source_for(targets[4])]   # only #1 (oldest) still on source
+        di.apply_retention(self._cfg(1), "home", sources, targets, "/recv")
+        deleted = " ".join(self.deleted)
+        self.assertNotIn(targets[4].path, deleted)  # pinned + source-backed → kept
+        self.assertIn(targets[2].path, deleted)     # mid tail, source gone → pruned
 
 
 # --------------------------------------------------------------------------

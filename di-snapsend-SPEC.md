@@ -329,9 +329,11 @@ Bodies to fill in the skeleton (search for `NotImplementedError` /
 3. **`apply_retention()`** — **target-only** (Decision 1): prune only the
    server; never touch source snapshots (Snapper owns those). Implement
    `keep_daily/weekly/monthly` per-subvol from the config file, exclude the
-   pinned pair (Rule 3), and apply the pre/post "keep pairs together" check for
-   root (§4). Retention buckets need real timestamps (from `info.xml` or subvol
-   creation time), not just numbers — see task 5.
+   pinned pair (Rule 3), apply the pre/post "keep pairs together" check for
+   root (§4), and (superset model, §9.1) keep every target whose source still
+   exists — GFS thins only the source-aged-out long tail. Retention buckets need
+   real timestamps (from `info.xml` or subvol creation time), not just numbers —
+   see task 5.
 
 4. **`parse_subvolume_show()`** — already drafted and validated against real
    output; harden it (handle missing fields gracefully, cross-check `readonly`
@@ -416,8 +418,10 @@ recv_dir   = "/srv/snapshots-recv/home"
 mountpoint = "/"
 recv_dir   = "/srv/snapshots-recv/root"
 
-# TARGET-side retention only (source is Snapper-owned — Decision 1).
-# [retention.default] is the fallback; per-subvol tables override.
+# TARGET-side retention only (source is Snapper-owned — Decision 1). GFS thinning
+# applies ONLY to the long tail (snapshots the source has aged out); every target
+# whose source still exists is retained — the server is a superset of the source
+# (Option B, §9.1). [retention.default] is the fallback; per-subvol tables override.
 [retention.default]
 keep_daily   = 14
 keep_weekly  = 8
@@ -449,6 +453,25 @@ decision.
    of local retention, no risk of fighting Snapper's timeline cleanup. The
    `keep_source_last` knob is **removed** from the design. di-snapsend reads
    source snapshots but never deletes them.
+
+   **Superset model (Option B).** Target retention applies GFS thinning **only to
+   snapshots the source has already aged out**. While a source snapshot still
+   exists, its target copy is **always retained** — the server is a *superset* of
+   the source. Concretely, `apply_retention` keeps the union of: the GFS
+   daily/weekly/monthly set, the pinned parent (Rule 3), the root pre/post
+   partners, **and every target whose source counterpart is still present**
+   (`source_backed`). Only the "long tail" — targets whose source is gone — is
+   GFS-thinned. This is required for correctness, not just tidiness: the "what to
+   send" decision (`replicate_subvol.missing` = sources not on the target) and the
+   "what to retain" decision must not fight. Without it, a target pruned by GFS
+   while its source still exists is immediately re-sent on the next run, then
+   re-pruned — endless churn (observed live: an hourly source snapshot re-sent and
+   re-deleted every run). The superset rule removes the churn *by construction*:
+   the snapshots that would be re-sent are exactly the ones now pinned by
+   `source_backed`. Consequence: the server short-term holds the **full current
+   source set** plus a GFS-thinned long tail — more than a strict `keep_daily`
+   count implies, but cheap (Btrfs COW) and the desired DR-mirror behaviour; the
+   long tail is still bounded so the server never grows without limit.
 
 2. **Replicate BOTH home and root.** Home is the churny personal data; root
    carries full-system DR plus the apt pre/post history. Both are sent. Root's

@@ -1,0 +1,22 @@
+[Unit]
+Description=di-snapsend — Snapper-native Btrfs snapshot replication to the server
+Documentation=file:/usr/local/share/doc/di-snapsend/README.md
+# Need the network up before we can ssh the stream across.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root: btrfs send needs privilege, and the transport ssh key + log live
+# under root-owned paths. The server side is the least-privileged 'snapsend' user.
+User=root
+ExecStart=/usr/local/bin/di-snapsend
+# Be a good neighbour on a laptop: snapshots are a background chore.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+# A full seed can take a long time; never time it out mid-stream.
+TimeoutStartSec=0
+# di-snapsend already takes a flock; this is belt-and-braces.
+# A transient failure (server asleep, wifi down) should not spam-restart.
+Restart=no

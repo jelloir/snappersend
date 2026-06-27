@@ -1,0 +1,16 @@
+[Unit]
+Description=Run di-snapsend hourly (snapshot replication to the server)
+Documentation=file:/usr/local/share/doc/di-snapsend/README.md
+
+[Timer]
+# Hourly aligns with Snapper's TIMELINE_LIMIT_HOURLY window, keeping the
+# server's incremental parent well inside the 48-hourly margin (SPEC §3).
+OnCalendar=hourly
+# Spread the load / avoid every host hitting the server on the dot.
+RandomizedDelaySec=300
+# If the laptop was asleep/offline at the scheduled tick, run as soon as it can
+# rather than silently skipping the slot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

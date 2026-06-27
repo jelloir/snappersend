@@ -1,0 +1,10 @@
+[Unit]
+Description=di-snapsend missed-run watchdog (warn if replication has gone stale)
+Documentation=file:/usr/local/share/doc/di-snapsend/README.md
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/snapsend-watchdog
+# Tune the staleness threshold here if the timer cadence changes.
+# Environment=SNAPSEND_MAX_AGE_HOURS=6

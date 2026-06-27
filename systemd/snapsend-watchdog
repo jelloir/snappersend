@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# snapsend-watchdog — alert if di-snapsend has not succeeded recently.
+#
+# di-snapsend touches /var/lib/snapsend/last-success on every clean run. This
+# watchdog (run by snapsend-watchdog.timer) checks that stamp's age and warns via
+# syslog if it is stale — catching the silent-failure case where the timer keeps
+# firing but every run errors (server gone, key revoked, disk full, ...).
+# Mirrors the di-btrbk-send missed-run pattern.
+set -euo pipefail
+
+STAMP="${SNAPSEND_STAMP:-/var/lib/snapsend/last-success}"
+MAX_AGE_HOURS="${SNAPSEND_MAX_AGE_HOURS:-6}"   # hourly timer -> 6h is generous
+
+now=$(date +%s)
+if [[ -f "$STAMP" ]]; then
+    last=$(stat -c %Y "$STAMP")
+else
+    last=0
+fi
+
+age_h=$(( (now - last) / 3600 ))
+
+if (( age_h >= MAX_AGE_HOURS )); then
+    msg="di-snapsend has not succeeded in ${age_h}h (threshold ${MAX_AGE_HOURS}h)"
+    logger -t snapsend-watchdog -p daemon.warning "$msg" 2>/dev/null || true
+    echo "WARN: $msg" >&2
+    exit 1
+fi
+
+echo "OK: di-snapsend last succeeded ${age_h}h ago (threshold ${MAX_AGE_HOURS}h)"

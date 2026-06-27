@@ -1,0 +1,48 @@
+# di-snapsend configuration — installed to /etc/snapsend/config by
+# `di-snapsend.sh --laptop`, then tuned in place. Parsed with tomllib (stdlib).
+#
+# Precedence for operational settings: CLI flag > env var > this file.
+#   --server / $SNAPSEND_SERVER     overrides [server].host
+#   --dry-run / $SNAPSEND_DRY_RUN    forces a no-op dry run
+#   --no-mbuffer                     overrides [server].use_mbuffer
+# Retention is POLICY — file-only, no CLI/env equivalent (SPEC §9).
+
+[server]
+host        = "debian-server"            # the receive end
+ssh_port    = 22
+user        = "snapsend"                 # dedicated least-privilege transport user
+ssh_key     = "/etc/snapsend/ssh/id_ed25519"
+use_mbuffer = true                       # smooth throughput + progress over WiFi
+
+# Non-Btrfs boot tier (/boot ext4, /boot/efi FAT32): a single current rsync
+# mirror, NOT versioned here — the downstream restic-on-server tier versions the
+# receive area for free. Independent + fail-safe vs the snapshot tiers (SPEC §11).
+[boot]
+enabled   = true
+paths     = ["/boot", "/boot/efi"]       # efi nested last; trailing-slash handled
+recv_base = "/srv/snapshots-recv"        # -> /<hostname>/{boot,boot-efi}
+
+# One table per replicated subvolume. `mountpoint` is where Snapper's .snapshots
+# lives; `recv_dir` is where received subvols land on the server, and where the
+# <subvol>.latest symlink (restic's stable target) is maintained.
+[subvolumes.home]
+mountpoint = "/home"
+recv_dir   = "/srv/snapshots-recv/home"
+
+[subvolumes.root]
+mountpoint = "/"
+recv_dir   = "/srv/snapshots-recv/root"
+
+# TARGET-side retention ONLY (Decision 1): di-snapsend never prunes source
+# snapshots — Snapper owns local retention. [retention.default] is the fallback;
+# per-subvol tables override it. The pinned incremental parent (Rule 3) is always
+# kept regardless of these numbers, so you can tune them freely.
+[retention.default]
+keep_daily   = 14
+keep_weekly  = 8
+keep_monthly = 6
+
+[retention.root]
+keep_daily   = 30                        # keep apt pre/post upgrade history longer
+keep_weekly  = 12
+keep_monthly = 12

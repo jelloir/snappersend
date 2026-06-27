@@ -141,6 +141,22 @@ behaviour) and it is what prevents pointless re-send/re-prune churn — di-snaps
 never deletes a server copy only to re-send it next run. The pinned incremental
 parent (Rule 3) is always kept regardless of the numbers.
 
+### Retention timezone
+
+`[retention].timezone` chooses the calendar used for the daily/weekly/monthly
+bucket boundaries (global, all subvols):
+
+- `"local"` (**default**) — boundaries align to **this machine's local calendar**,
+  so a "Monday weekly" is genuinely your local Monday. Recommended.
+- `"utc"` — UTC boundaries; timezone-independent, for strict cross-zone
+  determinism or shared/relocating setups.
+
+Folder **names** are always local-time **+ UTC offset** (e.g. `…+1000…`)
+regardless of this setting. Local bucketing in a DST zone is cosmetically
+imperfect for exactly one day a year — a fall-back day may keep one extra
+snapshot, a spring-forward day one fewer — but never loses data or breaks the
+incremental chain; no DST configuration is needed.
+
 ## Server layout & the restore pointer
 
 Every tier lands under a **per-host** subtree, so several machines can share one
@@ -150,17 +166,21 @@ server with zero collision. The host segment is derived automatically
 ```
 /srv/snapshots-recv/                 # = [server].recv_base
 └── <hostname>/                      # e.g. millionaire/
-    ├── home/<date>-<num>-<short_uuid>/snapshot   # e.g. 20260627-1300-8-a2159d69
-    ├── root/<date>-<num>-<short_uuid>/snapshot
+    ├── home/<localdate>-<offset>-<num>-<short_uuid>/snapshot   # 20260627-2300+1000-8-a2159d69
+    ├── root/<localdate>-<offset>-<num>-<short_uuid>/snapshot
     ├── boot/                        # boot tier (rsync mirror)
     └── boot-efi/
 ```
 
-Received subvolumes are named `<date>-<num>-<short_uuid>` — the **date leads**
-(`%Y%m%d-%H%M`, colon-free) so `ls` of a subvol's directory sorts chronologically;
-`<num>` mirrors Snapper's number and `<short_uuid>` ties the name to the
-correlation key. `<recv_base>/<hostname>/<subvol>/<subvol>.latest` always points at
-the newest received subvol's `…/snapshot` — the stable target for the downstream
+Received subvolumes are named `<localdate>-<offset>-<num>-<short_uuid>` — the
+**date leads** (local time, `%Y%m%d-%H%M`, colon-free) so `ls` of a subvol's
+directory sorts chronologically; `<offset>` is the UTC offset (`+1000`, `+0000`)
+which self-documents the machine's zone and keeps names unique across a DST
+fall-back; `<num>` mirrors Snapper's number and `<short_uuid>` is the uniqueness
+backstop / correlation key. (The name carries *local* time for readability, but
+the authoritative retention timestamp stays UTC.)
+`<recv_base>/<hostname>/<subvol>/<subvol>.latest` always points at the newest
+received subvol's `…/snapshot` — the stable target for the downstream
 **restic-on-server** tier.
 
 The boot tier (`/boot` ext4, `/boot/efi` FAT32) is mirrored with
@@ -170,11 +190,11 @@ under the **same** `<hostname>/` as the snapshot tiers. The **restore side alrea
 exists** in `di-btrfs-recovery.sh`, which formats EFI/boot and restores both, then
 chroots to rebuild initramfs + GRUB; this tool only *feeds* that flow.
 
-> **Layout changed in this version — re-seed the receive area.** The destination
-> moved to `<recv_base>/<hostname>/<subvol>/<date>-<num>-<uuid>/snapshot` (per-host
-> segment + dated names). There is no automatic migration of subvols already on
-> the server. If you have an older receive area, delete the old subvols and let
-> di-snapsend rebuild from empty, e.g. on the server:
+> **Naming/retention-timezone changed in this version — re-seed the receive area.**
+> The destination is `<recv_base>/<hostname>/<subvol>/<localdate>-<offset>-<num>-<uuid>/snapshot`
+> (per-host segment + local-time-with-offset dated names). There is no automatic
+> migration of subvols already on the server. If you have an older receive area,
+> delete the old subvols and let di-snapsend rebuild from empty, e.g. on the server:
 > ```sh
 > # for each old <subvol>/<wrapper> holding a `snapshot` subvol:
 > sudo btrfs subvolume delete /srv/snapshots-recv/<subvol>/*/snapshot

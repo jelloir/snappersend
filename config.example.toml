@@ -43,6 +43,15 @@ mountpoint = "/"
 # snapshots — Snapper owns local retention. [retention.default] is the fallback;
 # per-subvol tables override it. The pinned incremental parent (Rule 3) is always
 # kept regardless of these numbers, so you can tune them freely.
+[retention]
+# Calendar used for daily/weekly/monthly bucket boundaries (global, all subvols).
+#   "local" (default) — buckets align to THIS machine's local calendar, so a
+#                       "Monday weekly" is your local Monday. Recommended.
+#   "utc"             — buckets use UTC boundaries; fully timezone-independent,
+#                       for strict cross-zone determinism / shared setups.
+# Folder NAMES are always local-time + UTC offset regardless of this setting.
+timezone = "local"
+
 [retention.default]
 keep_daily   = 14
 keep_weekly  = 8

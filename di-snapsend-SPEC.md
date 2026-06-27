@@ -201,42 +201,51 @@ automatically, never configured (it's a fact about the machine, not a preference
 and shared by the snapshot tiers and the boot tier so they never diverge:
 
 ```
-<recv_base>/                                         e.g. /srv/snapshots-recv
-└── <hostname>/                                           millionaire/
-    ├── home/<date>-<num>-<short_uuid>/snapshot           home/20260627-1300-8-a2159d69/snapshot
-    ├── root/<date>-<num>-<short_uuid>/snapshot
-    ├── boot/                                             (boot tier — §11)
+<recv_base>/                                              e.g. /srv/snapshots-recv
+└── <hostname>/                                                millionaire/
+    ├── home/<localdate>-<offset>-<num>-<short_uuid>/snapshot   home/20260627-2300+1000-8-a2159d69/snapshot
+    ├── root/<localdate>-<offset>-<num>-<short_uuid>/snapshot
+    ├── boot/                                                  (boot tier — §11)
     └── boot-efi/
 ```
 
 A subvol's destination is composed at runtime as
 `<recv_base>/<hostname>/<subvol_name>`; each received snapshot then lives in a
-per-transfer **directory** named `<date>-<num>-<short_uuid>`, with the subvol one
-level down (`btrfs receive` always names it `snapshot` — §5.2):
+per-transfer **directory** named `<localdate>-<offset>-<num>-<short_uuid>`, with
+the subvol one level down (`btrfs receive` always names it `snapshot` — §5.2):
 
-- `date`: the **source snapshot's own** timestamp (`Subvol.when`: info.xml date,
-  else btrfs creation time), formatted `%Y%m%d-%H%M` — **colon-free** by design
-  (ISO `HH:MM` colons are legal on Linux but break tooling and are awful to type;
-  do NOT use `datetime.isoformat()`). The date **leads** so `ls` of the receive
-  area sorts chronologically. A missing timestamp falls back to the literal
-  `nodate`.
+- `localdate`: the **source snapshot's own** timestamp (`Subvol.when`, a naive-UTC
+  instant) rendered in the machine's **system local** time, `%Y%m%d-%H%M` —
+  **colon-free** by design (ISO `HH:MM` colons are legal on Linux but break tooling
+  and are awful to type; do NOT use `datetime.isoformat()`). The date **leads** so
+  `ls` of the receive area sorts chronologically. A missing timestamp falls back to
+  the literal `nodate`.
+- `offset`: the local UTC offset at that instant (`%z`, e.g. `+1000`, `-0500`,
+  `+0000`). It **disambiguates the DST fall-back hour** — when a local clock-time
+  repeats, the offset differs (`+0100` vs `+0000`) so the two folder names never
+  collide — and self-documents which zone the machine was in (useful across
+  relocations). The **authoritative** time stays UTC (`when`); the name is a label.
 - `num`: the source Snapper number **at send time** — human-readable, mirrors how
   Snapper presents snapshots.
-- `short_uuid`: first 8 hex chars of the source `uuid` — guarantees uniqueness on
-  the server even as laptop numbers churn/repeat over months, and ties the
+- `short_uuid`: first 8 hex chars of the source `uuid` — the ultimate uniqueness
+  backstop (every subvol is unique regardless of the date portion), and ties the
   directory name to the correlation key. Falls back to `nouuid` if absent.
 
 The wrapper directory mirrors Snapper's own `<N>/snapshot` layout and lets every
 snapshot be received directly into its final home (no subvolume `mv` — §5.2).
 Enumeration reads the subvol at `<name>/snapshot`, recovers `num` from the
-directory name, and parses the leading `<date>` into the subvol's `when` so
-ordering/retention key on the **source-snapshot time** (robust against btrfs
-receive-time running out of order across re-sends); retention deletes the subvol
-then `rmdir`s the wrapper.
+directory name, and parses the `<localdate><offset>` label back to a **naive-UTC
+instant** into the subvol's `when`, so ordering/retention key on the
+**source-snapshot time**. (This is deliberate: btrfs `Creation time` on a
+*received* subvol is the **receive time**, not the source-snapshot time — verified
+on Trixie's btrfs-progs — so the name is the only carrier of source time on the
+target and must remain authoritative; a malformed name simply falls back to the
+btrfs creation time without crashing.) Retention deletes the subvol then `rmdir`s
+the wrapper.
 
 The `<recv_dir>/<subvol>.latest` symlink always points at the newest received
-subvol `<date>-<num>-<short_uuid>/snapshot`, giving restic a stable target. This
-is our own equivalent of btrbk's `latest` pointer.
+subvol's `…/snapshot`, giving restic a stable target. This is our own equivalent
+of btrbk's `latest` pointer.
 
 ### Pre/post pair handling (root only)
 
@@ -510,6 +519,30 @@ decision.
 
 4. **Transport user: `snapsend`** (renamed from the placeholder `btrbk`). The
    `--server` installer creates this dedicated least-privilege user.
+
+5. **Retention bucket boundaries are timezone-configurable; default LOCAL.**
+   `[retention].timezone` (global, `"local"` | `"utc"`, default `"local"`; warn +
+   fall back to local on an unrecognized value) chooses the calendar used for the
+   GFS daily/weekly/monthly **bucket boundaries**:
+   - `"local"` (default) — day/week/month boundaries align to **this machine's
+     local calendar**, so a "Monday weekly" is the operator's local Monday. The
+     internal datetime layer is naive-UTC; `_bucket_keep` converts each `when` to
+     local **only** to extract the bucket key.
+   - `"utc"` — UTC boundaries, fully timezone-independent (for strict cross-zone
+     determinism / shared setups).
+
+   **Scope of the zone-shift:** ONLY the bucket-key extraction in `_bucket_keep` is
+   zone-aware. Correlation (Rules 1–3), the pinned parent, Option B `source_backed`,
+   and the newest-first **ordering** all operate on the true instant / identity and
+   are untouched — a zone shift never changes instant ordering, so the sort is
+   unaffected.
+
+   **DST is safe.** Local bucketing needs no DST special-casing. The only effect is
+   cosmetic and harmless: on a fall-back day a local bucket may keep two snapshots
+   instead of one; on spring-forward the day is an hour short. Neither loses data
+   nor breaks the chain — a once-a-year off-by-one in *how many* snapshots are kept
+   that single day. (Folder names are always local-time **+ UTC offset** — §4 — so
+   even the repeated fall-back hour yields distinct, non-colliding names.)
 
 ### Server retention numbers (decision 3 detail)
 

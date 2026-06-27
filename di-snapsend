@@ -161,6 +161,11 @@ class Config:
         "default": {"keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
         "root":    {"keep_daily": 30, "keep_weekly": 12, "keep_monthly": 12},
     })
+    # Calendar used for daily/weekly/monthly bucket BOUNDARIES (SPEC §9):
+    # "local" (default) aligns to this machine's local calendar; "utc" uses UTC
+    # boundaries for strict cross-zone determinism. Folder names are always
+    # local-time+offset regardless of this. Global policy, not per-subvol.
+    retention_timezone: str = "local"
     use_mbuffer: bool = True
     dry_run: bool = False
 
@@ -234,8 +239,20 @@ def load_config(path: str = "/etc/snapsend/config") -> dict:
 
     ret = data.get("retention")
     if ret:
+        # [retention].timezone is a global scalar living alongside the per-subvol
+        # sub-tables; pull it out before iterating the (dict-valued) policies.
+        if "timezone" in ret:
+            tz = str(ret["timezone"]).strip().lower()
+            if tz in ("local", "utc"):
+                kwargs["retention_timezone"] = tz
+            else:
+                log_warn(f"[retention].timezone {ret['timezone']!r} unrecognized "
+                         "(expected 'local' or 'utc'); using 'local'")
+                kwargs["retention_timezone"] = "local"
         parsed = {}
         for name, t in ret.items():
+            if not isinstance(t, dict):   # skip scalars like `timezone`
+                continue
             parsed[name] = {
                 "keep_daily": int(t.get("keep_daily", 0)),
                 "keep_weekly": int(t.get("keep_weekly", 0)),
@@ -514,11 +531,17 @@ def list_target_snapshots(cfg: Config, recv_dir: str) -> list[Subvol]:
     `<date>-<num>-<short_uuid>` holding the subvol at `<date>-<num>-<short_uuid>/
     snapshot` (SPEC §5.2 receive-in-place). We read the subvol one level down, and
     parse the leading `<date>` + `<num>` from the DIRECTORY name. The date (the
-    source snapshot's own timestamp, baked into the name at send time) is used for
-    ordering/retention bucketing — set into `info_time` so `Subvol.when` returns
-    it, which orders chronologically by source-snapshot time rather than by btrfs
-    receive time (the latter can run out of order across re-sends). `<num>` is kept
-    for readability. The `<base>.latest` symlink is skipped."""
+    source snapshot's own timestamp, baked into the name at send time) is the
+    AUTHORITATIVE source-snapshot time for targets and is used for ordering/
+    retention bucketing — set into `info_time` so `Subvol.when` returns it. This is
+    deliberate: btrfs `Creation time` on a RECEIVED subvol is the *receive* time,
+    not the source-snapshot time (verified on Trixie's btrfs-progs), so it must NOT
+    be used as the source-of-truth — it would bucket/order by when-received and run
+    out of order across re-sends. The name (local-time + UTC offset) is parsed back
+    to a naive-UTC instant so it matches the rest of the layer. If the name is
+    malformed (no match), info_time stays None and `when` falls back to the btrfs
+    creation_time — a graceful, never-crash degradation. `<num>` is kept for
+    readability. The `<base>.latest` symlink is skipped."""
     cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(recv_dir)}", check=False)
     out: list[Subvol] = []
     if cp.returncode != 0:
@@ -529,23 +552,25 @@ def list_target_snapshots(cfg: Config, recv_dir: str) -> list[Subvol]:
         sv = show_remote(cfg, os.path.join(recv_dir, name, "snapshot"))
         if sv is None:
             continue
-        # <date>-<num>-...  date = %Y%m%d-%H%M (group 1), num = group 2.
-        m = re.match(r"^(\d{8}-\d{4})-(\d+)-", name)
+        # <localdate>-<offset>-<num>-...  date+offset = group 1, num = group 2.
+        m = re.match(r"^(\d{8}-\d{4}[+-]\d{4})-(\d+)-", name)
         if m:
             sv.snapper_num = int(m.group(2))
             parsed = _parse_dt_name(m.group(1))
             if parsed is not None:
-                sv.info_time = parsed   # Subvol.when -> source-snapshot time
+                sv.info_time = parsed   # Subvol.when -> source-snapshot time (UTC)
         out.append(sv)
     return out
 
 
 def _parse_dt_name(s: str) -> Optional[datetime]:
-    """Parse a colon-free `YYYYMMDD-HHMM` directory-name date into a datetime."""
+    """Parse a colon-free `YYYYMMDD-HHMM±ZZZZ` directory-name label (local time +
+    UTC offset) into a NAIVE-UTC datetime, so it matches the rest of the layer."""
     try:
-        return datetime.strptime(s, "%Y%m%d-%H%M")
+        aware = datetime.strptime(s, "%Y%m%d-%H%M%z")
     except ValueError:
         return None
+    return aware.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _int_or_zero(s: str) -> int:
@@ -597,29 +622,37 @@ def send_receive(
     Receive strategy (SPEC §5.2): Snapper's subvol is literally named "snapshot",
     so `btrfs receive` always writes a child subvol named `snapshot`. We receive
     directly into the snapshot's FINAL per-transfer directory
-    `<recv_dir>/<date>-<num>-<short_uuid>/`, so the subvol lands as
-    `<recv_dir>/<date>-<num>-<short_uuid>/snapshot` and is NEVER moved. (A received
-    subvol is read-only with `received_uuid` set — the very correlation key Rule 2
-    needs — so it must not be `mv`'d across directories, which falls back to a
-    copy that fails on the RO source, nor flipped to RW, which resets
-    received_uuid. Receiving in place sidesteps both.)
+    `<recv_dir>/<localdate>-<offset>-<num>-<short_uuid>/`, so the subvol lands as
+    `<...>/snapshot` and is NEVER moved. (A received subvol is read-only with
+    `received_uuid` set — the very correlation key Rule 2 needs — so it must not be
+    `mv`'d across directories, which falls back to a copy that fails on the RO
+    source, nor flipped to RW, which resets received_uuid. Receiving in place
+    sidesteps both.)
     """
     send_cmd = ["btrfs", "send"]
     if parent is not None:
         send_cmd += ["-p", parent.path]
     send_cmd += [snapshot.path]
 
-    # Server-side naming (SPEC §4): <date>-<num>-<short_uuid>, e.g.
-    # 20260627-1300-8-a2159d69. The date leads so the receive area sorts
+    # Server-side naming (SPEC §4): <localdate>-<offset>-<num>-<short_uuid>, e.g.
+    # 20260627-1300+1000-8-a2159d69. The date leads so the receive area sorts
     # chronologically in `ls`.
-    #   date:        source snapshot's own timestamp (Subvol.when: info.xml date,
-    #                else btrfs creation time), formatted %Y%m%d-%H%M. COLON-FREE
-    #                deliberately — ISO colons are legal but break tooling.
+    #   localdate: source snapshot's own timestamp (Subvol.when, naive-UTC) rendered
+    #              in SYSTEM LOCAL time, %Y%m%d-%H%M — readable to the operator.
+    #   offset:    the local UTC offset at that instant (%z, e.g. +1000). COLON-FREE,
+    #              self-documents the machine's zone, and disambiguates the DST
+    #              fall-back hour (when a local clock-time repeats, the offset
+    #              differs: +0100 vs +0000). The authoritative time stays UTC
+    #              (when); the name is a label.
     #   snapper_num: readable, mirrors Snapper's numbering at send time
     #   short_uuid:  first 8 hex of the source uuid; unique on the server even as
-    #               laptop numbers churn, and ties the dir name to the corr. key
+    #               laptop numbers churn — the ultimate uniqueness backstop.
     dt = snapshot.when
-    date_part = dt.strftime("%Y%m%d-%H%M") if dt else "nodate"
+    if dt:
+        aware = dt.replace(tzinfo=timezone.utc).astimezone()   # -> system local
+        date_part = aware.strftime("%Y%m%d-%H%M%z")            # e.g. 20260627-1300+1000
+    else:
+        date_part = "nodate"
     short_uuid = snapshot.uuid.split("-")[0] if snapshot.uuid not in ("", "-") else "nouuid"
     num = snapshot.snapper_num if snapshot.snapper_num is not None else 0
     received_name = f"{date_part}-{num}-{short_uuid}"
@@ -838,13 +871,23 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
 # ============================================================================
 
 def _bucket_keep(targets_newest_first: list[Subvol],
-                 keep_daily: int, keep_weekly: int, keep_monthly: int) -> set:
+                 keep_daily: int, keep_weekly: int, keep_monthly: int,
+                 tz: str = "local") -> set:
     """
     GFS (grandfather-father-son) keep-set over already-newest-first targets.
     Returns the set of target.path to KEEP: the newest snapshot of each of the
     most recent `keep_daily` days, `keep_weekly` ISO-weeks, and `keep_monthly`
     months (union). Undatable targets are kept (we never delete what we can't
     place). Same semantics as btrbk/borg/restic prune.
+
+    Bucket BOUNDARIES are computed in `tz` (SPEC §9): "local" (default) aligns
+    day/week/month boundaries to this machine's local calendar — so a "Monday
+    weekly" is the operator's local Monday — while "utc" uses UTC boundaries for
+    strict cross-zone determinism. Only the bucket-KEY extraction is zone-aware;
+    `when` is a true instant (naive-UTC) and the newest-first ORDERING is by that
+    instant, which a zone shift never changes — so the caller's sort is unaffected.
+    (Local bucketing is DST-safe: the only effect is cosmetic — a fall-back day may
+    keep two snapshots, a spring-forward day is an hour short — never data loss.)
     """
     keep: set = set()
     last = {"d": None, "w": None, "m": None}
@@ -856,11 +899,13 @@ def _bucket_keep(targets_newest_first: list[Subvol],
         if w is None:
             keep.add(t.path)
             continue
-        iso = w.isocalendar()
+        # w is naive-UTC; shift to local for boundary keys when configured.
+        keyed = w.replace(tzinfo=timezone.utc).astimezone() if tz == "local" else w
+        iso = keyed.isocalendar()
         keys = {
-            "d": (w.year, w.month, w.day),
+            "d": (keyed.year, keyed.month, keyed.day),
             "w": (iso[0], iso[1]),
-            "m": (w.year, w.month),
+            "m": (keyed.year, keyed.month),
         }
         for p in ("d", "w", "m"):
             if lim[p] > 0 and keys[p] != last[p] and cnt[p] < lim[p]:
@@ -954,7 +999,7 @@ def apply_retention(
     targets_sorted = sorted(
         target_snaps, key=lambda t: (t.when or datetime.min), reverse=True
     )
-    keep_paths = _bucket_keep(targets_sorted, kd, kw, km)
+    keep_paths = _bucket_keep(targets_sorted, kd, kw, km, cfg.retention_timezone)
 
     # Rule 3: the pinned parent is never pruned, whatever the policy says.
     if pinned_target is not None:

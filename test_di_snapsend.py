@@ -16,15 +16,34 @@ The engine file has no .py extension (it installs as /usr/local/bin/di-snapsend)
 so it is loaded here by path via importlib.
 """
 
+import contextlib
 import importlib.util
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
 
 os.environ.setdefault("SNAPSEND_QUIET", "1")  # silence the logger during tests
+
+
+@contextlib.contextmanager
+def use_tz(tzname):
+    """Pin the process local timezone for the duration of a test, so timezone-
+    dependent naming/bucketing is deterministic regardless of the host's real TZ."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = tzname
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 # The engine installs as /usr/local/bin/di-snapsend (no .py extension), so the
 # extension-based loader can't infer it — load the source file explicitly. The
@@ -281,6 +300,8 @@ class TestParseDt(unittest.TestCase):
 # Retention bucketing
 # --------------------------------------------------------------------------
 class TestBucketKeep(unittest.TestCase):
+    # These exercise the pure GFS algorithm; pass tz="utc" so the bucket keys are
+    # host-TZ-independent (the local-calendar path has its own dedicated tests).
     def _daily_targets(self, n):
         # n consecutive days, newest first, one snapshot per day
         out = []
@@ -292,7 +313,7 @@ class TestBucketKeep(unittest.TestCase):
 
     def test_keep_daily_limits(self):
         targets = self._daily_targets(10)
-        keep = di._bucket_keep(targets, keep_daily=3, keep_weekly=0, keep_monthly=0)
+        keep = di._bucket_keep(targets, keep_daily=3, keep_weekly=0, keep_monthly=0, tz="utc")
         # newest 3 distinct days kept
         self.assertEqual(keep, {"/d0", "/d1", "/d2"})
 
@@ -301,19 +322,19 @@ class TestBucketKeep(unittest.TestCase):
         b = mksub(path="/b", creation=datetime(2026, 6, 27, 23, 0))  # newest of day
         c = mksub(path="/c", creation=datetime(2026, 6, 26, 23, 0))
         targets = sorted([a, b, c], key=lambda t: t.when, reverse=True)
-        keep = di._bucket_keep(targets, keep_daily=2, keep_weekly=0, keep_monthly=0)
+        keep = di._bucket_keep(targets, keep_daily=2, keep_weekly=0, keep_monthly=0, tz="utc")
         self.assertIn("/b", keep)   # newest of the 27th
         self.assertIn("/c", keep)   # the 26th
         self.assertNotIn("/a", keep)
 
     def test_undatable_kept(self):
         t = mksub(path="/u", creation=None)
-        keep = di._bucket_keep([t], keep_daily=0, keep_weekly=0, keep_monthly=0)
+        keep = di._bucket_keep([t], keep_daily=0, keep_weekly=0, keep_monthly=0, tz="utc")
         self.assertIn("/u", keep)
 
     def test_zero_policy_keeps_nothing_datable(self):
         targets = self._daily_targets(3)
-        keep = di._bucket_keep(targets, 0, 0, 0)
+        keep = di._bucket_keep(targets, 0, 0, 0, tz="utc")
         self.assertEqual(keep, set())
 
 
@@ -524,6 +545,10 @@ class TestRunPipe(unittest.TestCase):
 class TestSendReceive(unittest.TestCase):
     def setUp(self):
         import subprocess as sp
+        # Pin TZ=UTC so the name's local-time + offset is deterministic here
+        # (offset +0000, local == UTC). Non-zero offsets are covered separately.
+        self._tz = use_tz("UTC")
+        self._tz.__enter__()
         self._orig = {k: getattr(di, k) for k in
                       ("run_remote", "_run_pipe", "show_remote", "_update_latest_symlink")}
         self.remote_cmds = []
@@ -537,13 +562,14 @@ class TestSendReceive(unittest.TestCase):
         di.run_remote = fake_remote
         di._update_latest_symlink = lambda cfg, rd, name: self.latest_updated.append(name)
         self.cfg = di.Config(server_host="h", use_mbuffer=False)
-        # known source timestamp -> dated name 20260627-1300-7-a2159d69
+        # known source timestamp -> dated name (UTC -> +0000 offset)
         self.snap = mksub(path="/home/.snapshots/7/snapshot",
                           uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd", num=7,
                           info_time=datetime(2026, 6, 27, 13, 0, 0))
-        self.expected_name = "20260627-1300-7-a2159d69"
+        self.expected_name = "20260627-1300+0000-7-a2159d69"
 
     def tearDown(self):
+        self._tz.__exit__(None, None, None)
         for k, v in self._orig.items():
             setattr(di, k, v)
 
@@ -632,10 +658,10 @@ class TestTargetLayout(unittest.TestCase):
             setattr(di, k, v)
 
     def test_enumeration_reads_name_snapshot_and_parses_num(self):
-        # `ls -1 recv_dir` lists dated wrapper dirs + the .latest symlink.
+        # `ls -1 recv_dir` lists dated wrapper dirs (local time + offset) + .latest.
         recv = "/srv/snapshots-recv/millionaire/root"
         di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
-            ["ssh"], 0, "20260627-1300-3-aabbccdd\n20260627-1500-7-11223344\nroot.latest\n", "")
+            ["ssh"], 0, "20260627-1300+0000-3-aabbccdd\n20260627-1500+0000-7-11223344\nroot.latest\n", "")
         asked = []
 
         def fake_show(cfg, path):
@@ -646,13 +672,13 @@ class TestTargetLayout(unittest.TestCase):
         out = di.list_target_snapshots(self.cfg, recv)
 
         # The subvol is read one level DOWN, at <name>/snapshot ...
-        self.assertIn(f"{recv}/20260627-1300-3-aabbccdd/snapshot", asked)
-        self.assertIn(f"{recv}/20260627-1500-7-11223344/snapshot", asked)
+        self.assertIn(f"{recv}/20260627-1300+0000-3-aabbccdd/snapshot", asked)
+        self.assertIn(f"{recv}/20260627-1500+0000-7-11223344/snapshot", asked)
         # ... the .latest symlink is skipped ...
         self.assertFalse(any("latest" in p for p in asked))
         # ... snapper_num recovered from the 3rd field of the DIRECTORY name ...
         self.assertEqual(sorted(s.snapper_num for s in out), [3, 7])
-        # ... and the date prefix is parsed into `when` for ordering.
+        # ... and the date prefix (parsed to naive-UTC) populates `when`.
         by_num = {s.snapper_num: s for s in out}
         self.assertEqual(by_num[3].when, datetime(2026, 6, 27, 13, 0))
         self.assertEqual(by_num[7].when, datetime(2026, 6, 27, 15, 0))
@@ -662,12 +688,12 @@ class TestTargetLayout(unittest.TestCase):
         issued = []
         di.run_remote = lambda cfg, cmd, *, check=True: (
             issued.append(cmd) or self.sp.CompletedProcess(["ssh"], 0, "", ""))
-        di._update_latest_symlink(self.cfg, recv, "20260627-1500-7-11223344")
+        di._update_latest_symlink(self.cfg, recv, "20260627-1500+0000-7-11223344")
         self.assertEqual(len(issued), 1)
         cmd = issued[0]
         self.assertIn("ln -sfn", cmd)
         # link target is the SUBVOL (…/snapshot), not the wrapper dir
-        self.assertIn(f"{recv}/20260627-1500-7-11223344/snapshot", cmd)
+        self.assertIn(f"{recv}/20260627-1500+0000-7-11223344/snapshot", cmd)
         self.assertIn(f"{recv}/root.latest", cmd)
 
 
@@ -724,14 +750,17 @@ class TestPerHostDatedLayout(unittest.TestCase):
         finally:
             di.socket.gethostname = orig
 
-    # (2) dated name format -------------------------------------------------
-    def test_dated_name_format_no_colon(self):
+    # (2) dated name format + offset ---------------------------------------
+    def test_dated_name_format_local_time_and_offset(self):
+        # Brisbane is UTC+10 (no DST): 13:00 UTC -> 23:00 local, offset +1000.
         snap = mksub(path="/home/.snapshots/8/snapshot",
                      uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd", num=8,
                      info_time=datetime(2026, 6, 27, 13, 0, 0))
-        name = self._send_name(snap)
-        self.assertEqual(name, "20260627-1300-8-a2159d69")
+        with use_tz("Australia/Brisbane"):
+            name = self._send_name(snap)
+        self.assertEqual(name, "20260627-2300+1000-8-a2159d69")
         self.assertNotIn(":", name)                       # colon-free is mandatory
+        self.assertIn("+1000", name)                      # offset matches the zone
         # the receive target is <recv_dir>/<name> (subvol lands as .../snapshot)
         self.assertTrue(any(name in s and "sudo btrfs receive" in s for s in self.pipe_ssh))
 
@@ -742,24 +771,25 @@ class TestPerHostDatedLayout(unittest.TestCase):
         self.assertEqual(name, "nodate-9-nouuid")          # no crash, still unique-ish
         self.assertNotIn(":", name)
 
-    # (4) enumeration round-trip -------------------------------------------
+    # (4) enumeration round-trip (offset-bearing name -> naive-UTC when) -----
     def test_enumeration_round_trip(self):
         recv = "/srv/snapshots-recv/millionaire/home"
         di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
-            ["ssh"], 0, "20260627-1300-8-a2159d69\n", "")
+            ["ssh"], 0, "20260627-1300+1000-8-a2159d69\n", "")
         di.show_remote = lambda cfg, p: mksub(path=p, uuid="x", received="src", ro=True)
         out = di.list_target_snapshots(di.Config(server_host="h"), recv)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].snapper_num, 8)
-        self.assertEqual(out[0].when, datetime(2026, 6, 27, 13, 0))
+        # 13:00 +1000  ==  03:00 UTC
+        self.assertEqual(out[0].when, datetime(2026, 6, 27, 3, 0))
 
     # (5) ordering by date across a day boundary ---------------------------
     def test_ordering_by_date_across_day_boundary(self):
         recv = "/srv/snapshots-recv/millionaire/root"
         # deliberately listed out of order; nums do NOT match chronological order
-        listing = ("20260628-0100-2-bbbb\n"     # newest (next day, 01:00)
-                   "20260627-2300-9-aaaa\n"     # older  (prev day, 23:00)
-                   "20260627-0900-5-cccc\n")    # oldest (prev day, 09:00)
+        listing = ("20260628-0100+0000-2-bbbb\n"     # newest (next day, 01:00Z)
+                   "20260627-2300+0000-9-aaaa\n"     # older  (prev day, 23:00Z)
+                   "20260627-0900+0000-5-cccc\n")    # oldest (prev day, 09:00Z)
         di.run_remote = lambda cfg, cmd, *, check=True: self.sp.CompletedProcess(
             ["ssh"], 0, listing, "")
         di.show_remote = lambda cfg, p: mksub(path=p, uuid="x", received="src", ro=True)
@@ -775,9 +805,88 @@ class TestPerHostDatedLayout(unittest.TestCase):
             issued.append(cmd) or self.sp.CompletedProcess(["ssh"], 0, "", ""))
         # use the real _update_latest_symlink (setUp stubbed it for the send tests)
         self._orig["_update_latest_symlink"](di.Config(server_host="h"), recv,
-                                             "20260627-1300-8-a2159d69")
-        self.assertIn(f"{recv}/20260627-1300-8-a2159d69/snapshot", issued[0])
+                                             "20260627-1300+1000-8-a2159d69")
+        self.assertIn(f"{recv}/20260627-1300+1000-8-a2159d69/snapshot", issued[0])
         self.assertIn(f"{recv}/home.latest", issued[0])
+
+    # DST fall-back: two instants that render the same LOCAL clock-time must get
+    # distinct folder names (disambiguated by the UTC offset), never colliding.
+    def test_dst_fallback_names_differ_via_offset(self):
+        # Europe/London fall-back 2026-10-25: clocks go 02:00 BST -> 01:00 GMT, so
+        # 00:30Z (01:30 +0100) and 01:30Z (01:30 +0000) share local clock 01:30.
+        s1 = mksub(path="/h/1/snapshot", uuid="aaaaaaaa-1111-2222-3333-444444444444",
+                   num=1, info_time=datetime(2026, 10, 25, 0, 30))
+        s2 = mksub(path="/h/2/snapshot", uuid="bbbbbbbb-1111-2222-3333-444444444444",
+                   num=2, info_time=datetime(2026, 10, 25, 1, 30))
+        with use_tz("Europe/London"):
+            n1 = self._send_name(s1)
+            n2 = self._send_name(s2)
+        self.assertEqual(n1, "20261025-0130+0100-1-aaaaaaaa")
+        self.assertEqual(n2, "20261025-0130+0000-2-bbbbbbbb")
+        self.assertNotEqual(n1, n2)                 # no collision across the repeat hour
+
+    # Relocation: the same UTC instant labels differently under different machine
+    # zones — the name "follows the machine".
+    def test_relocation_label_follows_machine(self):
+        snap = mksub(path="/h/8/snapshot", uuid="a2159d69-aaaa-bbbb-cccc-dddddddddddd",
+                     num=8, info_time=datetime(2026, 6, 27, 13, 0))
+        with use_tz("Australia/Brisbane"):
+            bne = self._send_name(snap)
+        with use_tz("UTC"):
+            utc = self._send_name(snap)
+        self.assertIn("+1000", bne)
+        self.assertIn("+0000", utc)
+        self.assertNotEqual(bne, utc)
+        self.assertEqual(utc, "20260627-1300+0000-8-a2159d69")
+        self.assertEqual(bne, "20260627-2300+1000-8-a2159d69")
+
+
+# --------------------------------------------------------------------------
+# Configurable retention bucket timezone (SPEC §9): local (default) vs utc
+# boundaries. `when` (the instant) and newest-first ordering are unchanged; only
+# the bucket-KEY extraction shifts zone.
+# --------------------------------------------------------------------------
+class TestRetentionTimezone(unittest.TestCase):
+    @staticmethod
+    def _t(path, when_utc):
+        return mksub(path=path, creation=when_utc)   # creation_time -> when (naive-UTC)
+
+    def test_local_bucketing_aligns_to_local_calendar(self):
+        # THE HEADLINE FIX. Brisbane = UTC+10.
+        #   A = Sun 22:00 UTC = Mon 08:00 BNE -> local ISO week 27, UTC week 26
+        #   B = Wed 02:00 UTC = Wed 12:00 BNE -> local & UTC week 27
+        A = self._t("/A", datetime(2026, 6, 28, 22, 0))
+        B = self._t("/B", datetime(2026, 7, 1, 2, 0))
+        with use_tz("Australia/Brisbane"):
+            keep = di._bucket_keep([B, A], 0, 2, 0, tz="local")   # keep_weekly=2
+        # Local: A and B share local week 27 -> single weekly rep (newest, B). The
+        # Monday-morning snapshot is correctly THIS week, not the previous one.
+        self.assertEqual(keep, {"/B"})
+
+    def test_utc_bucketing_unchanged(self):
+        # Same instants, tz="utc": A lands in the PRIOR UTC week -> kept separately.
+        A = self._t("/A", datetime(2026, 6, 28, 22, 0))
+        B = self._t("/B", datetime(2026, 7, 1, 2, 0))
+        keep = di._bucket_keep([B, A], 0, 2, 0, tz="utc")
+        self.assertEqual(keep, {"/A", "/B"})     # week 26 + week 27, both kept
+
+    def test_daily_boundary_local_vs_utc(self):
+        # Brisbane local days vs UTC days diverge at 10:00 local.
+        #   09:00 BNE Jun27 = 23:00 UTC Jun26
+        #   23:00 BNE Jun27 = 13:00 UTC Jun27
+        #   02:00 BNE Jun28 = 16:00 UTC Jun27
+        nine  = self._t("/09", datetime(2026, 6, 26, 23, 0))
+        late  = self._t("/23", datetime(2026, 6, 27, 13, 0))
+        nextd = self._t("/next", datetime(2026, 6, 27, 16, 0))
+        targets = sorted([nine, late, nextd], key=lambda t: t.when, reverse=True)
+        with use_tz("Australia/Brisbane"):
+            keep_local = di._bucket_keep(targets, 2, 0, 0, tz="local")   # keep_daily=2
+        # Local days: Jun27 (09:00 + 23:00 BNE) and Jun28 (02:00 BNE). Daily keeps
+        # the newest of each local day -> 23:00 BNE for Jun27, 02:00 BNE for Jun28.
+        self.assertEqual(keep_local, {"/23", "/next"})
+        keep_utc = di._bucket_keep(targets, 2, 0, 0, tz="utc")
+        # UTC days: Jun26 (/09) and Jun27 (/23, /next) -> newest of Jun27 is /next.
+        self.assertEqual(keep_utc, {"/09", "/next"})
 
 
 # --------------------------------------------------------------------------

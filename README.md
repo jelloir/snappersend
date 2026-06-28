@@ -25,16 +25,16 @@ retention**. See `di-snapsend-SPEC.md` for the full design rationale and
 ```
    SOURCE host (e.g. laptop)                    DESTINATION host (e.g. server)
    ┌───────────────────────┐                    ┌────────────────────────────┐
-   │  Snapper makes RO      │   btrfs send |     │  btrfs receive stores each │
-   │  snapshots on a timer  │   ssh ... btrfs    │  snapshot under            │
-   │                        │   receive          │  /srv/snapshots-recv/...   │
-   │  di-snapsend (hourly   │ ─────────────────► │                            │
-   │  timer) sends the new  │   (encrypted SSH,  │  least-privilege transport │
-   │  ones incrementally    │    least-priv key) │  user, scoped sudoers,     │
+   │  Snapper makes RO     │   btrfs send |     │  btrfs receive stores each │
+   │  snapshots on a timer │   ssh ... btrfs    │  snapshot under            │
+   │                       │   receive          │  /srv/snapshots-recv/...   │
+   │  di-snapsend (hourly  │ ─────────────────► │                            │
+   │  timer) sends the new │   (encrypted SSH,  │  least-privilege transport │
+   │  ones incrementally   │    least-priv key) │  user, scoped sudoers,     │
    └───────────────────────┘                    │  forced-command filter     │
-                                                 └─────────────┬──────────────┘
-                                                               │ (optional)
-                                                      restic / offsite archive
+                                                └─────────────┬──────────────┘
+                                                              │ (optional)
+                                                     restic / offsite archive
 ```
 
 - **Snapper** (on the source) creates the snapshots; di-snapsend never makes them.
@@ -229,15 +229,15 @@ They run independently — and the destination keep-rule is a **UNION**:
 
 ```
   destination snapshots (one set)
-  ┌──────────────────────────────────────────────────────────┐
-  │  (b) still on the SOURCE          (a) within GFS policy    │
-  │  ┌───────────────────────┐    ┌──────────────────────────┐│
-  │  │  recent, dense         │    │  daily/weekly/monthly    ││
-  │  │  (source-backed)       │####│  representatives         ││   ## = overlap,
-  │  │                        │####│  (the long-tail taper)   ││        kept once
-  │  └───────────────────────┘    └──────────────────────────┘│
-  │            KEEP = the UNION (whichever reaches further back) │
-  └──────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────┐
+  │  (b) still on the SOURCE         (a) within GFS policy     │
+  │  ┌───────────────────────┐    ┌──────────────────────────┐ │
+  │  │  recent, dense        │    │  daily/weekly/monthly    │ │
+  │  │  (source-backed)      │####│  representatives         │ │   ## = overlap,
+  │  │                       │####│  (the long-tail taper)   │ │        kept once
+  │  └───────────────────────┘    └──────────────────────────┘ │
+  │      KEEP = the UNION (whichever reaches further back)     │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 **So the destination is a *superset* of the source.** While the source holds a

@@ -1,7 +1,7 @@
 # di-snapsend — Design Specification & Implementation Brief
 
-**Status:** Design complete, ready for implementation.
-**Audience:** Claude Code (implementation) + James (review).
+**Status:** Design complete, implemented.
+**Audience:** implementers + reviewers.
 **Companion file:** `di-snapsend-DESIGN.py` (annotated skeleton — the structural
 contract; this document is the *why* and the worked examples behind it).
 
@@ -10,89 +10,91 @@ contract; this document is the *why* and the worked examples behind it).
 ## 1. What this tool is
 
 `di-snapsend` is a **thin orchestration layer** that replicates Snapper-created
-Btrfs snapshots from the laptop (`millionaire`) to the server (`debian-server`)
-over SSH. It is the on-prem disaster-recovery / snapshot-history tier of the
-Debstillation backup architecture.
+Btrfs snapshots from a **source** host (the sending side — typically a
+workstation/laptop) to a **destination** host (the receiving side — typically an
+always-on server) over SSH. It is a standalone tool: the on-host
+disaster-recovery / snapshot-history layer of a 3-2-1 backup strategy.
 
 It is a peer to btrbk and snbk in *role*, but deliberately minimal: it does
 **not** reimplement the Btrfs stream format or network transport. It shells out
 to the tools that already solve those problems:
 
 ```
-btrfs send [-p PARENT] SRC | [mbuffer |] ssh SERVER "sudo btrfs receive DST"
+btrfs send [-p PARENT] SRC | [mbuffer |] ssh DEST "sudo btrfs receive DST"
 ```
 
 btrfs does the filesystem + stream work. ssh does the (encrypted) network. This
 tool does only the three things a wrapper actually has to get right:
 
 1. **Enumeration** — read Snapper's snapshots directly off disk (no format
-   guessing), and inventory what the server already holds.
+   guessing), and inventory what the destination already holds.
 2. **Parent selection** — pick the correct `-p` parent for incrementals.
-3. **Cleanup + retention** — detect and delete partial transfers; prune each
-   side per policy without ever breaking the incremental chain.
+3. **Cleanup + retention** — detect and delete partial transfers; prune the
+   destination per policy without ever breaking the incremental chain.
 
 ### Why build it rather than use btrbk or snbk
 
-| Option | Blocker for this setup |
-|--------|------------------------|
+| Option | Blocker |
+|--------|---------|
 | btrbk | Config DSL doesn't map cleanly onto Snapper's `<N>/snapshot` nesting — hit in practice (sent nothing). Powerful but heavy (7k lines Perl). |
-| snbk | Mirror-only retention; requires an out-of-Debian OBS repo on the laptop (snapper ≥ 0.12; Trixie ships 0.10.6). |
+| snbk | Mirror-only retention; requires an out-of-Debian OBS repo on the source (snapper ≥ 0.12; Debian Trixie ships 0.10.6). |
 | **di-snapsend** | Reads Snapper's own layout directly; stays in Debian main (needs only `btrfs-progs` + `openssh`, both in main); retention is plain Python we control. |
 
-This is squarely aligned with the project's values: minimalism, "do one thing
-well", Debian-main containment, and reasoning fully about our own tools.
+Aligned with the project's values: minimalism, "do one thing well", Debian-main
+containment, and fully reasoning about our own tools.
 
 ---
 
-## 2. Confirmed environment (millionaire, verified 2026-06-27)
+## 2. Source layout assumptions (Snapper on Btrfs)
 
-### On-disk Snapper layout
+di-snapsend reads Snapper's snapshots **directly off disk** on the source. For
+each replicated subvolume, Snapper exposes its snapshots at the subvolume's
+mountpoint as:
 
-| Subvol | Btrfs path | Snapshot path (what we read) | Mounted at |
-|--------|-----------|------------------------------|------------|
-| root | `@snapshots` (ID 264, top-level) | `@snapshots/<N>/snapshot` | `/.snapshots/<N>/snapshot` |
-| home | `@home/.snapshots` (ID 271, nested under `@home` 268) | `@home/.snapshots/<N>/snapshot` | `/home/.snapshots/<N>/snapshot` |
-
-Note the structural asymmetry: root's `.snapshots` is a **top-level** subvolume;
-home's is **nested** under `@home`. This does not change the read logic — both
-expose `<N>/snapshot` at their mountpoint — but is worth knowing.
-
-Each snapshot directory contains:
 ```
-/home/.snapshots/1/
+<mountpoint>/.snapshots/<N>/
 ├── snapshot/      <- the read-only Btrfs subvolume we send
-└── info.xml       <- Snapper metadata (number, timestamp, description)
+└── info.xml       <- Snapper metadata (number, timestamp, pre/post type)
 ```
 
-### Verified `btrfs subvolume show` output (the fields our rules depend on)
+So for `root` (mountpoint `/`) the tool reads `/.snapshots/<N>/snapshot`, and for
+`home` (mountpoint `/home`) it reads `/home/.snapshots/<N>/snapshot`. The on-disk
+Btrfs nesting may differ between subvolumes — e.g. root's `.snapshots` is often a
+**top-level** subvolume while home's is **nested** under `@home` — but this does
+**not** change the read logic: both expose `<N>/snapshot` at their mountpoint.
+The set of subvolumes to replicate (and their mountpoints) is configured in
+`[subvolumes.*]`; the tool assumes nothing beyond "Snapper's `<N>/snapshot`
+layout exists at the configured mountpoint."
 
-From `/home/.snapshots/1/snapshot`:
+### `btrfs subvolume show` — the fields the rules depend on
+
+A source snapshot's `btrfs subvolume show` looks like:
+
 ```
-UUID:            a2159d69-abcd-934e-a327-68d19fc4cd1b
-Parent UUID:     f877a71f-1aea-f040-8ad0-655e84d27d1c
+UUID:            <source-uuid>
+Parent UUID:     <live-subvol-uuid>
 Received UUID:   -
 Flags:           readonly
 ```
 
-Confirmed parsing facts:
+Parsing facts the engine relies on:
 - `Flags:` contains the literal substring `readonly` for RO subvols →
   `"readonly" in flags_line.lower()` is a reliable test.
 - Source snapshots have `Received UUID: -` (they're locally created). After a
-  send, the **server's** copy will carry `Received UUID = <source UUID>` — this
+  send, the **destination's** copy carries `Received UUID = <source UUID>` — this
   is the correlation link (Rule 2).
-- `Parent UUID` is the live `@home` subvol and is identical across all home
-  snapshots → it is **useless for ordering**. Use the Snapper number for
-  within-machine age ordering.
+- `Parent UUID` is the live subvolume and is typically identical across all of a
+  subvolume's snapshots → it is **useless for ordering**. Use the Snapper number
+  for within-machine age ordering.
 
-### Retention currently in effect
+### Source-side retention is Snapper's, and irregular by design
 
-`home` config: `TIMELINE_LIMIT_HOURLY 48`, `DAILY 7`, `WEEKLY 4`,
-`MONTHLY 0`, `NUMBER_LIMIT 0`, `TIMELINE_MIN_AGE 1800`.
-Snapper owns local retention and will gap/churn the numbering (expected — see §4).
-
-`root` config has **pre/post pairs** from the apt hook (e.g. 3/4 "apt upgrade",
-15/16 "apt"), and **non-contiguous numbers** (5 is absent). Both facts are
-handled by enumerating what's actually on disk rather than assuming a range.
+Snapper owns the source retention and will gap/churn the snapshot numbering as it
+prunes (expected — see §4; correlation is by UUID, not number). Snapper configs
+also produce **pre/post pairs** (from the apt hook) and **non-contiguous numbers**;
+both are handled by enumerating what's actually on disk rather than assuming a
+contiguous range. How source (Snapper) retention and destination (di-snapsend)
+retention combine is covered in §9.
 
 ---
 
@@ -202,7 +204,7 @@ and shared by the snapshot tiers and the boot tier so they never diverge:
 
 ```
 <recv_base>/                                              e.g. /srv/snapshots-recv
-└── <hostname>/                                                millionaire/
+└── <source-hostname>/                                         source-host/
     ├── home/<localdate>-<offset>-<num>-<short_uuid>/snapshot   home/20260627-2300+1000-8-a2159d69/snapshot
     ├── root/<localdate>-<offset>-<num>-<short_uuid>/snapshot
     ├── boot/                                                  (boot tier — §11)
@@ -406,28 +408,28 @@ Bodies to fill in the skeleton (search for `NotImplementedError` /
 
 ## 8. Packaging into the suite (di-* convention)
 
-The tool is Python, but its **installer/config** should follow the suite's Bash
-`di-*.sh` convention (the same shape as `di-btrbk-send.sh`):
+The tool is Python, but its **installer/config** is a Bash `di-snapsend.sh` with
+two roles (the historical spellings `--server`/`--laptop` are kept as aliases of
+`--dest`/`--source`):
 
-- `di-snapsend.sh --server` — provision the receive end: dedicated transport
-  user, receive subvolume, restricted SSH key (`ssh_filter`-style command
-  restriction or a forced-command wrapper limited to `btrfs receive`/`btrfs
-  subvolume`), sudoers rule. Reuse the proven logic from `di-btrbk-send.sh`'s
-  server role almost verbatim — that part is tool-agnostic.
-- `di-snapsend.sh --laptop` — install the Python tool to
-  `/usr/local/bin/di-snapsend`, write `/etc/snapsend/config`, install the SSH
-  key, write + enable the systemd timer and watchdog.
-- The Python tool itself (`di-snapsend`) is the engine; the `.sh` is the
-  installer. Mirrors how the suite separates concerns elsewhere.
+- `di-snapsend.sh --dest` (alias `--server`) — provision the **destination**
+  receive end: dedicated transport user, receive area (on Btrfs), restricted SSH
+  key via a forced-command wrapper limited to the exact `btrfs receive`/`btrfs
+  subvolume`/etc. command set, and a scoped sudoers rule.
+- `di-snapsend.sh --source` (alias `--laptop`) — install the engine on the
+  **source** to `/usr/local/bin/di-snapsend`, write `/etc/snapsend/config`,
+  generate the SSH key, pin the destination host key, and enable the systemd timer
+  + watchdog.
+- The Python tool itself (`di-snapsend`) is the engine; the `.sh` is the installer.
 
 ### Config file schema — `/etc/snapsend/config` (TOML)
 
-Written with sane defaults by `di-snapsend.sh --laptop`; tuned in place. Parsed
+Written with sane defaults by `di-snapsend.sh --source`; tuned in place. Parsed
 with `tomllib` (stdlib, Python 3.11+).
 
 ```toml
 [server]
-host     = "debian-server"
+host     = "dest-host"
 ssh_port = 22
 user     = "snapsend"
 ssh_key  = "/etc/snapsend/ssh/id_ed25519"
@@ -544,9 +546,36 @@ decision.
    that single day. (Folder names are always local-time **+ UTC offset** — §4 — so
    even the repeated fall-back hour yields distinct, non-colliding names.)
 
-### Server retention numbers (decision 3 detail)
+### Source vs destination retention interaction (the union rule)
 
-Starting policy — tune in the config file as the server fills:
+Two **independent** retention systems run: Snapper prunes the **source**;
+di-snapsend prunes the **destination**. The destination keep-rule is a **UNION** — a
+destination snapshot is kept if **either** it's within di-snapsend's GFS policy
+**or** its source counterpart still exists (`source_backed`), kept once if both (no
+duplication). So the destination is a **superset** of the source, and **whichever
+retention reaches further back wins, per tier:**
+
+- Destination policy longer than source (the intended setup): di-snapsend governs
+  the archive depth; source-backed just shields the recent dense history. They
+  cooperate.
+- Source longer than destination at a tier: the source-backed rule overrides the
+  shorter destination limit *at that tier* — that tier's config is effectively dead
+  (correct, not data loss, just "you keep more"). **Decision 5b:** `apply_retention`
+  emits an INFO line per run/subvolume when this happens (`override = source_backed
+  − keep_paths` non-empty), so the otherwise-silent "holding more than the config
+  implies" is visible. Log-only; it changes no keep/prune decision.
+- Mixed: resolved per-tier in one run.
+
+**Guidance:** set each destination tier ≥ the corresponding source tier and keep the
+source retention short — then the destination governs the archive, the source stays
+lean, and shortening the source never reduces recoverability. The union rule is also
+what eliminates re-send/re-prune churn (di-snapsend never deletes a copy only to
+re-send it because its source still exists). The user-facing version of this is in
+the README's "Retention" section.
+
+### Destination retention numbers (decision 3 detail)
+
+Example starting policy — tune in the config file as the destination fills:
 
 | Subvol | keep_daily | keep_weekly | keep_monthly | Rationale |
 |--------|-----------|-------------|--------------|-----------|

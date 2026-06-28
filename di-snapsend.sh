@@ -41,24 +41,27 @@ require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root"; }
 
 usage() {
     cat >&2 <<EOF
-di-snapsend.sh — installer
+di-snapsend.sh — installer (provisions the two ends of a replication link)
 
 Usage:
-  sudo $0 --server [PUBKEY_FILE]   provision the receive end on the SERVER
-  sudo $0 --laptop                 install the engine + timer on the LAPTOP
+  sudo $0 --dest   [PUBKEY_FILE]   provision the receive end (DESTINATION host)
+  sudo $0 --source                 install the engine + timer (SOURCE host)
 
-Server role (idempotent):
+  Aliases: --dest = --destination = --server ;  --source = --laptop
+  (--server/--laptop are the historical spellings, kept for back-compat.)
+
+Destination role (idempotent) — run on the receiving host:
   - creates the '${SNAPSEND_USER}' transport user
   - creates ${RECV_BASE} (must be on a Btrfs filesystem)
   - installs a scoped sudoers rule (/etc/sudoers.d/snapsend)
   - installs the forced-command ssh filter
   - if PUBKEY_FILE is given, authorizes that key (locked down); else prints how
 
-Laptop role (idempotent):
+Source role (idempotent) — run on the sending host:
   - installs ${BIN_DIR}/di-snapsend and ${BIN_DIR}/snapsend-watchdog
   - writes ${ETC_DIR}/config (from config.example.toml) if absent
   - generates the transport key at ${KEY_PATH} if absent, prints the pubkey line
-  - installs and enables snapsend.timer + snapsend-watchdog.timer
+  - pins the destination SSH host key, installs + enables snapsend timers
 
 Env overrides: SNAPSEND_USER RECV_BASE ETC_DIR KEY_PATH BIN_DIR UNIT_DIR
 EOF
@@ -277,11 +280,27 @@ PY
 # ============================================================================
 main() {
     [[ $# -ge 1 ]] || usage 1
+    # Roles are source (the sending side) and dest (the receiving side). The
+    # historical spellings --laptop/--server are kept as aliases so existing
+    # scripts/muscle-memory keep working; --source/--dest are the generic names.
+    local role
     case "$1" in
-        --server) shift; cmd_server "${1:-}" ;;
-        --laptop) shift; cmd_laptop ;;
+        --source|--laptop)        role=source ;;
+        --dest|--destination|--server) role=dest ;;
         -h|--help) usage 0 ;;
         *) err "unknown role: $1"; usage 1 ;;
+    esac
+    # Test-only introspection: with SNAPSEND_DISPATCH_TEST set, report the resolved
+    # role and exit before doing any work (so alias dispatch is unit-testable
+    # without a real install). Inert in normal use.
+    if [[ -n "${SNAPSEND_DISPATCH_TEST:-}" ]]; then
+        echo "role=${role}"
+        exit 0
+    fi
+    shift
+    case "$role" in
+        source) cmd_laptop ;;
+        dest)   cmd_server "${1:-}" ;;
     esac
 }
 main "$@"

@@ -102,10 +102,11 @@ def mksource(num, *, source_uuid=None, typ=None, pre=None):
                  ro=True, num=num, typ=typ, pre=pre)
 
 
-def gen_history(start_utc, end_utc, step, recv="/recv/host/home"):
-    """Targets at `step` cadence over [start, end), numbered 1..N oldest→newest.
-    Call inside use_tz(...) (mktarget renders local-time names)."""
-    out, t, n = [], start_utc, 1
+def gen_history(start_utc, end_utc, step, recv="/recv/host/home", start_num=1):
+    """Targets at `step` cadence over [start, end), numbered start_num..N
+    oldest→newest. `start_num` lets disjoint histories avoid num/UUID collisions
+    (the UUID derives from num). Call inside use_tz(...) (names render local)."""
+    out, t, n = [], start_utc, start_num
     while t < end_utc:
         out.append(mktarget(t, n, recv=recv))
         t += step
@@ -1330,6 +1331,147 @@ class TestRetentionApplyInteractions(unittest.TestCase):
         # pre & post are source-backed (their sources exist) -> both kept, pair intact
         self.assertIn(t_pre.path, kept)
         self.assertIn(t_post.path, kept)
+
+
+# ==========================================================================
+# §5 — installer role-alias dispatch. --source/--laptop -> source role;
+# --dest/--destination/--server -> dest role. Uses the test-only
+# SNAPSEND_DISPATCH_TEST hook so no real install runs.
+# ==========================================================================
+class TestInstallerDispatch(unittest.TestCase):
+    def _role(self, flag):
+        import subprocess
+        sh = os.path.join(_HERE, "di-snapsend.sh")
+        env = dict(os.environ, SNAPSEND_DISPATCH_TEST="1")
+        cp = subprocess.run(["bash", sh, flag], capture_output=True, text=True, env=env)
+        return cp.returncode, cp.stdout.strip()
+
+    def test_source_aliases_dispatch_to_source(self):
+        for flag in ("--source", "--laptop"):
+            rc, out = self._role(flag)
+            self.assertEqual((rc, out), (0, "role=source"), f"{flag}")
+
+    def test_dest_aliases_dispatch_to_dest(self):
+        for flag in ("--dest", "--destination", "--server"):
+            rc, out = self._role(flag)
+            self.assertEqual((rc, out), (0, "role=dest"), f"{flag}")
+
+    def test_unknown_flag_rejected(self):
+        rc, out = self._role("--bogus")
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("role=", out)
+
+
+# ==========================================================================
+# §7/§8 — source-vs-destination retention interaction across tiers, and the
+# §8 "source retention is overriding destination retention" INFO log.
+# ==========================================================================
+class TestRetentionTierInteraction(unittest.TestCase):
+    def setUp(self):
+        import subprocess as sp
+        self._orig = {k: getattr(di, k) for k in
+                      ("run_remote", "_update_latest_symlink", "log_info")}
+        self.deleted, self.logs = [], []
+
+        def fake_remote(cfg, cmd, *, check=True):
+            if "subvolume delete" in cmd:
+                self.deleted.append(cmd)
+            return sp.CompletedProcess(["ssh"], 0, "", "")
+
+        di.run_remote = fake_remote
+        di._update_latest_symlink = lambda *a, **k: None
+        di.log_info = lambda m: self.logs.append(m)
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(di, k, v)
+
+    def _cfg(self, kd, kw, km, tz):
+        return di.Config(server_host="h", retention_timezone=tz, retention={
+            "default": {"keep_daily": kd, "keep_weekly": kw, "keep_monthly": km}})
+
+    def _run(self, name, sources, targets, kd, kw, km, tz):
+        self.deleted, self.logs = [], []
+        di.apply_retention(self._cfg(kd, kw, km, tz), name, sources, targets,
+                           "/recv/host/home")
+        deleted = {t.path for t in targets if any(t.path in c for c in self.deleted)}
+        return deleted
+
+    def _override_logged(self):
+        return any("source retention is holding" in m for m in self.logs)
+
+    # ---- §7: the realistic "inverse" multi-tier config ---------------------
+    def test_inverse_config_per_tier_independence(self):
+        # Source keeps ~30 daily; destination policy keep_daily=14/weekly=8/monthly=6.
+        # 30 source-backed dailies (recent) + an older source-GONE tail spanning
+        # months that the weekly/monthly tiers act on. Disjoint nums via start_num.
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                recent = gen_history(datetime(2026, 1, 1, 2, 0),
+                                     datetime(2026, 1, 31, 0, 0), _td(days=1))   # 30 daily
+                tail = gen_history(datetime(2025, 7, 1, 2, 0),
+                                   datetime(2025, 12, 20, 0, 0), _td(days=10),
+                                   start_num=1000)                              # source-gone
+            targets = recent + tail
+            sources = [mksource(t.snapper_num) for t in recent]   # only recent source-backed
+            deleted = self._run("home", sources, targets, 14, 8, 6, tz)
+
+            # (1) Daily tier OVERRIDDEN: all 30 source-backed dailies kept, though
+            #     keep_daily=14 — because they're source-backed. The headline answer.
+            for t in recent:
+                self.assertNotIn(t.path, deleted, f"source-backed daily pruned [{tz}]")
+
+            # (2) Older tiers STILL GOVERN: among the source-gone tail, exactly the
+            #     GFS weekly/monthly reps survive; the rest prune. So weekly/monthly
+            #     config is NOT ignored.
+            nf_tail = sorted(tail, key=lambda t: t.when, reverse=True)
+            gfs_all = oracle_keep(targets, 14, 8, 6, tz)
+            tail_survivors = {t.path for t in tail if t.path not in deleted}
+            tail_expected = {t.path for t in tail if t.path in gfs_all}
+            self.assertEqual(tail_survivors, tail_expected,
+                             f"tail survivors must equal GFS weekly/monthly reps [{tz}]")
+            self.assertTrue(deleted, "the source-gone tail must be thinned")
+            self.assertIn(nf_tail[-1].path, deleted)              # oldest tail pruned
+
+            # (3) per-tier independence in ONE run: daily source-dominated, monthly
+            #     GFS-dominated, both correct above.
+            # (4) pin kept: newest correlated pair (recent's newest) survives.
+            pinned = max(recent, key=lambda t: t.snapper_num)
+            self.assertNotIn(pinned.path, deleted)
+
+    # ---- §8: the override INFO log -----------------------------------------
+    def test_override_logged_when_source_longer_than_policy(self):
+        # keep_daily=2 but 5 source-backed distinct days -> 3 are held only because
+        # the source has them (beyond GFS) -> override set non-empty -> INFO logged.
+        with use_tz(BNE):
+            targets = gen_history(datetime(2026, 1, 1, 2, 0),
+                                  datetime(2026, 1, 6, 0, 0), _td(days=1))   # 5 daily
+        sources = [mksource(t.snapper_num) for t in targets]
+        self._run("home", sources, targets, 2, 0, 0, "utc")
+        self.assertTrue(self._override_logged(),
+                        "override INFO must be emitted when source outlives the policy")
+        # and it states the count of extras (5 source-backed - 2 GFS-kept = 3)
+        msg = next(m for m in self.logs if "source retention is holding" in m)
+        self.assertIn("3 extra", msg)
+
+    def test_override_not_logged_in_steady_state(self):
+        # destination policy comfortably covers the source set -> no override,
+        # no false positive.
+        with use_tz(BNE):
+            targets = gen_history(datetime(2026, 1, 1, 2, 0),
+                                  datetime(2026, 1, 6, 0, 0), _td(days=1))   # 5 daily
+        sources = [mksource(t.snapper_num) for t in targets]
+        self._run("home", sources, targets, 14, 8, 6, "utc")   # policy >= source
+        self.assertFalse(self._override_logged(),
+                         "no override line when the destination policy governs")
+
+    def test_override_not_logged_when_no_sources(self):
+        # pure long-tail (no sources) -> source_backed empty -> never an override.
+        with use_tz(BNE):
+            targets = gen_history(datetime(2026, 1, 1, 2, 0),
+                                  datetime(2026, 1, 6, 0, 0), _td(days=1))
+        self._run("home", [], targets, 2, 0, 0, "utc")
+        self.assertFalse(self._override_logged())
 
 
 if __name__ == "__main__":

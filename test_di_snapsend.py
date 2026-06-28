@@ -1363,6 +1363,23 @@ class TestInstallerDispatch(unittest.TestCase):
 
 
 # ==========================================================================
+# Engine --server / --dest / --destination runtime override alias. The flag
+# name (and $SNAPSEND_SERVER) stay --server for back-compat; --dest and
+# --destination are additive aliases. argparse keeps the dest as "server"
+# (first option string), so args.server / env precedence is unchanged.
+# ==========================================================================
+class TestServerOverrideAlias(unittest.TestCase):
+    def test_all_spellings_set_args_server(self):
+        p = di.build_parser()
+        for flag in ("--server", "--dest", "--destination"):
+            self.assertEqual(p.parse_args([flag, "other-host"]).server,
+                             "other-host", flag)
+
+    def test_default_is_none(self):
+        self.assertIsNone(di.build_parser().parse_args([]).server)
+
+
+# ==========================================================================
 # §7/§8 — source-vs-destination retention interaction across tiers, and the
 # §8 "source retention is overriding destination retention" INFO log.
 # ==========================================================================

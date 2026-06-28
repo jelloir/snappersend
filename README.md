@@ -97,25 +97,46 @@ subvolumes you list in the config.
 
 ## Install
 
-The installer (`di-snapsend.sh`) has two roles. Run them in this order.
+The installer (`di-snapsend.sh`) has two roles. There's a deliberate chicken-and-egg:
+the **destination** wants the **source's** public key, but that key doesn't exist
+until the source role runs. So the destination is provisioned in **two passes** —
+once to set everything up (printing the `authorized_keys` line to complete later),
+then again to authorize the key once the source has generated it. The canonical
+sequence:
+
+1. **Destination, first pass** — `sudo ./di-snapsend.sh --dest` (no key yet):
+   provisions the transport user, receive area, sudoers, and SSH filter, and **prints
+   the `authorized_keys` line format** to complete once the source key exists.
+2. **Source** — `sudo ./di-snapsend.sh --source`: generates the transport key, pins
+   the destination's host key, installs the timer, and **prints the public key** plus
+   the exact command to authorize it on the destination.
+3. **Destination, finalize** — either re-run `sudo ./di-snapsend.sh --dest
+   /path/to/id_ed25519.pub` with the copied key, **or** paste the printed
+   `authorized_keys` line manually.
+4. **Edit the config** on the source, then **verify** with `sudo di-snapsend
+   --dry-run` and seed.
 
 > **Role flags:** `--dest` (aliases: `--destination`, `--server`) and `--source`
 > (alias: `--laptop`). The `--server`/`--laptop` spellings are historical and kept
 > for back-compat; the generic names are `--dest`/`--source`.
 
-### 1. Destination host (the receiver)
+### 1. Destination host (the receiver) — first pass
 
 ```sh
-sudo ./di-snapsend.sh --dest                      # prints the authorized_keys line to add later
-# (or, once you have the source's public key:)
-sudo ./di-snapsend.sh --dest /path/to/id_ed25519.pub
+sudo ./di-snapsend.sh --dest                      # no key yet; prints the authorized_keys line to add later
 ```
 
 This creates the least-privilege `snapsend` transport user, the receive area
 `/srv/snapshots-recv` (**must be Btrfs**), a scoped sudoers rule, and the
 forced-command SSH filter (so the key can only run the exact send/receive command
-set, even if it leaks). With a pubkey argument it authorizes that key, locked to the
-filter with no pty/forwarding.
+set, even if it leaks). With **no** pubkey argument (the first pass, before the source
+key exists), it prints the `authorized_keys` line to complete in step 3. If you
+already have the source's public key copied over, you can pass it now and skip the
+finalize pass:
+
+```sh
+sudo ./di-snapsend.sh --dest /path/to/id_ed25519.pub   # authorizes the key directly
+```
 
 ### 2. Source host (the sender)
 
@@ -126,10 +147,22 @@ sudo ./di-snapsend.sh --source
 This installs the engine + watchdog, writes `/etc/snapsend/config` from the example,
 generates the transport SSH key at `/etc/snapsend/ssh/id_ed25519`, **pins the
 destination's SSH host key**, and enables `snapsend.timer` (hourly) +
-`snapsend-watchdog.timer`. It prints the public key — copy it to the destination and
-run step 1 with it (or paste the printed `authorized_keys` line manually).
+`snapsend-watchdog.timer`. It prints the public key and the exact `--dest` command to
+register it on the destination.
 
-### 3. Edit the config (`/etc/snapsend/config`)
+### 3. Destination host — finalize the key
+
+Copy the source's public key (`/etc/snapsend/ssh/id_ed25519.pub`) to the destination
+and authorize it, either by re-running `--dest` with the file:
+
+```sh
+sudo ./di-snapsend.sh --dest /path/to/id_ed25519.pub
+```
+
+or by pasting the `authorized_keys` line printed in step 1 manually. (Skip this step
+if you already passed the key in step 1.)
+
+### 4. Edit the config (`/etc/snapsend/config`)
 
 Open it on the source and set, at minimum:
 
@@ -144,7 +177,7 @@ Open it on the source and set, at minimum:
   (Snapper) retention so the destination governs the archive depth.
 - **`[boot]`** — enable if you also want `/boot` + `/boot/efi` mirrored for full DR.
 
-### 4. Verify, then seed
+### 5. Verify, then seed
 
 ```sh
 sudo di-snapsend --dry-run        # reads both sides, changes nothing — check the plan
@@ -201,7 +234,7 @@ snapshots are kept.
 - **Dry run:** `--dry-run` (or `$SNAPSEND_DRY_RUN=1`) — reads remote state but
   performs no sends or prunes.
 - **One subvolume:** `--subvol home`.
-- **Override destination host:** `--server other-host` (or `$SNAPSEND_SERVER`).
+- **Override destination host:** `--dest other-host` (alias `--server`; or `$SNAPSEND_SERVER`).
 - **No mbuffer:** `--no-mbuffer`.
 - **Watchdog:** `snapsend-watchdog` warns (syslog) if no successful run is recorded in
   `/var/lib/snapsend/last-success` within `SNAPSEND_MAX_AGE_HOURS` (default 6).

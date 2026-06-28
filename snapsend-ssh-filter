@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# snapsend-ssh-filter — forced command for the snapsend transport key (server side).
+# snapsend-ssh-filter — forced command for the snapsend transport key (destination side).
 #
-# Installed on the SERVER as /usr/local/bin/snapsend-ssh-filter and wired up in the
+# Installed on the DESTINATION as /usr/local/bin/snapsend-ssh-filter and wired up in the
 # snapsend user's authorized_keys:
 #
 #   command="/usr/local/bin/snapsend-ssh-filter",no-pty,no-agent-forwarding,\
-#   no-port-forwarding,no-X11-forwarding ssh-ed25519 AAAA... laptop-snapsend
+#   no-port-forwarding,no-X11-forwarding ssh-ed25519 AAAA... snapsend@source
 #
-# It restricts what the laptop's key can run to exactly the command set
+# It restricts what the source's key can run to exactly the command set
 # di-snapsend issues over ssh — so even if the key leaks, it cannot get a shell or
 # run arbitrary commands. This is defense-in-depth ON TOP of the scoped sudoers
 # rule (/etc/sudoers.d/snapsend); neither alone is the whole story.

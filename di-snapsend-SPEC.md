@@ -117,7 +117,7 @@ receive (confirmed in btrbk source comment, `btrfs:1590`).
 | Garbled | `false` | `-` | Partial/interrupted; **we must delete it** |
 
 After every receive, run `btrfs subvolume show` on the landed path and check
-**both** conditions. If garbled, `btrfs subvolume delete` it on the server and
+**both** conditions. If garbled, `btrfs subvolume delete` it on the destination and
 treat the transfer as failed. Never advance the parent pointer past an
 unverified transfer.
 
@@ -125,8 +125,8 @@ Encoded as: `Subvol.is_valid_received` and `Subvol.is_garbled`.
 
 ### Rule 2 — Parent eligibility ("correlation")
 
-A laptop snapshot `S` may be the `-p` parent for an incremental **only if** the
-server already holds a snapshot correlated with `S` (same Btrfs lineage). Both
+A source snapshot `S` may be the `-p` parent for an incremental **only if** the
+destination already holds a snapshot correlated with `S` (same Btrfs lineage). Both
 must be read-only. Correlation holds when **any** of:
 
 ```
@@ -138,15 +138,15 @@ S.received_uuid == T.received_uuid     (both received from a common source)
 
 (from btrbk `_is_correlated`, `btrfs:2587`)
 
-**Worked example with real data.** Laptop home snapshot #1 has
-`uuid = a2159d69-…`, `received_uuid = -`. After we send it, the server's copy
-will have `received_uuid = a2159d69-…`. On the next run, `is_correlated(laptop#1,
-server_copy)` returns true via the first clause (`S.uuid == T.received_uuid`).
-So laptop #1 is a valid parent for sending laptop #2 incrementally. ✓
+**Worked example with real data.** Source home snapshot #1 has
+`uuid = a2159d69-…`, `received_uuid = -`. After we send it, the destination's copy
+will have `received_uuid = a2159d69-…`. On the next run, `is_correlated(source#1,
+dest_copy)` returns true via the first clause (`S.uuid == T.received_uuid`).
+So source #1 is a valid parent for sending source #2 incrementally. ✓
 
-**Parent choice:** the parent for sending snapshot `N` is the **newest** laptop
+**Parent choice:** the parent for sending snapshot `N` is the **newest** source
 snapshot that is (a) strictly older than `N` (lower Snapper number) and (b)
-correlated with something on the server. If none → full send.
+correlated with something on the destination. If none → full send.
 
 Encoded as: `is_correlated()` and `choose_parent()`.
 
@@ -162,43 +162,43 @@ build delete sets that honour the keep-policy **and** exclude the pinned pair.
 
 Encoded as: `_newest_correlated_pair()` (pin), consumed by `apply_retention()`.
 
-**Invariant this imposes on scheduling:** laptop retention must always leave at
-least one snapshot the server also holds, to serve as parent. With Snapper
+**Invariant this imposes on scheduling:** source retention must always leave at
+least one snapshot the destination also holds, to serve as parent. With Snapper
 keeping 48 hourly and this tool running hourly, that is satisfied with wide
-margin. If the laptop were offline for >48h, the next run would correctly fall
+margin. If the source were offline for >48h, the next run would correctly fall
 back to a full send (no breakage, just a bigger transfer).
 
 ---
 
 ## 4. The numbering / retention divergence (resolved)
 
-**Concern:** once Snapper retention deletes old snapshots on the laptop, laptop
-numbering gaps and diverges from what the server holds (server keeps long
+**Concern:** once Snapper retention deletes old snapshots on the source, source
+numbering gaps and diverges from what the destination holds (destination keeps long
 retention). Won't this break matching?
 
 **Resolution: it does not, because correlation is by UUID, never by number.**
 
-Worked through with real state. Suppose laptop home currently holds 1–24 and all
-are on the server. Overnight, Snapper timeline cleanup deletes 1–10 on the
-laptop (aged past the hourly window). Next run:
+Worked through with real state. Suppose source home currently holds 1–24 and all
+are on the destination. Overnight, Snapper timeline cleanup deletes 1–10 on the
+source (aged past the hourly window). Next run:
 
-- Laptop holds 11–N. Server holds 1–N (long retention).
-- `choose_parent()` for the new snapshot finds the newest laptop snapshot whose
-  **UUID** correlates with a server copy. Laptop #11 still exists; its UUID still
-  matches the server's copy-of-#11 → valid parent.
-- The deletion of 1–10 on the laptop is **invisible** to correlation, because
+- Source holds 11–N. Destination holds 1–N (long retention).
+- `choose_parent()` for the new snapshot finds the newest source snapshot whose
+  **UUID** correlates with a destination copy. Source #11 still exists; its UUID still
+  matches the destination's copy-of-#11 → valid parent.
+- The deletion of 1–10 on the source is **invisible** to correlation, because
   the tool never looks up snapshots by number across machines. Numbers are used
   **only** for within-machine age sorting.
 
-The divergence is the asymmetric retention working as intended (short on laptop,
-long on server). The single invariant (Rule 3 / §3) — keep at least one shared
+The divergence is the asymmetric retention working as intended (short on source,
+long on destination). The single invariant (Rule 3 / §3) — keep at least one shared
 snapshot as parent — is guaranteed by hourly operation against a 48-hourly
 Snapper window.
 
-### Server-side layout & naming scheme (decided)
+### Destination-side layout & naming scheme (decided)
 
 Every tier lives under a **per-host** subtree, so multiple machines share one
-server with zero collision. The host segment is `socket.gethostname()` — derived
+destination with zero collision. The host segment is `socket.gethostname()` — derived
 automatically, never configured (it's a fact about the machine, not a preference),
 and shared by the snapshot tiers and the boot tier so they never diverge:
 
@@ -252,9 +252,9 @@ of btrbk's `latest` pointer.
 ### Pre/post pair handling (root only)
 
 Root snapshots include apt-hook pre/post pairs. They send and correlate like any
-other RO snapshot. The only refinement: **server-side retention should avoid
+other RO snapshot. The only refinement: **destination-side retention should avoid
 orphaning half a pre/post pair** when *we* prune — if a `post` is kept, prefer
-keeping its `pre` for restore sanity. This is a server-retention nicety (Rule 3
+keeping its `pre` for restore sanity. This is a destination-retention nicety (Rule 3
 territory), not a correctness requirement. Implement as a "keep pairs together"
 check in `apply_retention()` for the root subvol.
 
@@ -264,12 +264,12 @@ check in `apply_retention()` for the root subvol.
 
 ### Full send (first time, or no correlated parent)
 ```
-btrfs send SRC | [mbuffer |] ssh SERVER "sudo btrfs receive RECV_DIR"
+btrfs send SRC | [mbuffer |] ssh DEST "sudo btrfs receive RECV_DIR"
 ```
 
 ### Incremental (have correlated parent P)
 ```
-btrfs send -p P.path SRC | [mbuffer |] ssh SERVER "sudo btrfs receive RECV_DIR"
+btrfs send -p P.path SRC | [mbuffer |] ssh DEST "sudo btrfs receive RECV_DIR"
 ```
 
 ### Critical implementation requirements
@@ -284,7 +284,7 @@ btrfs send -p P.path SRC | [mbuffer |] ssh SERVER "sudo btrfs receive RECV_DIR"
 2. **Receive in place — no subvolume `mv`, ever.** Snapper's subvolume is
    literally named `snapshot`, so `btrfs receive DIR` always writes a child
    subvol named `DIR/snapshot`. To keep each received snapshot uniquely named on
-   the server, receive each one directly into its **own final per-transfer
+   the destination, receive each one directly into its **own final per-transfer
    directory** (`RECV_DIR = <recv_base>/<hostname>/<subvol>`, composed at runtime
    — §4):
    - `final_dir = RECV_DIR/<date>-<num>-<short_uuid>`  (date = `%Y%m%d-%H%M`, §4)
@@ -329,7 +329,7 @@ btrfs send -p P.path SRC | [mbuffer |] ssh SERVER "sudo btrfs receive RECV_DIR"
 ```
 1. ssh mkdir -p RECV_DIR
 2. source_snaps = enumerate /home/.snapshots (or /.snapshots)   [RO only]
-3. target_snaps = enumerate RECV_DIR on server
+3. target_snaps = enumerate RECV_DIR on the destination
 4. missing = source snaps not correlated with any target snap
 5. sort missing oldest-first (so each can parent the next)
 6. for each missing snap:
@@ -359,7 +359,7 @@ Bodies to fill in the skeleton (search for `NotImplementedError` /
    cleanup (delete subvol + `rmdir`), update `.latest`.
 
 3. **`apply_retention()`** — **target-only** (Decision 1): prune only the
-   server; never touch source snapshots (Snapper owns those). Implement
+   destination; never touch source snapshots (Snapper owns those). Implement
    `keep_daily/weekly/monthly` per-subvol from the config file, exclude the
    pinned pair (Rule 3), apply the pre/post "keep pairs together" check for
    root (§4), and (superset model, §9.1) keep every target whose source still
@@ -455,7 +455,7 @@ mountpoint = "/"
 
 # TARGET-side retention only (source is Snapper-owned — Decision 1). GFS thinning
 # applies ONLY to the long tail (snapshots the source has aged out); every target
-# whose source still exists is retained — the server is a superset of the source
+# whose source still exists is retained — the destination is a superset of the source
 # (Option B, §9.1). [retention.default] is the fallback; per-subvol tables override.
 [retention.default]
 keep_daily   = 14
@@ -473,8 +473,8 @@ startup, not hard-coded. Operational flags (`--server`, `--dry-run`, `--subvol`)
 override the corresponding file values via the three-tier precedence; retention
 has no CLI equivalent — it is file-only policy.
 
-The server receive directory and `.latest` contract are identical to the
-btrbk-send design, so the **restic-on-server** component (next milestone) can
+The destination receive directory and `.latest` contract are identical to the
+btrbk-send design, so the **restic-on-destination** component (next milestone) can
 point at `<recv_base>/<hostname>/<subvol>/<subvol>.latest` regardless of which
 sender is in use. This keeps the downstream restic tier decoupled from this
 decision.
@@ -484,14 +484,14 @@ decision.
 ## 9. Decisions (locked 2026-06-27)
 
 1. **Source-side retention: TARGET-ONLY.** di-snapsend prunes **only the
-   server**. All laptop/source retention is left entirely to Snapper — one owner
+   destination**. All source retention is left entirely to Snapper — one owner
    of local retention, no risk of fighting Snapper's timeline cleanup. The
    `keep_source_last` knob is **removed** from the design. di-snapsend reads
    source snapshots but never deletes them.
 
    **Superset model (Option B).** Target retention applies GFS thinning **only to
    snapshots the source has already aged out**. While a source snapshot still
-   exists, its target copy is **always retained** — the server is a *superset* of
+   exists, its target copy is **always retained** — the destination is a *superset* of
    the source. Concretely, `apply_retention` keeps the union of: the GFS
    daily/weekly/monthly set, the pinned parent (Rule 3), the root pre/post
    partners, **and every target whose source counterpart is still present**
@@ -503,10 +503,10 @@ decision.
    re-pruned — endless churn (observed live: an hourly source snapshot re-sent and
    re-deleted every run). The superset rule removes the churn *by construction*:
    the snapshots that would be re-sent are exactly the ones now pinned by
-   `source_backed`. Consequence: the server short-term holds the **full current
+   `source_backed`. Consequence: the destination short-term holds the **full current
    source set** plus a GFS-thinned long tail — more than a strict `keep_daily`
    count implies, but cheap (Btrfs COW) and the desired DR-mirror behaviour; the
-   long tail is still bounded so the server never grows without limit.
+   long tail is still bounded so the destination never grows without limit.
 
 2. **Replicate BOTH home and root.** Home is the churny personal data; root
    carries full-system DR plus the apt pre/post history. Both are sent. Root's
@@ -520,7 +520,8 @@ decision.
    `--subvol`) keep the three-tier precedence (flag > env > config).
 
 4. **Transport user: `snapsend`** (renamed from the placeholder `btrbk`). The
-   `--server` installer creates this dedicated least-privilege user.
+   `--dest` installer role (alias `--server`) creates this dedicated
+   least-privilege user.
 
 5. **Retention bucket boundaries are timezone-configurable; default LOCAL.**
    `[retention].timezone` (global, `"local"` | `"utc"`, default `"local"`; warn +
@@ -602,7 +603,7 @@ config** (GRUB setup, initramfs, EFI entries). The snapshot tiers cover `@` and
 `@home`, but the bootloader lives on separate non-Btrfs partitions. Without this
 mirror, a DR restore would have the data but not a clean path to boot it. This
 ports the original `di-btrbk.sh` boot/efi rsync logic — from a USB target to the
-server, and from a separate bash helper into a Python function.
+destination, and from a separate bash helper into a Python function.
 
 ### Behaviour
 
@@ -614,9 +615,9 @@ server, and from a separate bash helper into a Python function.
 - Runs over SSH with `--rsync-path "sudo rsync"` so the remote side can write
   the receive area as the unprivileged `snapsend` transport user.
 - **Single current copy only.** No versioning here — and it doesn't need any,
-  because the mirror lands in the server's receive area, so the **downstream
-  restic-on-server tier versions it for free** (each tool does its job: rsync
-  makes the current mirror, restic versions everything on the server).
+  because the mirror lands in the destination's receive area, so the **downstream
+  restic-on-destination tier versions it for free** (each tool does its job: rsync
+  makes the current mirror, restic versions everything on the destination).
 - **Fail-safe + independent.** A boot rsync failure is logged/warned but does
   **not** abort the snapshot tiers (and vice versa). Boot backup runs **once per
   host**, after the per-subvol replication loop.
@@ -646,7 +647,7 @@ Encoded as: `boot_backup(cfg, hostname)` + the `[boot]` config table +
   heart; all encoded, all with worked examples using real UUIDs.
 - **Numbering divergence under retention is a non-issue** — correlation is
   UUID-based; numbers are within-machine labels only.
-- **Naming:** `<num>-<short_uuid>/snapshot` on the server (received in place, no
+- **Naming:** `<num>-<short_uuid>/snapshot` on the destination (received in place, no
   subvolume `mv`); `.latest` symlink → that subvol for restic.
 - **Boot tier:** non-Btrfs `/boot` + `/boot/efi` mirrored via rsync (not
   versioned); feeds the existing `di-btrfs-recovery.sh` restore flow.

@@ -137,8 +137,9 @@ def _log(m: str) -> None:
 class Config:
     """
     Populated from /etc/snapsend/config (TOML) at startup — NOT hard-coded.
-    Operational flags (--server/--dry-run/--subvol/--no-mbuffer) override via
-    three-tier precedence; retention is file-only policy (SPEC §8/§9).
+    Operational flags (--server/--dest (destination host override), --dry-run,
+    --subvol, --no-mbuffer) override via three-tier precedence; retention is
+    file-only policy (SPEC §8/§9).
     """
     server_host: str
     server_ssh_port: int = 22
@@ -1196,8 +1197,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config",
                    default=os.environ.get("SNAPSEND_CONFIG", "/etc/snapsend/config"),
                    help="config file (default /etc/snapsend/config, $SNAPSEND_CONFIG)")
-    p.add_argument("--server", default=None,
-                   help="override the server host from config ($SNAPSEND_SERVER)")
+    # --dest/--destination are additive aliases for --server; argparse keeps the
+    # dest as "server" (first option string), so args.server / $SNAPSEND_SERVER
+    # precedence is unchanged. The flag name --server + env var stay for back-compat.
+    p.add_argument("--server", "--dest", "--destination", default=None,
+                   help="override the destination host from config "
+                        "(alias --server; $SNAPSEND_SERVER)")
     p.add_argument("--subvol", default=None,
                    help="replicate only this subvolume (name from config)")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", default=None,

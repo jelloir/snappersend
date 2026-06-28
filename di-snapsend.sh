@@ -2,13 +2,14 @@
 # di-snapsend.sh — installer for di-snapsend (the Python engine is the tool;
 # this .sh provisions the two ends, di-* suite convention).
 #
-#   di-snapsend.sh --server [PUBKEY_FILE]   provision the receive end (server)
-#   di-snapsend.sh --laptop                 install the engine + timer (laptop)
+#   di-snapsend.sh --dest   [PUBKEY_FILE]   provision the receive end (destination)
+#   di-snapsend.sh --source                 install the engine + timer (source)
+#   (aliases: --dest=--destination=--server, --source=--laptop — historical)
 #
-# Server role: dedicated least-privilege transport user, receive area, scoped
+# Destination role: dedicated least-privilege transport user, receive area, scoped
 # sudoers, and an optional forced-command ssh filter — reusable, tool-agnostic
-# (mirrors di-btrbk-send.sh's server role).
-# Laptop role: install /usr/local/bin/di-snapsend, write /etc/snapsend/config,
+# (mirrors di-btrbk-send.sh's destination role).
+# Source role: install /usr/local/bin/di-snapsend, write /etc/snapsend/config,
 # generate the transport ssh key, install + enable the systemd timer + watchdog.
 set -euo pipefail
 
@@ -71,7 +72,7 @@ EOF
 need_file() { [[ -f "$1" ]] || die "missing expected file next to installer: $1"; }
 
 # ============================================================================
-# SERVER ROLE
+# DESTINATION ROLE  (cmd_server: the historical name; role = dest)
 # ============================================================================
 cmd_server() {
     require_root
@@ -107,7 +108,7 @@ cmd_server() {
     local sudoers="/etc/sudoers.d/snapsend"
     local tmp; tmp="$(mktemp)"
     cat > "$tmp" <<EOF
-# Installed by di-snapsend.sh --server. Scoped to the commands di-snapsend runs.
+# Installed by di-snapsend.sh --dest. Scoped to the commands di-snapsend runs.
 Cmnd_Alias SNAPSEND_CMDS = \\
     /usr/bin/btrfs receive *, \\
     /usr/bin/btrfs subvolume show *, \\
@@ -135,7 +136,7 @@ EOF
     install -m 0755 "$SCRIPT_DIR/snapsend-ssh-filter" "$BIN_DIR/snapsend-ssh-filter"
     ok "installed ${BIN_DIR}/snapsend-ssh-filter"
 
-    # 5) authorize the laptop key (if provided), locked down with the filter.
+    # 5) authorize the source key (if provided), locked down with the filter.
     local ssh_dir="/home/${SNAPSEND_USER}/.ssh"
     local auth="${ssh_dir}/authorized_keys"
     local opts='command="/usr/local/bin/snapsend-ssh-filter",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding'
@@ -145,27 +146,30 @@ EOF
         local key; key="$(< "$pubkey_file")"
         touch "$auth"
         if grep -qF "$key" "$auth" 2>/dev/null; then
-            info "laptop key already authorized"
+            info "source key already authorized"
         else
             printf '%s %s\n' "$opts" "$key" >> "$auth"
-            ok "authorized laptop key (forced command + no forwarding)"
+            ok "authorized source key (forced command + no forwarding)"
         fi
         chown "$SNAPSEND_USER:$SNAPSEND_USER" "$auth"
         chmod 0600 "$auth"
     else
-        warn "no PUBKEY_FILE given — add the laptop's key to ${auth} as:"
-        echo "  ${opts} ssh-ed25519 AAAA...laptop-snapsend" >&2
+        warn "no PUBKEY_FILE given — this is the destination's first pass."
+        warn "Run '--source' on the SOURCE host to generate its key, then either"
+        warn "re-run '--dest ${KEY_PATH}.pub' here with the copied key, or add the"
+        warn "source's key to ${auth} manually as:"
+        echo "  ${opts} ssh-ed25519 AAAA...snapsend@source" >&2
     fi
 
-    ok "server provisioning complete"
+    ok "destination provisioning complete"
 }
 
 # ============================================================================
-# LAPTOP ROLE
+# SOURCE ROLE  (cmd_laptop: the historical name; role = source)
 # ============================================================================
 cmd_laptop() {
     require_root
-    step "Installing di-snapsend on the laptop"
+    step "Installing di-snapsend on the source host"
 
     # 1) dependencies
     command -v btrfs >/dev/null || die "btrfs-progs not installed"
@@ -218,12 +222,12 @@ PY
         chmod 0600 "$KEY_PATH"
         ok "generated transport key ${KEY_PATH}"
     fi
-    step "Register this key on the server:"
-    echo "  sudo ./di-snapsend.sh --server ${KEY_PATH}.pub   (run on the server with this file copied over)" >&2
+    step "Register this key on the destination host:"
+    echo "  sudo ./di-snapsend.sh --dest ${KEY_PATH}.pub   (run on the DESTINATION host with this file copied over)" >&2
     echo "  --- ${KEY_PATH}.pub ---" >&2
     cat "${KEY_PATH}.pub" >&2
 
-    # 4b) pin the server's SSH host key so the FIRST transfer doesn't die with
+    # 4b) pin the destination's SSH host key so the FIRST transfer doesn't die with
     #     "Host key verification failed". The service runs as ROOT, so the pin
     #     must land in ROOT's known_hosts (not the invoking user's). ssh-keyscan
     #     only fetches the host key — it runs no remote command, so it is NOT
@@ -244,7 +248,7 @@ PY
         done <<< "$scanned"
         ok "pinned ${cfg_host} host key"
     else
-        warn "could not fetch ${cfg_host}:${cfg_port} host key (server unreachable, or [server].host not set yet)"
+        warn "could not fetch ${cfg_host}:${cfg_port} host key (destination unreachable, or [server].host not set yet)"
         warn "after setting [server].host, run once as root:"
         echo "  sudo ssh-keyscan -p ${cfg_port} -t ed25519 ${cfg_host} >> ${kh}" >&2
     fi
@@ -274,7 +278,7 @@ PY
         warn "systemctl not found — units installed but not enabled"
     fi
 
-    ok "laptop installation complete"
+    ok "source installation complete"
 }
 
 # ============================================================================

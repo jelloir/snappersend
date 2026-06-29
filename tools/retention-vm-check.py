@@ -42,6 +42,8 @@ def main():
     ap.add_argument("subvol", help="subvol name (e.g. home) under the fabricate host")
     ap.add_argument("--host", default="fabricate-test", help="host segment (default fabricate-test)")
     ap.add_argument("--config", default=os.environ.get("SNAPSEND_CONFIG", "/etc/snapsend/config"))
+    ap.add_argument("--keep-hourly", type=int, default=0,
+                    help="finest GFS tier (default 0 = disabled, the pre-tier behaviour)")
     ap.add_argument("--keep-daily", type=int, default=14)
     ap.add_argument("--keep-weekly", type=int, default=8)
     ap.add_argument("--keep-monthly", type=int, default=6)
@@ -50,7 +52,8 @@ def main():
     a = ap.parse_args()
 
     kw = di.load_config(a.config)
-    kw["retention"] = {"default": {"keep_daily": a.keep_daily,
+    kw["retention"] = {"default": {"keep_hourly": a.keep_hourly,
+                                   "keep_daily": a.keep_daily,
                                    "keep_weekly": a.keep_weekly,
                                    "keep_monthly": a.keep_monthly}}
     cfg = di.Config(**kw)
@@ -61,11 +64,12 @@ def main():
         print(f"FAIL: no targets found under {recv} (fabricate first)")
         return 2
     nf = sorted(before, key=lambda t: (t.when or datetime.min), reverse=True)
-    decision = di._bucket_keep(nf, a.keep_daily, a.keep_weekly, a.keep_monthly,
-                               cfg.retention_timezone)
+    decision = di._bucket_keep(nf, a.keep_hourly, a.keep_daily, a.keep_weekly,
+                               a.keep_monthly, cfg.retention_timezone)
     expected = {os.path.basename(os.path.dirname(t.path)) for t in before if t.path in decision}
     print(f"enumerated {len(before)} targets; GFS decision (tz={cfg.retention_timezone}, "
-          f"d={a.keep_daily}/w={a.keep_weekly}/m={a.keep_monthly}) keeps {len(expected)}")
+          f"h={a.keep_hourly}/d={a.keep_daily}/w={a.keep_weekly}/m={a.keep_monthly}) "
+          f"keeps {len(expected)}")
 
     # EXECUTE for real (no sources -> pure GFS + execution; real ssh deletes/rmdir).
     di.apply_retention(cfg, a.subvol, [], before, recv)

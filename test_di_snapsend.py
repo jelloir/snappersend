@@ -114,11 +114,12 @@ def gen_history(start_utc, end_utc, step, recv="/recv/host/home", start_num=1):
     return out
 
 
-def oracle_keep(targets, kd, kw, km, tz):
+def oracle_keep(targets, kh, kd, kw, km, tz):
     """Reference GFS keep-set: keep the newest target of each of the most recent
-    `lim` POPULATED buckets per class (day/week/month), union; undatable always
-    kept. Group-based — deliberately a different shape from di._bucket_keep's
-    newest-first counter, so agreement is meaningful."""
+    `lim` POPULATED buckets per class (hour/day/week/month), union; undatable
+    always kept. Group-based — deliberately a different shape from di._bucket_keep's
+    newest-first counter, so agreement is meaningful. `kh` is the finest (hourly)
+    tier; kh=0 disables it → identical to the daily/weekly/monthly-only oracle."""
     keep, datable = set(), []
     for t in targets:
         (keep.add(t.path) if t.when is None else datable.append(t))
@@ -127,11 +128,12 @@ def oracle_keep(targets, kd, kw, km, tz):
     def keyset(w):
         loc = w.replace(tzinfo=_UTC).astimezone() if tz == "local" else w
         iso = loc.isocalendar()
-        return {"d": (loc.year, loc.month, loc.day),
+        return {"h": (loc.year, loc.month, loc.day, loc.hour),
+                "d": (loc.year, loc.month, loc.day),
                 "w": (iso[0], iso[1]),
                 "m": (loc.year, loc.month)}
 
-    for cls, lim in (("d", kd), ("w", kw), ("m", km)):
+    for cls, lim in (("h", kh), ("d", kd), ("w", kw), ("m", km)):
         if lim <= 0:
             continue
         order, newest = [], {}
@@ -409,7 +411,7 @@ class TestBucketKeep(unittest.TestCase):
 
     def test_keep_daily_limits(self):
         targets = self._daily_targets(10)
-        keep = di._bucket_keep(targets, keep_daily=3, keep_weekly=0, keep_monthly=0, tz="utc")
+        keep = di._bucket_keep(targets, keep_hourly=0, keep_daily=3, keep_weekly=0, keep_monthly=0, tz="utc")
         # newest 3 distinct days kept
         self.assertEqual(keep, {"/d0", "/d1", "/d2"})
 
@@ -418,19 +420,19 @@ class TestBucketKeep(unittest.TestCase):
         b = mksub(path="/b", creation=datetime(2026, 6, 27, 23, 0))  # newest of day
         c = mksub(path="/c", creation=datetime(2026, 6, 26, 23, 0))
         targets = sorted([a, b, c], key=lambda t: t.when, reverse=True)
-        keep = di._bucket_keep(targets, keep_daily=2, keep_weekly=0, keep_monthly=0, tz="utc")
+        keep = di._bucket_keep(targets, keep_hourly=0, keep_daily=2, keep_weekly=0, keep_monthly=0, tz="utc")
         self.assertIn("/b", keep)   # newest of the 27th
         self.assertIn("/c", keep)   # the 26th
         self.assertNotIn("/a", keep)
 
     def test_undatable_kept(self):
         t = mksub(path="/u", creation=None)
-        keep = di._bucket_keep([t], keep_daily=0, keep_weekly=0, keep_monthly=0, tz="utc")
+        keep = di._bucket_keep([t], keep_hourly=0, keep_daily=0, keep_weekly=0, keep_monthly=0, tz="utc")
         self.assertIn("/u", keep)
 
     def test_zero_policy_keeps_nothing_datable(self):
         targets = self._daily_targets(3)
-        keep = di._bucket_keep(targets, 0, 0, 0, tz="utc")
+        keep = di._bucket_keep(targets, 0, 0, 0, 0, tz="utc")
         self.assertEqual(keep, set())
 
 
@@ -597,6 +599,25 @@ class TestLoadConfig(unittest.TestCase):
         cfg = di.Config(**di.load_config(self._write(SAMPLE_CONFIG)))
         # retention_for an unknown subvol must fall back without KeyError
         self.assertIn("keep_daily", cfg.retention_for("unknown"))
+
+    def test_keep_hourly_absent_defaults_to_zero(self):
+        # BACK-COMPAT GUARD: a partial config table that omits keep_hourly must
+        # parse to 0 (hourly disabled) so existing deployments are byte-for-byte
+        # unchanged. SAMPLE_CONFIG's [retention.home] has no keep_hourly.
+        cfg = di.Config(**di.load_config(self._write(SAMPLE_CONFIG)))
+        self.assertEqual(cfg.retention_for("home")["keep_hourly"], 0)
+
+    def test_keep_hourly_parsed_when_present(self):
+        cfg = di.Config(**di.load_config(self._write(
+            SAMPLE_CONFIG + "\n[retention.root]\nkeep_hourly = 48\n"
+                            "keep_daily = 30\n")))
+        self.assertEqual(cfg.retention_for("root")["keep_hourly"], 48)
+
+    def test_synthesized_default_carries_new_install_hourly(self):
+        # The synthesized [retention.default] (table present, default absent) is the
+        # "new install" case → keep_hourly=24, NOT the absent-key=0 partial rule.
+        cfg = di.Config(**di.load_config(self._write(SAMPLE_CONFIG)))
+        self.assertEqual(cfg.retention_for("unknown")["keep_hourly"], 24)
 
     def test_missing_host_raises(self):
         with self.assertRaises(KeyError):
@@ -954,7 +975,7 @@ class TestRetentionTimezone(unittest.TestCase):
         A = self._t("/A", datetime(2026, 6, 28, 22, 0))
         B = self._t("/B", datetime(2026, 7, 1, 2, 0))
         with use_tz("Australia/Brisbane"):
-            keep = di._bucket_keep([B, A], 0, 2, 0, tz="local")   # keep_weekly=2
+            keep = di._bucket_keep([B, A], 0, 0, 2, 0, tz="local")   # keep_weekly=2
         # Local: A and B share local week 27 -> single weekly rep (newest, B). The
         # Monday-morning snapshot is correctly THIS week, not the previous one.
         self.assertEqual(keep, {"/B"})
@@ -963,7 +984,7 @@ class TestRetentionTimezone(unittest.TestCase):
         # Same instants, tz="utc": A lands in the PRIOR UTC week -> kept separately.
         A = self._t("/A", datetime(2026, 6, 28, 22, 0))
         B = self._t("/B", datetime(2026, 7, 1, 2, 0))
-        keep = di._bucket_keep([B, A], 0, 2, 0, tz="utc")
+        keep = di._bucket_keep([B, A], 0, 0, 2, 0, tz="utc")
         self.assertEqual(keep, {"/A", "/B"})     # week 26 + week 27, both kept
 
     def test_daily_boundary_local_vs_utc(self):
@@ -976,11 +997,11 @@ class TestRetentionTimezone(unittest.TestCase):
         nextd = self._t("/next", datetime(2026, 6, 27, 16, 0))
         targets = sorted([nine, late, nextd], key=lambda t: t.when, reverse=True)
         with use_tz("Australia/Brisbane"):
-            keep_local = di._bucket_keep(targets, 2, 0, 0, tz="local")   # keep_daily=2
+            keep_local = di._bucket_keep(targets, 0, 2, 0, 0, tz="local")   # keep_daily=2
         # Local days: Jun27 (09:00 + 23:00 BNE) and Jun28 (02:00 BNE). Daily keeps
         # the newest of each local day -> 23:00 BNE for Jun27, 02:00 BNE for Jun28.
         self.assertEqual(keep_local, {"/23", "/next"})
-        keep_utc = di._bucket_keep(targets, 2, 0, 0, tz="utc")
+        keep_utc = di._bucket_keep(targets, 0, 2, 0, 0, tz="utc")
         # UTC days: Jun26 (/09) and Jun27 (/23, /next) -> newest of Jun27 is /next.
         self.assertEqual(keep_utc, {"/09", "/next"})
 
@@ -1050,12 +1071,12 @@ LON = "Europe/London"             # DST zone for the transition scenarios
 class TestRetentionExhaustive(unittest.TestCase):
     """GFS keep-set (`_bucket_keep`) across long spans + irregular cadences."""
 
-    def _assert_matches_oracle(self, targets, kd, kw, km, tz, scenario):
+    def _assert_matches_oracle(self, targets, kd, kw, km, tz, scenario, kh=0):
         nf = sorted(targets, key=lambda t: t.when, reverse=True)
-        keep = di._bucket_keep(nf, kd, kw, km, tz)
-        self.assertEqual(keep, oracle_keep(targets, kd, kw, km, tz),
+        keep = di._bucket_keep(nf, kh, kd, kw, km, tz)
+        self.assertEqual(keep, oracle_keep(targets, kh, kd, kw, km, tz),
                          f"{scenario} [{tz}]: engine keep-set != oracle")
-        _report(f"{scenario} [{tz}] kd={kd} kw={kw} km={km}", targets, keep)
+        _report(f"{scenario} [{tz}] kh={kh} kd={kd} kw={kw} km={km}", targets, keep)
         return keep
 
     def _newest_of_each(self, targets, keyfn, tz):
@@ -1153,8 +1174,8 @@ class TestRetentionExhaustive(unittest.TestCase):
         b = datetime(2026, 6, 27, 16, 0)
         with use_tz(BNE):
             A, B = mktarget(a, 1), mktarget(b, 2)
-            keep_local = di._bucket_keep([B, A], 1, 0, 0, "local")
-        keep_utc = di._bucket_keep([B, A], 1, 0, 0, "utc")
+            keep_local = di._bucket_keep([B, A], 0, 1, 0, 0, "local")
+        keep_utc = di._bucket_keep([B, A], 0, 1, 0, 0, "utc")
         # local: A is Jun27, B is Jun28 -> different local days; keep_daily=1 keeps
         # only the newest local day (B).
         self.assertEqual(keep_local, {B.path})
@@ -1164,8 +1185,8 @@ class TestRetentionExhaustive(unittest.TestCase):
         # add C = 13:00 UTC Jun27 (= 23:00 BNE Jun27, same local day as A, same utc day as B)
         with use_tz(BNE):
             C = mktarget(datetime(2026, 6, 27, 13, 0), 3)
-            kl = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 2, 0, 0, "local")
-        ku = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 2, 0, 0, "utc")
+            kl = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 0, 2, 0, 0, "local")
+        ku = di._bucket_keep(sorted([A, B, C], key=lambda t: t.when, reverse=True), 0, 2, 0, 0, "utc")
         # local days: Jun27 {A(09:00),C(23:00)} -> newest C ; Jun28 {B} -> B.  keep {C,B}
         self.assertEqual(kl, {C.path, B.path})
         # utc days:   Jun26 {A} ; Jun27 {C(13:00),B(16:00)} -> newest B.  keep {B,A}
@@ -1177,7 +1198,7 @@ class TestRetentionExhaustive(unittest.TestCase):
         feb = datetime(2026, 1, 31, 14, 30)   # 00:30 BNE Feb01
         with use_tz(BNE):
             J, F = mktarget(jan, 1), mktarget(feb, 2)
-            keep = di._bucket_keep([F, J], 0, 0, 2, "local")   # keep_monthly=2
+            keep = di._bucket_keep([F, J], 0, 0, 0, 2, "local")   # keep_monthly=2
         # distinct local months Jan + Feb -> both kept
         self.assertEqual(keep, {J.path, F.path})
 
@@ -1186,9 +1207,9 @@ class TestRetentionExhaustive(unittest.TestCase):
         sun = datetime(2026, 6, 28, 12, 0)    # Sunday  -> ISO week 26
         mon = datetime(2026, 6, 29, 12, 0)    # Monday  -> ISO week 27
         S, M = mktarget(sun, 1), mktarget(mon, 2)
-        keep = di._bucket_keep([M, S], 0, 2, 0, "utc")        # keep_weekly=2
+        keep = di._bucket_keep([M, S], 0, 0, 2, 0, "utc")        # keep_weekly=2
         self.assertEqual(keep, {S.path, M.path})              # distinct ISO weeks
-        keep1 = di._bucket_keep([M, S], 0, 1, 0, "utc")
+        keep1 = di._bucket_keep([M, S], 0, 0, 1, 0, "utc")
         self.assertEqual(keep1, {M.path})                     # newest week only
 
     def test_boundary_leap_day(self):
@@ -1198,7 +1219,7 @@ class TestRetentionExhaustive(unittest.TestCase):
         after = datetime(2024, 3, 1, 12, 0)
         targets = [mktarget(before, 1), mktarget(leap, 2), mktarget(after, 3)]
         keep = di._bucket_keep(sorted(targets, key=lambda t: t.when, reverse=True),
-                               3, 0, 0, "utc")
+                               0, 3, 0, 0, "utc")
         self.assertEqual(len(keep), 3)                        # 3 distinct days kept
         self.assertEqual(keep, {t.path for t in targets})
 
@@ -1210,9 +1231,9 @@ class TestRetentionExhaustive(unittest.TestCase):
             hist = gen_history(datetime(2026, 3, 1, 0, 0),
                                datetime(2026, 11, 1, 0, 0), _td(hours=1))
             nf = sorted(hist, key=lambda t: t.when, reverse=True)
-            keep = di._bucket_keep(nf, 14, 8, 6, "local")
+            keep = di._bucket_keep(nf, 0, 14, 8, 6, "local")
             # oracle must convert under the SAME pinned zone -> assert inside the block
-            self.assertEqual(keep, oracle_keep(hist, 14, 8, 6, "local"))
+            self.assertEqual(keep, oracle_keep(hist, 0, 14, 8, 6, "local"))
         self.assertLessEqual(len(keep), 14 + 8 + 6 + 1)       # at most a 1-day cosmetic excess
         _report("dst-transition [local]", hist, keep)
 
@@ -1223,11 +1244,11 @@ class TestRetentionExhaustive(unittest.TestCase):
                                datetime(2025, 3, 1, 0, 0), _td(days=1))
         nf = sorted(hist, key=lambda t: t.when, reverse=True)
         # only weekly enabled
-        self.assertEqual(di._bucket_keep(nf, 0, 4, 0, "utc"),
-                         oracle_keep(hist, 0, 4, 0, "utc"))
+        self.assertEqual(di._bucket_keep(nf, 0, 0, 4, 0, "utc"),
+                         oracle_keep(hist, 0, 0, 4, 0, "utc"))
         # all-zero -> nothing kept by GFS (pin/source-backed are added by
         # apply_retention, not here)
-        self.assertEqual(di._bucket_keep(nf, 0, 0, 0, "utc"), set())
+        self.assertEqual(di._bucket_keep(nf, 0, 0, 0, 0, "utc"), set())
 
     # (11) Undatable safety --------------------------------------------------
     def test_undatable_never_deleted_amid_history(self):
@@ -1236,9 +1257,153 @@ class TestRetentionExhaustive(unittest.TestCase):
                                datetime(2025, 2, 1, 0, 0), _td(days=1))
         bad = mksub(path="/recv/host/home/garbled-name/snapshot", uuid="g", info_time=None)
         nf = sorted(hist + [bad], key=lambda t: (t.when or datetime.min), reverse=True)
-        keep = di._bucket_keep(nf, 7, 2, 1, "utc")
+        keep = di._bucket_keep(nf, 0, 7, 2, 1, "utc")
         self.assertIn(bad.path, keep)                         # never delete the unparseable one
-        self.assertEqual(keep, oracle_keep(hist + [bad], 7, 2, 1, "utc"))
+        self.assertEqual(keep, oracle_keep(hist + [bad], 0, 7, 2, 1, "utc"))
+
+
+KOL = "Asia/Kolkata"              # UTC+5:30 — a half-hour offset that shifts the
+                                  # HOURLY partition (not just the hour label), so a
+                                  # tz change can move two snaps into/out of one bucket
+
+
+class TestRetentionHourly(unittest.TestCase):
+    """The new finest GFS tier: `keep_hourly` keeps the newest snapshot of each of
+    the most recent N distinct hours, slotting in above daily. Validated against the
+    independent group-based `oracle_keep` (now hourly-aware) plus concrete invariants.
+    `keep_hourly=0` is the back-compat regression guard: identical to the pre-tier
+    daily/weekly/monthly-only GFS."""
+
+    @staticmethod
+    def _hour_key(t, tz):
+        loc = (t.when.replace(tzinfo=_UTC).astimezone() if tz == "local" else t.when)
+        return (loc.year, loc.month, loc.day, loc.hour)
+
+    # (1) Hourly keeps the newest rep of each of the most recent N hours ---------
+    def test_hourly_keeps_per_hour_reps(self):
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                # 48 distinct hours, 3 snaps per hour (every 20 min) -> 144 targets.
+                hist = gen_history(datetime(2026, 6, 25, 0, 0),
+                                   datetime(2026, 6, 27, 0, 0), _td(minutes=20))
+                nf = sorted(hist, key=lambda t: t.when, reverse=True)
+                keep = di._bucket_keep(nf, 24, 0, 0, 0, tz)   # hourly only
+                # engine == independent oracle
+                self.assertEqual(keep, oracle_keep(hist, 24, 0, 0, 0, tz),
+                                 f"hourly-reps [{tz}]: engine != oracle")
+            # exactly the 24 most-recent distinct hours are represented...
+            kept = [t for t in hist if t.path in keep]
+            kept_hours = {self._hour_key(t, tz) for t in kept}
+            self.assertEqual(len(keep), 24)
+            self.assertEqual(len(kept_hours), 24)            # one rep per hour, no dupes
+            # ...each kept snap is the NEWEST of its hour (the :40 of three :00/:20/:40)
+            by_hour = {}
+            for t in hist:
+                by_hour.setdefault(self._hour_key(t, tz), []).append(t)
+            for t in kept:
+                hour_newest = max(by_hour[self._hour_key(t, tz)], key=lambda x: x.when)
+                self.assertEqual(t.path, hour_newest.path)
+            # a snapshot older than the 24 most recent hours is NOT kept (no d/w/m
+            # tier to rescue it)
+            oldest = min(hist, key=lambda t: t.when)
+            self.assertNotIn(oldest.path, keep)
+
+    # (2) Hourly ∪ daily union ---------------------------------------------------
+    def test_hourly_and_daily_union(self):
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                # 20 days of hourly snapshots
+                hist = gen_history(datetime(2026, 6, 8, 0, 0),
+                                   datetime(2026, 6, 28, 0, 0), _td(hours=1))
+                nf = sorted(hist, key=lambda t: t.when, reverse=True)
+                keep = di._bucket_keep(nf, 24, 14, 0, 0, tz)
+                self.assertEqual(keep, oracle_keep(hist, 24, 14, 0, 0, tz),
+                                 f"hourly+daily union [{tz}]: engine != oracle")
+            kept = [t for t in hist if t.path in keep]
+            # the last 24 hours keep hourly granularity -> 24 distinct hours
+            kept_hours = {self._hour_key(t, tz) for t in kept}
+            self.assertGreaterEqual(len(kept_hours), 24)
+            # AND 14 distinct days are represented (the daily reps for days 2..14
+            # plus the 24 hourly reps living inside the most recent day(s))
+            day = lambda t: self._hour_key(t, tz)[:3]
+            kept_days = {day(t) for t in kept}
+            self.assertEqual(len(kept_days), 14)
+            # union counted once: |keep| == |hourly reps ∪ daily reps|, i.e. a snap
+            # that is BOTH newest-of-hour and newest-of-day is a single path. With
+            # hourly=24 inside one day, the 14-day daily set contributes 13 NEW days
+            # beyond the hourly band's day(s); total stays bounded by the sum.
+            self.assertLessEqual(len(keep), 24 + 14)
+            self.assertIn(max(hist, key=lambda t: t.when).path, keep)   # newest always
+
+    # (3) keep_hourly=0 disables the tier — BACK-COMPAT REGRESSION GUARD ---------
+    def test_keep_hourly_zero_is_byte_for_byte_old_behaviour(self):
+        # A dense sub-hourly history under a full d/w/m policy. With keep_hourly=0 the
+        # keep-set must equal the oracle computed WITHOUT any hourly tier — i.e. the
+        # exact result the engine produced before this tier existed.
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                hist = gen_history(datetime(2026, 1, 1, 0, 0),
+                                   datetime(2026, 6, 28, 0, 0), _td(hours=6))
+                nf = sorted(hist, key=lambda t: t.when, reverse=True)
+                keep0 = di._bucket_keep(nf, 0, 14, 8, 6, tz)
+                self.assertEqual(keep0, oracle_keep(hist, 0, 14, 8, 6, tz),
+                                 f"kh=0 must match the pre-tier d/w/m GFS [{tz}]")
+                # and enabling hourly is purely ADDITIVE: kh=0's keep-set is a subset
+                # of kh=24's (the tier only ever widens the union).
+                keep24 = di._bucket_keep(nf, 24, 14, 8, 6, tz)
+                self.assertTrue(keep0 <= keep24,
+                                f"hourly tier must only widen the keep-set [{tz}]")
+
+    # (4) The asymmetry-warning resolution: hourlies become policy, not overflow --
+    def test_source_hourly_band_enters_keepset_when_matched(self):
+        # The real scenario: the source (Snapper) holds ~48 hourlies. With the
+        # destination's keep_hourly matched (=48), every one of those hourlies has a
+        # real GFS bucket, so _bucket_keep returns ALL of them -> they're "within
+        # policy", NOT source-backed overflow. This is what empties the override set
+        # for the hourly band (see test_hourly_tier_quiets_override).
+        for tz in ("local", "utc"):
+            with use_tz(BNE):
+                hist = gen_history(datetime(2026, 6, 25, 0, 0),
+                                   datetime(2026, 6, 27, 0, 0), _td(hours=1))  # 48 hourly
+                nf = sorted(hist, key=lambda t: t.when, reverse=True)
+                self.assertEqual(len(hist), 48)
+                keep = di._bucket_keep(nf, 48, 0, 0, 0, tz)
+            self.assertEqual(keep, {t.path for t in hist},
+                             f"all 48 hourlies must be within policy [{tz}]")
+
+    # (5) Hourly bucket honours the tz boundary, like the coarser tiers ----------
+    def test_hourly_boundary_whole_hour_zone(self):
+        # Two snaps in the SAME local hour (:10 and :50) + one in the next hour.
+        #   utc 00:10 -> BNE 10:10 | utc 00:50 -> BNE 10:50 (both local hour 10)
+        #   utc 01:30 -> BNE 11:30 (local hour 11)
+        ten10 = mktarget(datetime(2026, 6, 27, 0, 10), 1)
+        ten50 = mktarget(datetime(2026, 6, 27, 0, 50), 2)   # newest of hour 10
+        eleven = mktarget(datetime(2026, 6, 27, 1, 30), 3)
+        nf = sorted([ten10, ten50, eleven], key=lambda t: t.when, reverse=True)
+        with use_tz(BNE):
+            keep_local = di._bucket_keep(nf, 24, 0, 0, 0, "local")
+        keep_utc = di._bucket_keep(nf, 24, 0, 0, 0, "utc")
+        # Same hour -> only the newer (:50) survives; next hour is a separate bucket.
+        # Whole-hour offset: the local and utc partitions coincide, so the keep-set
+        # is identical under both (the boundaries shift together, like daily here).
+        self.assertEqual(keep_local, {ten50.path, eleven.path})
+        self.assertEqual(keep_utc, {ten50.path, eleven.path})
+        self.assertNotIn(ten10.path, keep_local)
+
+    def test_hourly_boundary_half_hour_zone_shifts_partition(self):
+        # A half-hour zone (UTC+5:30) makes the hourly PARTITION itself move with tz —
+        # the same demonstration the day/week/month tiers make, one tier finer.
+        #   utc 00:10 -> KOL 05:40 (local hour 05) | utc 00:50 -> KOL 06:20 (hour 06)
+        a = mktarget(datetime(2026, 6, 27, 0, 10), 1)
+        b = mktarget(datetime(2026, 6, 27, 0, 50), 2)
+        nf = sorted([a, b], key=lambda t: t.when, reverse=True)
+        with use_tz(KOL):
+            keep_local = di._bucket_keep(nf, 24, 0, 0, 0, "local")
+        keep_utc = di._bucket_keep(nf, 24, 0, 0, 0, "utc")
+        # Local: distinct hours 05 and 06 -> BOTH kept.
+        self.assertEqual(keep_local, {a.path, b.path})
+        # UTC: both in hour 00 -> only the newer (b) survives.
+        self.assertEqual(keep_utc, {b.path})
 
 
 class TestRetentionApplyInteractions(unittest.TestCase):
@@ -1442,7 +1607,7 @@ class TestRetentionTierInteraction(unittest.TestCase):
             #     GFS weekly/monthly reps survive; the rest prune. So weekly/monthly
             #     config is NOT ignored.
             nf_tail = sorted(tail, key=lambda t: t.when, reverse=True)
-            gfs_all = oracle_keep(targets, 14, 8, 6, tz)
+            gfs_all = oracle_keep(targets, 0, 14, 8, 6, tz)
             tail_survivors = {t.path for t in tail if t.path not in deleted}
             tail_expected = {t.path for t in tail if t.path in gfs_all}
             self.assertEqual(tail_survivors, tail_expected,
@@ -1489,6 +1654,38 @@ class TestRetentionTierInteraction(unittest.TestCase):
                                   datetime(2026, 1, 6, 0, 0), _td(days=1))
         self._run("home", [], targets, 2, 0, 0, "utc")
         self.assertFalse(self._override_logged())
+
+    # ---- §5: the hourly tier self-corrects the override line ----------------
+    def _run_hourly(self, sources, targets, kh, kd, tz):
+        """apply_retention with an explicit keep_hourly policy (the class _run/_cfg
+        helpers predate the tier and only carry d/w/m)."""
+        self.deleted, self.logs = [], []
+        cfg = di.Config(server_host="h", retention_timezone=tz, retention={
+            "default": {"keep_hourly": kh, "keep_daily": kd,
+                        "keep_weekly": 0, "keep_monthly": 0}})
+        di.apply_retention(cfg, "home", sources, targets, "/recv/host/home")
+
+    def test_hourly_tier_quiets_override(self):
+        # THE BRIEF'S MOTIVATING CASE. Source (Snapper) holds 48 hourlies, all still
+        # present -> all source-backed. The destination's smallest bucket being daily
+        # makes 46 of them "beyond policy but source-backed" -> the noisy INFO line.
+        with use_tz(BNE):
+            targets = gen_history(datetime(2026, 6, 25, 2, 0),
+                                  datetime(2026, 6, 27, 2, 0), _td(hours=1))  # 48 hourly
+        sources = [mksource(t.snapper_num) for t in targets]
+
+        # keep_hourly=0 (today's behaviour): daily-only bucket -> override fires.
+        self._run_hourly(sources, targets, 0, 2, "utc")
+        self.assertTrue(self._override_logged(),
+                        "with no hourly tier the source's hourlies read as overflow")
+
+        # keep_hourly=48 (matched to source): every hourly now has a real bucket ->
+        # source_backed - keep_paths is empty -> the override line STOPS firing.
+        self._run_hourly(sources, targets, 48, 2, "utc")
+        self.assertFalse(self._override_logged(),
+                         "matched keep_hourly must quiet the 'holding N extra' line")
+        # and nothing is pruned (all source-backed AND all within policy)
+        self.assertEqual(self.deleted, [])
 
 
 if __name__ == "__main__":

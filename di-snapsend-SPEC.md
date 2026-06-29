@@ -5,6 +5,14 @@
 **Companion file:** `di-snapsend-DESIGN.py` (annotated skeleton — the structural
 contract; this document is the *why* and the worked examples behind it).
 
+**Changelog:**
+- **2026-06-29 — added optional `keep_hourly` retention tier.** A fourth, finest GFS
+  tier above daily, so the destination can match Snapper's hourly granularity and quiet
+  the "source holding N extra" INFO line for the hourly band (§9). Existing configs
+  without the key are **unchanged** (hourly disabled, `0`). New installs default to
+  `keep_hourly = 24`. Additive only — correlation, transfer, naming, Option B, and the
+  override-logging logic are untouched.
+
 ---
 
 ## 1. What this tool is
@@ -360,10 +368,11 @@ Bodies to fill in the skeleton (search for `NotImplementedError` /
 
 3. **`apply_retention()`** — **target-only** (Decision 1): prune only the
    destination; never touch source snapshots (Snapper owns those). Implement
-   `keep_daily/weekly/monthly` per-subvol from the config file, exclude the
+   `keep_hourly/daily/weekly/monthly` per-subvol from the config file, exclude the
    pinned pair (Rule 3), apply the pre/post "keep pairs together" check for
    root (§4), and (superset model, §9.1) keep every target whose source still
-   exists — GFS thins only the source-aged-out long tail. Retention buckets need
+   exists — GFS thins only the source-aged-out long tail. Retention tiers are
+   hourly/daily/weekly/monthly (hourly optional, default-disabled on upgrade). Buckets need
    real timestamps (from `info.xml` or subvol creation time), not just numbers —
    see task 5.
 
@@ -458,15 +467,24 @@ mountpoint = "/"
 # whose source still exists is retained — the destination is a superset of the source
 # (Option B, §9.1). [retention.default] is the fallback; per-subvol tables override.
 [retention.default]
+keep_hourly  = 24             # finest tier; match the source's Snapper hourly count
 keep_daily   = 14
 keep_weekly  = 8
 keep_monthly = 6
 
 [retention.root]
+keep_hourly  = 24
 keep_daily   = 30             # apt pre/post history kept longer
 keep_weekly  = 12
 keep_monthly = 12
 ```
+
+> **`keep_hourly` back-compat:** the per-table parser reads `keep_hourly` with a
+> default of **0** (`int(t.get("keep_hourly", 0))`), so a config table that omits the
+> key disables the hourly tier — pruning is byte-for-byte identical to releases before
+> the tier existed. The shipped `config.example.toml` and the built-in `Config`
+> defaults use `24` for new installs. Upgrading an existing deployment therefore never
+> silently changes its retention; opting in is an explicit `keep_hourly = N`.
 
 `Config` (the dataclass in the skeleton) is **populated from this file** at
 startup, not hard-coded. Operational flags (`--server`, `--dry-run`, `--subvol`)
@@ -493,7 +511,7 @@ decision.
    snapshots the source has already aged out**. While a source snapshot still
    exists, its target copy is **always retained** — the destination is a *superset* of
    the source. Concretely, `apply_retention` keeps the union of: the GFS
-   daily/weekly/monthly set, the pinned parent (Rule 3), the root pre/post
+   hourly/daily/weekly/monthly set, the pinned parent (Rule 3), the root pre/post
    partners, **and every target whose source counterpart is still present**
    (`source_backed`). Only the "long tail" — targets whose source is gone — is
    GFS-thinned. This is required for correctness, not just tidiness: the "what to
@@ -526,11 +544,13 @@ decision.
 5. **Retention bucket boundaries are timezone-configurable; default LOCAL.**
    `[retention].timezone` (global, `"local"` | `"utc"`, default `"local"`; warn +
    fall back to local on an unrecognized value) chooses the calendar used for the
-   GFS daily/weekly/monthly **bucket boundaries**:
-   - `"local"` (default) — day/week/month boundaries align to **this machine's
+   GFS hourly/daily/weekly/monthly **bucket boundaries**:
+   - `"local"` (default) — hour/day/week/month boundaries align to **this machine's
      local calendar**, so a "Monday weekly" is the operator's local Monday. The
      internal datetime layer is naive-UTC; `_bucket_keep` converts each `when` to
-     local **only** to extract the bucket key.
+     local **only** to extract the bucket key. The hourly bucket key is
+     `(year, month, day, hour)` from that same zone-shifted instant, so it honours
+     the timezone exactly like the coarser tiers.
    - `"utc"` — UTC boundaries, fully timezone-independent (for strict cross-zone
      determinism / shared setups).
 
@@ -541,11 +561,22 @@ decision.
    unaffected.
 
    **DST is safe.** Local bucketing needs no DST special-casing. The only effect is
-   cosmetic and harmless: on a fall-back day a local bucket may keep two snapshots
-   instead of one; on spring-forward the day is an hour short. Neither loses data
-   nor breaks the chain — a once-a-year off-by-one in *how many* snapshots are kept
-   that single day. (Folder names are always local-time **+ UTC offset** — §4 — so
-   even the repeated fall-back hour yields distinct, non-colliding names.)
+   cosmetic and harmless: on a fall-back day/hour a local bucket may keep two snapshots
+   instead of one; on spring-forward it is short. Neither loses data nor breaks the
+   chain — a once-a-year off-by-one in *how many* snapshots are kept that single
+   day/hour. The DST caveat applies to the hourly tier identically to daily/weekly/
+   monthly. (Folder names are always local-time **+ UTC offset** — §4 — so even the
+   repeated fall-back hour yields distinct, non-colliding names.)
+
+   **GFS taper (four tiers).** `_bucket_keep` walks targets newest-first and keeps the
+   newest snapshot of each populated bucket, for the most recent `keep_hourly` hours /
+   `keep_daily` days / `keep_weekly` ISO-weeks / `keep_monthly` months (union, kept
+   once if a snapshot is the rep of several tiers). The tiers run finest→coarsest —
+   **hourly → daily → weekly → monthly** — hourly being the finest granularity and
+   shortest reach. Each tier is independent and any tier set to `0` is disabled (the
+   `lim[p] > 0` guard); `keep_hourly = 0` therefore reduces to the original
+   daily/weekly/monthly GFS. The hourly tier exists to let the destination match
+   Snapper's hourly granularity on the source (see the union-rule note below).
 
 ### Source vs destination retention interaction (the union rule)
 
@@ -567,6 +598,17 @@ retention reaches further back wins, per tier:**
   implies" is visible. Log-only; it changes no keep/prune decision.
 - Mixed: resolved per-tier in one run.
 
+**The hourly tier and the override line.** The classic instance of "source longer than
+destination" was the *hourly* band: Snapper keeps ~48 hourlies on the source, but with
+daily as di-snapsend's finest bucket, every intra-day hourly was source-backed yet
+"beyond policy", so the override INFO line reported a count climbing through the day and
+dropping at the daily rollover (accurate but noisy). Setting `keep_hourly` ≥ the source's
+hourly count gives those snapshots a real GFS bucket: they enter `keep_paths` via the
+hourly tier, leave the `override = source_backed − keep_paths` set, and the line stops
+reporting the hourly band. The override-logging logic is **unchanged** — it self-corrects
+once the tier is configured. Left at `0`/unset, the message behaves exactly as before
+(the destination genuinely has a coarser policy than the source).
+
 **Guidance:** set each destination tier ≥ the corresponding source tier and keep the
 source retention short — then the destination governs the archive, the source stays
 lean, and shortening the source never reduces recoverability. The union rule is also
@@ -578,10 +620,13 @@ the README's "Retention" section.
 
 Example starting policy — tune in the config file as the destination fills:
 
-| Subvol | keep_daily | keep_weekly | keep_monthly | Rationale |
-|--------|-----------|-------------|--------------|-----------|
-| home | 14 | 8 | 6 | Personal data; long tail on cheap storage |
-| root | 30 | 12 | 12 | Keep apt pre/post upgrade history longer for system rollback |
+| Subvol | keep_hourly | keep_daily | keep_weekly | keep_monthly | Rationale |
+|--------|-------------|-----------|-------------|--------------|-----------|
+| home | 24 | 14 | 8 | 6 | Personal data; long tail on cheap storage |
+| root | 24 | 30 | 12 | 12 | Keep apt pre/post upgrade history longer for system rollback |
+
+`keep_hourly` is new-install default `24`; on an existing config that omits it the
+hourly tier stays disabled (`0`) — see the back-compat note in §8.
 
 These are the "long retention on cheap on-prem storage" tier — deliberately
 generous since Btrfs COW makes history cheap. Adjust freely; the pin guard

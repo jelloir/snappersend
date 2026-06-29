@@ -160,9 +160,14 @@ class Config:
     # TARGET-ONLY retention (Decision 1): source is Snapper-owned, never pruned
     # here. Per-subvol policy; falls back to "default". The pinned parent
     # (Rule 3) is always excluded from deletion.
+    # Built-in defaults are the "no config at all" case → recommended new-install
+    # values, including keep_hourly=24 (finest GFS tier, matches Snapper's hourly
+    # granularity). Note the asymmetry with load_config: a PARTIAL config table that
+    # omits keep_hourly parses to 0 (disabled) for byte-for-byte back-compat, but
+    # these built-ins (used only when no table is supplied) carry the new default.
     retention: dict = field(default_factory=lambda: {
-        "default": {"keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
-        "root":    {"keep_daily": 30, "keep_weekly": 12, "keep_monthly": 12},
+        "default": {"keep_hourly": 24, "keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
+        "root":    {"keep_hourly": 24, "keep_daily": 30, "keep_weekly": 12, "keep_monthly": 12},
     })
     # Calendar used for daily/weekly/monthly bucket BOUNDARIES (SPEC §9):
     # "local" (default) aligns to this machine's local calendar; "utc" uses UTC
@@ -257,12 +262,20 @@ def load_config(path: str = "/etc/snapsend/config") -> dict:
             if not isinstance(t, dict):   # skip scalars like `timezone`
                 continue
             parsed[name] = {
+                # Absent keep_hourly = 0 = hourly tier disabled = behaviour
+                # identical to releases before this tier existed (back-compat:
+                # existing partial configs are byte-for-byte unchanged).
+                "keep_hourly": int(t.get("keep_hourly", 0)),
                 "keep_daily": int(t.get("keep_daily", 0)),
                 "keep_weekly": int(t.get("keep_weekly", 0)),
                 "keep_monthly": int(t.get("keep_monthly", 0)),
             }
+        # The synthesized fallback `default` is the "[retention] table existed but
+        # had no [retention.default]" case — mirror the example/new-install default
+        # (keep_hourly=24), not the absent-key=0 partial-config rule above.
         parsed.setdefault(
-            "default", {"keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6}
+            "default",
+            {"keep_hourly": 24, "keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
         )
         kwargs["retention"] = parsed
 
@@ -874,28 +887,34 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
 # ============================================================================
 
 def _bucket_keep(targets_newest_first: list[Subvol],
-                 keep_daily: int, keep_weekly: int, keep_monthly: int,
-                 tz: str = "local") -> set:
+                 keep_hourly: int, keep_daily: int, keep_weekly: int,
+                 keep_monthly: int, tz: str = "local") -> set:
     """
     GFS (grandfather-father-son) keep-set over already-newest-first targets.
     Returns the set of target.path to KEEP: the newest snapshot of each of the
-    most recent `keep_daily` days, `keep_weekly` ISO-weeks, and `keep_monthly`
-    months (union). Undatable targets are kept (we never delete what we can't
-    place). Same semantics as btrbk/borg/restic prune.
+    most recent `keep_hourly` hours, `keep_daily` days, `keep_weekly` ISO-weeks,
+    and `keep_monthly` months (union). Undatable targets are kept (we never delete
+    what we can't place). Same semantics as btrbk/borg/restic prune.
+
+    The hourly tier is the finest GFS granularity (shortest reach): its bucket key
+    includes the hour — `(year, month, day, hour)` — so it keeps the newest
+    snapshot of each of the most recent `keep_hourly` distinct hours. It slots in
+    ABOVE daily in the taper. `keep_hourly=0` disables the tier entirely (the
+    `lim[p] > 0` guard) → behaviour identical to the daily/weekly/monthly-only GFS.
 
     Bucket BOUNDARIES are computed in `tz` (SPEC §9): "local" (default) aligns
-    day/week/month boundaries to this machine's local calendar — so a "Monday
+    hour/day/week/month boundaries to this machine's local calendar — so a "Monday
     weekly" is the operator's local Monday — while "utc" uses UTC boundaries for
     strict cross-zone determinism. Only the bucket-KEY extraction is zone-aware;
     `when` is a true instant (naive-UTC) and the newest-first ORDERING is by that
     instant, which a zone shift never changes — so the caller's sort is unaffected.
-    (Local bucketing is DST-safe: the only effect is cosmetic — a fall-back day may
-    keep two snapshots, a spring-forward day is an hour short — never data loss.)
+    (Local bucketing is DST-safe: the only effect is cosmetic — a fall-back hour/day
+    may keep two snapshots, a spring-forward one is short — never data loss.)
     """
     keep: set = set()
-    last = {"d": None, "w": None, "m": None}
-    cnt = {"d": 0, "w": 0, "m": 0}
-    lim = {"d": keep_daily, "w": keep_weekly, "m": keep_monthly}
+    last = {"h": None, "d": None, "w": None, "m": None}
+    cnt = {"h": 0, "d": 0, "w": 0, "m": 0}
+    lim = {"h": keep_hourly, "d": keep_daily, "w": keep_weekly, "m": keep_monthly}
 
     for t in targets_newest_first:
         w = t.when
@@ -906,11 +925,12 @@ def _bucket_keep(targets_newest_first: list[Subvol],
         keyed = w.replace(tzinfo=timezone.utc).astimezone() if tz == "local" else w
         iso = keyed.isocalendar()
         keys = {
+            "h": (keyed.year, keyed.month, keyed.day, keyed.hour),
             "d": (keyed.year, keyed.month, keyed.day),
             "w": (iso[0], iso[1]),
             "m": (keyed.year, keyed.month),
         }
-        for p in ("d", "w", "m"):
+        for p in ("h", "d", "w", "m"):
             if lim[p] > 0 and keys[p] != last[p] and cnt[p] < lim[p]:
                 keep.add(t.path)
                 last[p] = keys[p]
@@ -987,13 +1007,14 @@ def apply_retention(
     else on the target (the GFS-thinned long tail) is deleted.
     """
     policy = cfg.retention_for(subvol_name)
+    kh = int(policy.get("keep_hourly", 0))   # default 0 = disabled (back-compat)
     kd = int(policy.get("keep_daily", 0))
     kw = int(policy.get("keep_weekly", 0))
     km = int(policy.get("keep_monthly", 0))
 
     _pinned_source, pinned_target = _newest_correlated_pair(source_snaps, target_snaps)
-    log_step(f"[{subvol_name}] retention keep_daily={kd} keep_weekly={kw} "
-             f"keep_monthly={km}; pinned target="
+    log_step(f"[{subvol_name}] retention keep_hourly={kh} keep_daily={kd} "
+             f"keep_weekly={kw} keep_monthly={km}; pinned target="
              f"{os.path.basename(pinned_target.path) if pinned_target else None}")
 
     if not target_snaps:
@@ -1002,7 +1023,7 @@ def apply_retention(
     targets_sorted = sorted(
         target_snaps, key=lambda t: (t.when or datetime.min), reverse=True
     )
-    keep_paths = _bucket_keep(targets_sorted, kd, kw, km, cfg.retention_timezone)
+    keep_paths = _bucket_keep(targets_sorted, kh, kd, kw, km, cfg.retention_timezone)
 
     # Rule 3: the pinned parent is never pruned, whatever the policy says.
     if pinned_target is not None:
@@ -1034,7 +1055,7 @@ def apply_retention(
         log_info(
             f"[{subvol_name}] source retention is holding {len(override)} extra "
             f"snapshot(s) beyond the destination policy "
-            f"(keep_daily={kd}/weekly={kw}/monthly={km}); the source (Snapper) "
+            f"(keep_hourly={kh}/daily={kd}/weekly={kw}/monthly={km}); the source (Snapper) "
             f"retention is longer than di-snapsend's for this subvolume — the "
             f"destination keeps them because they still exist on the source. To "
             f"make the destination policy govern, set its retention >= the source's."

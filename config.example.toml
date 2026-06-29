@@ -48,7 +48,7 @@ mountpoint = "/"
 # per-subvol tables override it. The pinned incremental parent (Rule 3) is always
 # kept regardless of these numbers, so you can tune them freely.
 [retention]
-# Calendar used for daily/weekly/monthly bucket boundaries (global, all subvols).
+# Calendar used for hourly/daily/weekly/monthly bucket boundaries (global, all subvols).
 #   "local" (default) — buckets align to THIS machine's local calendar, so a
 #                       "Monday weekly" is your local Monday. Recommended.
 #   "utc"             — buckets use UTC boundaries; fully timezone-independent,
@@ -56,12 +56,21 @@ mountpoint = "/"
 # Folder NAMES are always local-time + UTC offset regardless of this setting.
 timezone = "local"
 
+# keep_hourly is the FINEST GFS tier: keeps the newest snapshot of each of the most
+# recent N hours. Set it to match (or deliberately below) the source's Snapper hourly
+# retention. Setting keep_hourly >= the source's hourly count gives those intra-day
+# snapshots a real destination bucket, so they're "within policy" rather than
+# source-backed overflow — which quiets the "source retention is holding N extra
+# snapshot(s)" INFO line for the hourly band. Omitting the key (or 0) disables the
+# hourly tier entirely — the behaviour of releases before this tier existed.
 [retention.default]
+keep_hourly  = 24                        # keep one snapshot per hour for the last 24 hours
 keep_daily   = 14
 keep_weekly  = 8
 keep_monthly = 6
 
 [retention.root]
+keep_hourly  = 24
 keep_daily   = 30                        # keep apt pre/post upgrade history longer
 keep_weekly  = 12
 keep_monthly = 12

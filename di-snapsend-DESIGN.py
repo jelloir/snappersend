@@ -124,11 +124,12 @@ class Config:
         "root": {"mountpoint": "/",     "recv_dir": "/srv/snapshots-recv/root"},
     })
     # TARGET-ONLY retention (Decision 1): source is Snapper-owned, never pruned
-    # here. Per-subvol policy; falls back to "default". Keys: keep_daily,
-    # keep_weekly, keep_monthly. The pinned parent (Rule 3) is always excluded.
+    # here. Per-subvol policy; falls back to "default". Keys: keep_hourly (finest,
+    # default-disabled on upgrade), keep_daily, keep_weekly, keep_monthly. The
+    # pinned parent (Rule 3) is always excluded. New-install defaults shown below.
     retention: dict = field(default_factory=lambda: {
-        "default": {"keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
-        "root":    {"keep_daily": 30, "keep_weekly": 12, "keep_monthly": 12},
+        "default": {"keep_hourly": 24, "keep_daily": 14, "keep_weekly": 8, "keep_monthly": 6},
+        "root":    {"keep_hourly": 24, "keep_daily": 30, "keep_weekly": 12, "keep_monthly": 12},
     })
     use_mbuffer: bool = True
     dry_run: bool = False
@@ -531,13 +532,13 @@ def apply_retention(
     Source snapshots are NEVER pruned here — Snapper owns local retention.
 
     PIN the newest correlated pair so the next incremental's parent survives
-    (Rule 3), then delete target snapshots beyond keep_daily/weekly/monthly,
+    (Rule 3), then delete target snapshots beyond keep_hourly/daily/weekly/monthly,
     excluding the pinned target. For root, additionally avoid orphaning half a
     pre/post pair (SPEC §4).
 
     SKELETON — claude-code: implement the keep_* bucketing. Needs real
     timestamps per target snapshot (from received info.xml or subvol creation
-    time) to assign daily/weekly/monthly buckets.
+    time) to assign hourly/daily/weekly/monthly buckets.
     """
     policy = cfg.retention_for(subvol_name)
     pinned_source, pinned_target = _newest_correlated_pair(source_snaps, target_snaps)

@@ -4,7 +4,7 @@ Retention has two halves, tested separately because they fail in different ways:
 
 | Half | What it does | How it's tested |
 |------|--------------|-----------------|
-| **Decision** | `_bucket_keep` + `apply_retention` read folder-name timestamps + UUID/correlation and compute the keep/prune set (GFS daily/weekly/monthly ∪ pin ∪ Option-B source-backed ∪ root pre/post). | **Part A** — exhaustive **pure-logic unit tests** (`test_di_snapsend.py`). No filesystem; fast; covers years of history and every edge case under both `local` and `utc` timezones. |
+| **Decision** | `_bucket_keep` + `apply_retention` read folder-name timestamps + UUID/correlation and compute the keep/prune set (GFS hourly/daily/weekly/monthly ∪ pin ∪ Option-B source-backed ∪ root pre/post). | **Part A** — exhaustive **pure-logic unit tests** (`test_di_snapsend.py`). No filesystem; fast; covers years of history and every edge case under both `local` and `utc` timezones. |
 | **Execution** | the real `btrfs subvolume delete` + wrapper `rmdir` + `.latest` repoint over SSH. | **Part B** — on the **VM**, against **real (empty) subvolumes** (`tools/fabricate-history.sh` + `tools/retention-vm-check.py`). |
 
 ### Why the split — the empty-folder caveat
@@ -66,6 +66,12 @@ UTC+10) and `utc`:
 4. **Sporadic yearly-ish** over 6 years — "don't nuke my only yearly backup": the
    newest within-limit survive, only the truly-beyond-all-limits oldest prunes.
 5. **Mixed cadence** — hourly-recent → daily → monthly; clean taper across changes.
+
+`TestRetentionHourly` covers the **`keep_hourly` tier** specifically: per-hour reps,
+the hourly∪daily union, the `keep_hourly=0` byte-for-byte back-compat guard, the
+source-matched "all 48 hourlies within policy" case, and the tz-aware hour boundary
+(whole-hour vs the half-hour `Asia/Kolkata` zone). `tools/retention-vm-check.py` grew a
+`--keep-hourly` flag (default `0` = the pre-tier behaviour) for the VM execution path.
 6. **Boundary precision** — local-midnight (UTC+10), month-end/start, ISO-week edge
    (Sun/Mon), **leap day** (29 Feb), and a full **DST** span (Europe/London) that
    matches the oracle and never over-prunes (documented ±1/day cosmetic only).

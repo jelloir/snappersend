@@ -172,9 +172,11 @@ Open it on the source and set, at minimum:
   `mountpoint` where its Snapper `.snapshots` lives (e.g. `/` and `/home`). The
   destination path is composed automatically as
   `<recv_base>/<this-host>/<name>/…`.
-- **`[retention]`** — `keep_daily/weekly/monthly` (per-subvol overrides allowed) and
-  `timezone` (`local` default). See **Retention** below — set these ≥ your source
-  (Snapper) retention so the destination governs the archive depth.
+- **`[retention]`** — `keep_hourly/daily/weekly/monthly` (per-subvol overrides allowed)
+  and `timezone` (`local` default). See **Retention** below — set these ≥ your source
+  (Snapper) retention so the destination governs the archive depth. `keep_hourly` is
+  the finest tier; matching it to Snapper's hourly count quiets the "source holding
+  extra" line (below). Omitting `keep_hourly` (or `0`) disables it — the prior behaviour.
 - **`[boot]`** — enable if you also want `/boot` + `/boot/efi` mirrored for full DR.
 
 ### 5. Verify, then seed
@@ -256,7 +258,7 @@ systems:**
 They run independently — and the destination keep-rule is a **UNION**:
 
 > A destination snapshot is **kept if EITHER (a)** it falls within di-snapsend's GFS
-> policy (`keep_daily/weekly/monthly`) **OR (b)** its source snapshot still exists.
+> policy (`keep_hourly/daily/weekly/monthly`) **OR (b)** its source snapshot still exists.
 > Kept once if both — there is **no duplication**, never "two histories". One set of
 > snapshots, selected by either rule.
 
@@ -265,7 +267,8 @@ They run independently — and the destination keep-rule is a **UNION**:
   ┌────────────────────────────────────────────────────────────┐
   │  (b) still on the SOURCE         (a) within GFS policy     │
   │  ┌───────────────────────┐    ┌──────────────────────────┐ │
-  │  │  recent, dense        │    │  daily/weekly/monthly    │ │
+  │  │  recent, dense        │    │  hourly/daily/weekly/    │ │
+  │  │                       │    │  monthly                 │ │
   │  │  (source-backed)      │####│  representatives         │ │   ## = overlap,
   │  │                       │####│  (the long-tail taper)   │ │        kept once
   │  └───────────────────────┘    └──────────────────────────┘ │
@@ -293,8 +296,24 @@ independently:**
   mean what it says. di-snapsend logs an INFO line per run/subvolume when this
   happens (`source retention is holding N extra snapshot(s) beyond the destination
   policy …`) so it isn't invisible.
-- **Mixed:** resolved per-tier — the larger reach wins at each of daily/weekly/monthly
-  in the same run.
+- **Mixed:** resolved per-tier — the larger reach wins at each of hourly/daily/weekly/
+  monthly in the same run.
+
+### The hourly tier and the "source holding extra" line
+
+`keep_hourly` is the **finest** GFS tier (added after daily/weekly/monthly): it keeps the
+newest snapshot of each of the most recent N hours. It exists to **match Snapper's
+granularity**. Snapper typically keeps a couple of days of *hourlies* on the source; if
+di-snapsend's smallest bucket is daily, every intra-day hourly is "beyond the destination
+policy" yet source-backed — so rule (b) keeps it and the INFO line above reports a count
+that climbs through the day and drops at the daily rollover. Accurate, but noisy.
+
+Set `keep_hourly ≥ the source's hourly count` (e.g. `keep_hourly = 48` for Snapper's
+default ~48 hourlies) and those snapshots get a **real destination bucket** — they're
+kept by rule (a) as policy, not by rule (b) as overflow — so the override line stops
+reporting the hourly band. Leaving `keep_hourly` unset (or `0`) **disables the tier
+entirely**, which is exactly the behaviour of releases before it existed: a config
+without the key prunes identically to today. New installs default to `keep_hourly = 24`.
 
 ### Rule of thumb
 
@@ -317,8 +336,8 @@ numbers, so the next incremental's parent always survives.
 
 ### Retention timezone
 
-`[retention].timezone` chooses the calendar used for the daily/weekly/monthly bucket
-boundaries (global, all subvols):
+`[retention].timezone` chooses the calendar used for the hourly/daily/weekly/monthly
+bucket boundaries (global, all subvols):
 
 - `"local"` (**default**) — boundaries align to **the source machine's local
   calendar**, so a "Monday weekly" is genuinely your local Monday. Recommended. (For
@@ -328,9 +347,11 @@ boundaries (global, all subvols):
   or shared/relocating setups.
 
 Folder **names** are always local-time **+ UTC offset** (e.g. `…+1000…`) regardless of
-this setting. Local bucketing in a DST zone is cosmetically imperfect for exactly one
-day a year — a fall-back day may keep one extra snapshot, a spring-forward day one
-fewer — but never loses data or breaks the chain; no DST configuration is needed.
+this setting. The hourly tier honours this timezone exactly like the coarser tiers —
+its bucket key is `(year, month, day, hour)` taken from the same zone-shifted instant.
+Local bucketing in a DST zone is cosmetically imperfect for exactly one day a year — a
+fall-back day/hour may keep one extra snapshot, a spring-forward one fewer — but never
+loses data or breaks the chain; no DST configuration is needed.
 
 ## Destination layout & the restore pointer
 

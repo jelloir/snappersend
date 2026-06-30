@@ -1,0 +1,62 @@
+# snappersend config — /etc/snappersend/config
+# =============================================================================
+# Flat KEY="value" file, the SAME format as Snapper's own config files
+# (/etc/snapper/configs/<name>), parsed by python-dotenv. The retention block uses
+# Snapper's exact TIMELINE_LIMIT_* names so if you run Snapper you already know it.
+#
+# Inline "# comments", spaces around "=", quoted or unquoted values, and blank
+# lines are all fine. Keys snappersend doesn't recognise (e.g. Snapper's own
+# SUBVOLUME/FSTYPE/NUMBER_LIMIT/...) are ignored without error, so you can keep
+# Snapper-style keys around for reference.
+
+# ---- Destination transport ---------------------------------------------------
+SERVER_HOST="dest-host"                       # REQUIRED — the receive end (edit this)
+SSH_PORT="22"
+SERVER_USER="snapsend"                        # dedicated least-privilege transport user
+SSH_KEY="/etc/snappersend/ssh/id_ed25519"
+RECV_BASE="/srv/snapshots-recv"               # -> <RECV_BASE>/<this-hostname>/<subvol>/...
+USE_MBUFFER="yes"                             # smooth throughput + a live rate readout
+
+# ---- Subvolumes to replicate -------------------------------------------------
+# Space-separated  name:mountpoint  pairs. The mountpoint is where that subvol's
+# Snapper .snapshots directory lives (e.g. "/" and "/home").
+SUBVOLUMES="root:/ home:/home"
+
+# ---- Parent-preservation tree (snappersend's incremental base) ---------------
+# snappersend keeps read-only clones of the snapshots it has confirmed-sent here,
+# on the SAME Btrfs filesystem as the source (reflinked, near-zero space). These
+# clones are the -p parents for future incrementals and are immune to Snapper's
+# own retention, so an incremental survives an arbitrary offline gap.
+PARENT_TREE_BASE="/.snappersend"
+PARENT_KEEP="2"                               # live parent + 1 redundancy slot
+
+# ---- Boot tier (optional) ----------------------------------------------------
+# /boot + /boot/efi are not Btrfs, so they're rsync-mirrored (single current copy,
+# not versioned) under <RECV_BASE>/<hostname>/{boot,boot-efi}.
+BOOT_ENABLED="yes"
+BOOT_PATHS="/boot /boot/efi"
+
+# ---- Destination retention — WYSIWYG GFS, Snapper's TIMELINE_LIMIT_* vocabulary
+# =============================================================================
+# What you set here is EXACTLY what the destination keeps (grandfather-father-son:
+# the newest snapshot of each of the most recent N hours/days/weeks/months/years,
+# unioned). The ONE exception: the most recent snapshot is always kept as the next
+# incremental's base ("the pinned parent"). A tier set to 0 is disabled.
+#
+# Remember snappersend sends only Snapper's CURRENT NEWEST snapshot each run, so the
+# destination is a sample at snappersend's run cadence — set these to the history
+# DEPTH you want to keep on the destination, independent of Snapper's own limits.
+RETENTION_TIMEZONE="local"                    # "local" (default) or "utc" bucket boundaries
+
+# Default policy (applies to every subvol unless overridden below):
+TIMELINE_LIMIT_HOURLY="24"
+TIMELINE_LIMIT_DAILY="14"
+TIMELINE_LIMIT_WEEKLY="8"
+TIMELINE_LIMIT_MONTHLY="6"
+TIMELINE_LIMIT_YEARLY="2"
+
+# Optional per-subvol overrides: prefix a tier with <SUBVOL>_ (uppercased). Only the
+# tiers you list are overridden; the rest inherit the default above. Example — keep a
+# deeper archive of the OS root:
+ROOT_TIMELINE_LIMIT_DAILY="30"
+ROOT_TIMELINE_LIMIT_MONTHLY="12"

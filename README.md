@@ -1,467 +1,211 @@
-# di-snapsend
+# snappersend
 
-**di-snapsend is a standalone tool for replicating [Snapper](http://snapper.io/)-managed
-Btrfs snapshots from one host to another over SSH.** A **source** host (typically a
-workstation or laptop running Snapper) ships its snapshots to a **destination** host
-(typically an always-on server) using Btrfs send/receive. It's the on-host
-snapshot-replication layer of a 3-2-1 backup strategy: keep recent snapshots locally
-for quick rollback, mirror a deep history to another machine for disaster recovery,
-and (optionally) let a tool like restic archive the destination offsite.
+**snappersend replicates [Snapper](http://snapper.io/)-managed Btrfs snapshots from a
+source host to a destination over SSH**, using `btrfs send | ssh btrfs receive`. A
+**source** (typically a workstation/laptop running Snapper) ships snapshots to a
+**destination** (typically an always-on server). It's the on-host replication layer of
+a 3-2-1 backup strategy: keep recent snapshots locally for quick rollback, mirror a
+deep history to another machine for disaster recovery, and (optionally) let a tool like
+restic archive the destination offsite.
 
-It is a thin orchestration layer — it does **not** reimplement the Btrfs stream
-format or the network. It shells out to the tools that already solve those:
+It is a thin orchestration layer — it does **not** reimplement the Btrfs stream format
+or the network. It shells out to the tools that already solve those:
 
 ```
-btrfs send [-p PARENT] SRC | [mbuffer |] ssh DEST "sudo btrfs receive DST"
+btrfs send [-p PARENT] CLONE | [mbuffer |] ssh DEST "sudo btrfs receive DST"
 ```
 
-…and confines itself to the three things a wrapper has to get right: snapshot
-**enumeration**, **parent selection**, and partial-transfer **cleanup +
-retention**. See `di-snapsend-SPEC.md` for the full design rationale and
-`di-snapsend-DESIGN.py` for the annotated structural contract.
+snappersend is a ground-up rewrite of `di-snapsend`. It exists to fix two things, and
+both fixes are the heart of its design:
+
+1. **Retention is WYSIWYG.** The destination keeps **exactly** the GFS policy you
+   configure — no hidden "superset", no silently-kept extras. (One documented
+   exception: the pinned parent, below.)
+2. **Gaps never force a full send.** snappersend keeps its **own** read-only parent
+   clones, immune to Snapper's retention, so an incremental survives an arbitrary
+   offline gap (a holiday, a powered-off laptop) instead of falling back to a full
+   re-send.
 
 ## How it works
 
-```
-   SOURCE host (e.g. laptop)                    DESTINATION host (e.g. server)
-   ┌───────────────────────┐                    ┌────────────────────────────┐
-   │  Snapper makes RO     │   btrfs send |     │  btrfs receive stores each │
-   │  snapshots on a timer │   ssh ... btrfs    │  snapshot under            │
-   │                       │   receive          │  /srv/snapshots-recv/...   │
-   │  di-snapsend (hourly  │ ─────────────────► │                            │
-   │  timer) sends the new │   (encrypted SSH,  │  least-privilege transport │
-   │  ones incrementally   │    least-priv key) │  user, scoped sudoers,     │
-   └───────────────────────┘                    │  forced-command filter     │
-                                                └─────────────┬──────────────┘
-                                                              │ (optional)
-                                                     restic / offsite archive
-```
+### Newest-only sends
 
-- **Snapper** (on the source) creates the snapshots; di-snapsend never makes them.
-- **di-snapsend** (on the source, on a timer) finds snapshots the destination
-  doesn't have yet and sends them — a **full** send the first time, **incremental**
-  thereafter.
-- The **destination** just receives and stores them under a per-source-host
-  directory, then di-snapsend prunes the destination per its retention policy.
-- A separate tool running **on the destination** (e.g. restic) can archive the
-  receive area further offsite.
+Each run, snappersend sends **only Snapper's current newest snapshot** for each
+configured subvolume — not every snapshot Snapper made since the last run. The
+destination is therefore a **sample at snappersend's run cadence**, not a copy of every
+Snapper snapshot. This is deliberate: it's what makes retention WYSIWYG (the send path
+never looks backward, so there's no "re-send a snapshot we already pruned" problem). For
+the rollback / DR use case this is exactly what you want, and the more often you run
+snappersend, the finer the sample.
 
-## The three correctness rules (why this isn't a one-liner)
+### The parent-preservation tree
 
-1. **Validity of a received subvolume** — a subvolume *existing* on the destination
-   does not mean the transfer completed. A clean receive is `readonly` **and** has
-   `received_uuid` set; a garbled one is writable with `received_uuid = -`. Every
-   receive is verified; garbled subvols are deleted and the run treated as failed.
-2. **Parent eligibility (correlation)** — a source snapshot is a valid `-p` parent
-   only if the destination already holds a snapshot of the same Btrfs lineage
-   (correlated by **UUID**, never by number). The parent for sending `N` is the
-   newest correlated source older than `N`; otherwise a full send.
-3. **Retention prune guard** — the newest correlated pair is **pinned** and never
-   pruned, so the next incremental's parent always survives.
+On the **source**, snappersend keeps a private tree of read-only **clones** of the
+snapshots it has successfully sent — one set per subvolume, under
+`PARENT_TREE_BASE/<subvol>/` (default `/.snappersend/<subvol>/`).
 
-Because correlation is UUID-based, Snapper churning/gapping the source numbering
-under its own (short) retention never breaks matching against the destination's long
-retention. See SPEC §4.
+- A clone is made with `btrfs subvolume snapshot -r`. It **shares extents via reflink**
+  (near-zero space) but is an **independent subvolume**: deleting Snapper's original
+  does not touch it. That independence is the whole point — it's what decouples the
+  incremental parent's lifetime from Snapper's retention.
+- The tree **must be on the same Btrfs filesystem** as the source subvolume (so
+  `btrfs send -p` can diff locally and the clone is reflinked, not copied). The default
+  `/.snappersend` satisfies this for the usual `@`/`@home` layout.
 
-## Layout of this repo
+**snappersend sends the clone, not Snapper's snapshot.** This is subtle but essential.
+A `btrfs subvolume snapshot` always gets a brand-new UUID. The destination correlates
+incrementals by UUID (`received_uuid`). If snappersend sent Snapper's snapshot but kept
+a *clone* as the parent, the clone's UUID wouldn't match what the destination received,
+and the next incremental would break. By sending the clone itself, the destination's
+`received_uuid` equals the clone's UUID — so the clone snappersend keeps **is** the
+thing the destination correlates with. (`btrfs send -p` between two clones of different
+Snapper snapshots works fine — it just diffs two read-only subvolumes that share
+extents.)
 
-| File | Role |
-|------|------|
-| `di-snapsend` | the Python engine (installs to `/usr/local/bin/di-snapsend`) |
-| `di-snapsend.sh` | installer — `--dest` (destination) and `--source` (source) roles |
-| `config.example.toml` | annotated config (installs to `/etc/snapsend/config`) |
-| `snapsend-ssh-filter` | forced-command wrapper for the transport key (destination) |
-| `systemd/` | `snapsend.{service,timer}` + missed-run watchdog units & script |
-| `test_di_snapsend.py` | unit tests for the pure correctness logic |
-| `tools/` | test-only retention fabricator + VM execution checker |
-| `tests/RETENTION-TESTING.md` | how retention is tested (decision + execution) |
-| `di-snapsend-SPEC.md`, `di-snapsend-DESIGN.py` | design docs / contract |
+### The promote-on-confirmed-send invariant
 
-## Prerequisites
+This is the safety rule that makes the parent tree trustworthy. The tree only ever
+advances to a clone that has been **confirmed landed on the destination**. Per run, per
+subvolume:
 
-**Both hosts** need Btrfs and OpenSSH (both in Debian/Ubuntu *main*; any distro with
-Btrfs works):
+1. **Read** the existing clones — the prior confirmed-sent states, untouched.
+2. **Choose the parent**: the newest clone that still **correlates** with a snapshot
+   the destination holds. (No correlating clone → full send.)
+3. If Snapper's current newest is already represented by a correlating clone, there's
+   **nothing to send** — go straight to retention. (Re-runs are idempotent.)
+4. Otherwise **stage a clone** of Snapper's newest and **send it**, `-p <parent clone>`.
+5. **On a verified-good receive only**: keep the staged clone and prune clones beyond
+   `PARENT_KEEP`. *The tree advances only here.*
+6. **On any send/receive failure**: delete the staged clone — the tree returns to
+   exactly its prior state. Next run retries off the same preserved parent.
 
-| Need | Package | Where |
-|------|---------|-------|
-| `btrfs send`/`receive`, `subvolume` | `btrfs-progs` | source **and** destination |
-| SSH client/server | `openssh-client` (source), `openssh-server` (destination) | both |
-| Python ≥ 3.11 (for `tomllib`) | `python3` | source |
-| Snapshots to replicate | `snapper`, configured for the subvolumes you want | source |
-| `rsync` (only if using the boot tier) | `rsync` | both |
-| `mbuffer` (optional, smooths throughput) | `mbuffer` | source (auto-installed by `--source`) |
+What this buys you:
 
-The destination's receive area **must be on a Btrfs filesystem** (it stores received
-subvolumes). Snapper must already be making snapshots on the source for the
-subvolumes you list in the config.
+- **Holiday / long gap.** Every failed run leaves the parent frozen and still
+  correlating with the destination's newest. When you come back online, the incremental
+  works off the preserved clone — **no full send**. This is the scenario snappersend
+  exists for.
+- **Divergence** (the destination's snapshot was deleted or altered, or it's the very
+  first run): no clone correlates, so snappersend does a **full send**, logs it loudly
+  at `INFO` (`no shared parent with destination — full send`), and reseeds the parent
+  tree on success. Full send is the rare genuine-divergence / first-run path, never the
+  routine gap path.
+- **Crash between “send OK” and “prune”** is safe: the staged clone is already in the
+  tree and the destination already has it, so the next run just continues off it. The
+  invariant guarantees the parent is never *ahead* of the destination — stale-behind is
+  recoverable, ahead would be the corruption trap, so snappersend always stays on the
+  safe side.
 
-## Install
+## Retention — WYSIWYG GFS
 
-The installer (`di-snapsend.sh`) has two roles. There's a deliberate chicken-and-egg:
-the **destination** wants the **source's** public key, but that key doesn't exist
-until the source role runs. So the destination is provisioned in **two passes** —
-once to set everything up (printing the `authorized_keys` line to complete later),
-then again to authorize the key once the source has generated it. The canonical
-sequence:
+The destination is pruned to a **pure grandfather-father-son** keep-set over the
+destination's own snapshots: the newest snapshot of each of the most recent
+`TIMELINE_LIMIT_HOURLY` hours, `…_DAILY` days, `…_WEEKLY` ISO-weeks, `…_MONTHLY`
+months, and `…_YEARLY` years, unioned. A tier set to `0` is disabled. Undatable
+snapshots are always kept.
 
-1. **Destination, first pass** — `sudo ./di-snapsend.sh --dest` (no key yet):
-   provisions the transport user, receive area, sudoers, and SSH filter, and **prints
-   the `authorized_keys` line format** to complete once the source key exists.
-2. **Source** — `sudo ./di-snapsend.sh --source`: generates the transport key, pins
-   the destination's host key, installs the timer, and **prints the public key** plus
-   the exact command to authorize it on the destination.
-3. **Destination, finalize** — either re-run `sudo ./di-snapsend.sh --dest
-   /path/to/id_ed25519.pub` with the copied key, **or** paste the printed
-   `authorized_keys` line manually.
-4. **Edit the config** on the source, then **verify** with `sudo di-snapsend
-   --dry-run` and seed.
+> **The single WYSIWYG asterisk — the pinned parent.** The destination keeps exactly
+> your GFS policy, **plus** the most recent snapshot is always retained as the
+> incremental base (so the next incremental's `-p` parent still exists). That's the only
+> snapshot kept beyond what the GFS numbers say.
 
-> **Role flags:** `--dest` (aliases: `--destination`, `--server`) and `--source`
-> (alias: `--laptop`). The `--server`/`--laptop` spellings are historical and kept
-> for back-compat; the generic names are `--dest`/`--source`.
+There is **no** "source-backed" union and **no** override logging — unlike di-snapsend,
+the destination never silently holds more than its policy implies. Source snapshots are
+never touched; Snapper owns local retention entirely.
 
-### 1. Destination host (the receiver) — first pass
+`RETENTION_TIMEZONE` (`local` default, or `utc`) chooses the calendar used for bucket
+boundaries; folder names are always local-time + UTC offset regardless. For the `root`
+subvolume, snappersend also avoids orphaning half of an apt pre/post snapshot pair (a
+small nicety that composes fine with pure GFS).
 
-```sh
-sudo ./di-snapsend.sh --dest                      # no key yet; prints the authorized_keys line to add later
-```
+## Configuration
 
-This creates the least-privilege `snapsend` transport user, the receive area
-`/srv/snapshots-recv` (**must be Btrfs**), a scoped sudoers rule, and the
-forced-command SSH filter (so the key can only run the exact send/receive command
-set, even if it leaks). With **no** pubkey argument (the first pass, before the source
-key exists), it prints the `authorized_keys` line to complete in step 3. If you
-already have the source's public key copied over, you can pass it now and skip the
-finalize pass:
+snappersend reads a flat `KEY="value"` file (default `/etc/snappersend/config`), the
+**same format as Snapper's own config files**, parsed by
+[`python-dotenv`](https://pypi.org/project/python-dotenv/) (`python3-dotenv`, in Debian
+main). The retention block uses Snapper's exact `TIMELINE_LIMIT_*` names — including
+`TIMELINE_LIMIT_YEARLY` — so a Snapper user reads it and immediately understands it.
 
-```sh
-sudo ./di-snapsend.sh --dest /path/to/id_ed25519.pub   # authorizes the key directly
-```
+- **Honoured keys:** `SERVER_HOST` (required), `SSH_PORT`, `SERVER_USER`, `SSH_KEY`,
+  `RECV_BASE`, `USE_MBUFFER`, `SUBVOLUMES`, `PARENT_TREE_BASE`, `PARENT_KEEP`,
+  `BOOT_ENABLED`, `BOOT_PATHS`, `RETENTION_TIMEZONE`, `TIMELINE_LIMIT_{HOURLY,DAILY,
+  WEEKLY,MONTHLY,YEARLY}`, and per-subvol overrides `<SUBVOL>_TIMELINE_LIMIT_*`.
+- **Ignored gracefully** (so you can keep Snapper-style keys around, or point
+  snappersend at a Snapper-shaped file without it choking): `SUBVOLUME`, `FSTYPE`,
+  `QGROUP`, `SPACE_LIMIT`, `FREE_LIMIT`, `ALLOW_USERS`, `ALLOW_GROUPS`, `SYNC_ACL`,
+  `BACKGROUND_COMPARISON`, `NUMBER_*`, `TIMELINE_CREATE`, `TIMELINE_CLEANUP`,
+  `TIMELINE_MIN_AGE`, `EMPTY_PRE_POST_*`.
 
-### 2. Source host (the sender)
+See `config.example` for an annotated starting point.
 
-```sh
-sudo ./di-snapsend.sh --source
-```
+> **Why python-dotenv** (not `configparser` or `configobj`): a Snapper config is a flat
+> `KEY="value"` file with no `[section]` header, so `configparser` can't read it without
+> a synthesised fake section. `configobj` can, but raises on a duplicate key.
+> `python-dotenv` is purpose-built for exactly this format and degrades gracefully on
+> malformed input — the right fit for "read a Snapper-shaped file tolerantly". It's the
+> one packaged dependency, and it's in Debian (Trixie) main.
 
-This installs the engine + watchdog, writes `/etc/snapsend/config` from the example,
-generates the transport SSH key at `/etc/snapsend/ssh/id_ed25519`, **pins the
-destination's SSH host key**, and enables `snapsend.timer` (hourly) +
-`snapsend-watchdog.timer`. It prints the public key and the exact `--dest` command to
-register it on the destination.
-
-### 3. Destination host — finalize the key
-
-Copy the source's public key (`/etc/snapsend/ssh/id_ed25519.pub`) to the destination
-and authorize it, either by re-running `--dest` with the file:
-
-```sh
-sudo ./di-snapsend.sh --dest /path/to/id_ed25519.pub
-```
-
-or by pasting the `authorized_keys` line printed in step 1 manually. (Skip this step
-if you already passed the key in step 1.)
-
-### 4. Edit the config (`/etc/snapsend/config`)
-
-Open it on the source and set, at minimum:
-
-- **`[server].host`** — the destination's hostname or IP (replace `dest-host`).
-- **`[server].ssh_port` / `user` / `ssh_key`** — usually fine as-is.
-- **`[subvolumes.*]`** — one table per subvolume to replicate, each with the
-  `mountpoint` where its Snapper `.snapshots` lives (e.g. `/` and `/home`). The
-  destination path is composed automatically as
-  `<recv_base>/<this-host>/<name>/…`.
-- **`[retention]`** — `keep_hourly/daily/weekly/monthly` (per-subvol overrides allowed)
-  and `timezone` (`local` default). See **Retention** below — set these ≥ your source
-  (Snapper) retention so the destination governs the archive depth. `keep_hourly` is
-  the finest tier; matching it to Snapper's hourly count quiets the "source holding
-  extra" line (below). Omitting `keep_hourly` (or `0`) disables it — the prior behaviour.
-- **`[boot]`** — enable if you also want `/boot` + `/boot/efi` mirrored for full DR.
-
-### 5. Verify, then seed
-
-```sh
-sudo di-snapsend --dry-run        # reads both sides, changes nothing — check the plan
-sudo systemctl start snapsend.service
-journalctl -u snapsend.service -f
-```
-
-### First-run SSH host-key trust
-
-The source must trust the destination's SSH host key before the first transfer, or
-every send/rsync fails with `Host key verification failed` (and rsync with
-`kex_exchange_identification: Connection reset`). The installer pins it automatically
-via `ssh-keyscan` into **root's** `known_hosts` (the systemd service runs as root, so
-the trust must live there — not the invoking user's).
-
-If you provisioned manually, or changed `[server].host` after install, run once as
-root on the source:
-
-```sh
-sudo ssh-keyscan -t ed25519 dest-host >> /root/.ssh/known_hosts
-```
-
-Note: a manual `ssh snapsend@dest-host` test will be **rejected by the forced-command
-filter** (expected — the key is locked to the transfer commands), but it still
-records the host key. `ssh-keyscan` is cleaner because it fetches only the host key
-without running a remote command.
-
-### The seed (first) transfer
-
-The first run does a **full send** per subvolume, which can be large. Do the seed
-over a **wired link** if you can; subsequent incrementals are small and fine over
-Wi-Fi. The tool is fail-safe and resumable at snapshot granularity — if a transfer is
-interrupted, the partial is discarded and re-sent next run, and already-transferred
-snapshots are kept.
-
-## Troubleshooting
-
-- **`Host key verification failed` / `Connection reset`** — the destination host key
-  isn't trusted; see *First-run SSH host-key trust* above.
-- **`btrfs receive` fails / "not a btrfs filesystem"** — the destination's
-  `recv_base` isn't on Btrfs. Point it at a Btrfs filesystem and re-run `--dest`.
-- **"No snapper snapshots … nothing to do"** — Snapper isn't making snapshots at the
-  configured `mountpoint`, or the `[subvolumes.*].mountpoint` is wrong. Check
-  `snapper -c <config> list` and that `<mountpoint>/.snapshots/<N>/snapshot` exists.
-- **`[WARN] mbuffer not on PATH`** — harmless; install `mbuffer` (Debian main) or set
-  `use_mbuffer = false` to silence it.
-- **Nothing sends but snapshots exist** — they may already be on the destination
-  (correlated). `--dry-run` shows what would send and why.
-
-## Operations
-
-- **Logs:** `/var/log/snapsend.log` (and the journal via systemd). Levels:
-  `[STEP]/[INFO]/[OK]/[WARN]/[ERROR]`.
-- **Dry run:** `--dry-run` (or `$SNAPSEND_DRY_RUN=1`) — reads remote state but
-  performs no sends or prunes.
-- **One subvolume:** `--subvol home`.
-- **Override destination host:** `--dest other-host` (alias `--server`; or `$SNAPSEND_SERVER`).
-- **No mbuffer:** `--no-mbuffer`.
-- **Watchdog:** `snapsend-watchdog` warns (syslog) if no successful run is recorded in
-  `/var/lib/snapsend/last-success` within `SNAPSEND_MAX_AGE_HOURS` (default 6).
-- **Locking:** a `flock` on `/var/lock/snapsend.lock` prevents overlapping runs.
-
-Precedence for operational settings is **CLI flag > env var > config file**.
-Retention is policy and lives only in the config file.
-
-### When replication runs (the hybrid trigger model)
-
-Replication fires from **two** triggers:
-
-- **`snapsend.timer` (hourly)** — the periodic baseline. It catches everything,
-  eventually, and bounds how old the destination's incremental parent can get
-  (SPEC §3). It carries a `RandomizedDelaySec` so a fleet of sources doesn't hit the
-  destination on the dot.
-- **An apt `DPkg::Post-Invoke` hook** (`/etc/apt/apt.conf.d/95snapsend-replicate`,
-  installed by `--source`) — fires a replication run immediately after every apt
-  transaction, after Snapper's apt post-snapshot exists.
-
-The reason for the second trigger is the **boot tier**. `/boot` + `/boot/efi` are
-replicated as a live `rsync` mirror, not a snapshot, so on the timer alone they could
-be captured up to ~an hour after — and decoupled from — the Snapper snapshot they
-should pair with. If a kernel/grub/initramfs change lands in that randomized-offset
-gap, the replicated boot files can be newer than the newest replicated `@`/`@root`
-snapshot, risking an inconsistent boot in a DR restore. Real OS/boot changes are almost
-always apt-driven, so firing right after the apt post-snapshot captures that case
-promptly and boot-aligned.
-
-The hook **starts the same `snapsend.service`** (`systemctl --no-block start`) rather
-than running the engine directly — so the engine's `flock`, logging, and resource
-limits all still apply. If a timer-started run is already in flight, the hook's start is
-a clean no-op (the engine takes a non-blocking lock and exits via `_AlreadyRunning`).
-
-The hook fires at `DPkg::Post-Invoke` — the **same** stage Snapper snapshots at — and
-relies on apt running same-stage entries in **filename sort order**: `95snapsend-replicate`
-sorts after Snapper's `80snapper`/`81snapper-enhanced`, so Snapper's post-snapshot is
-already committed before snapsend starts. (An earlier version used
-`DPkg::Post-Invoke-Success` to fire only on a clean transaction, but **apt 3.0.x / Debian
-13 does not execute that stage for normal package operations** — a hook there silently
-never runs, which is the bug this replaces. `Post-Invoke` is the stage that actually
-fires.) Because `Post-Invoke` runs regardless of outcome, a *failed* apt transaction also
-triggers a run; that's benign — snapsend only mirrors already-committed snapshots plus the
-live boot tier, and the hourly timer would replicate the same state anyway. See SPEC §3
-for the full rationale.
-
-The one accepted residual: a purely **manual, non-apt** boot change (e.g. a hand
-`update-grub`) isn't caught until the next snapshot/timer tick — a tiny, self-healing
-window.
-
-## Retention — how source and destination retention interact
-
-This trips people up, so read this once. **There are two independent retention
-systems:**
-
-- **Snapper** prunes the **source** on its own schedule (its config, not
-  di-snapsend's).
-- **di-snapsend** prunes the **destination** per the `[retention]` policy in
-  `/etc/snapsend/config`.
-
-They run independently — and the destination keep-rule is a **UNION**:
-
-> A destination snapshot is **kept if EITHER (a)** it falls within di-snapsend's GFS
-> policy (`keep_hourly/daily/weekly/monthly`) **OR (b)** its source snapshot still exists.
-> Kept once if both — there is **no duplication**, never "two histories". One set of
-> snapshots, selected by either rule.
+## CLI
 
 ```
-  destination snapshots (one set)
-  ┌────────────────────────────────────────────────────────────┐
-  │  (b) still on the SOURCE         (a) within GFS policy     │
-  │  ┌───────────────────────┐    ┌──────────────────────────┐ │
-  │  │  recent, dense        │    │  hourly/daily/weekly/    │ │
-  │  │                       │    │  monthly                 │ │
-  │  │  (source-backed)      │####│  representatives         │ │   ## = overlap,
-  │  │                       │####│  (the long-tail taper)   │ │        kept once
-  │  └───────────────────────┘    └──────────────────────────┘ │
-  │      KEEP = the UNION (whichever reaches further back)     │
-  └────────────────────────────────────────────────────────────┘
+snappersend                 # replicate every configured subvolume
+snappersend --dry-run       # read both sides; log intended clones/sends/promotions/
+                            #   prunes; change nothing
+snappersend --subvol home   # just one subvolume
+snappersend --config PATH   # alternate config (default /etc/snappersend/config)
+snappersend --no-mbuffer    # don't pipe through mbuffer
+snappersend --skip-boot     # skip the /boot + /boot/efi rsync tier
+snappersend -v              # verbose: log every shell command
 ```
 
-**So the destination is a *superset* of the source.** While the source holds a
-snapshot, the destination keeps its copy regardless of the GFS numbers; the GFS
-policy only thins the **long tail** — snapshots the source has *already* dropped.
-Don't be surprised if the destination holds **more** than `keep_daily` implies.
+Logging is `[STEP]/[INFO]/[OK]/[WARN]/[ERROR]` to the terminal (coloured on a tty) and
+to `/var/log/snappersend.log` (override `$SNAPPERSEND_LOG`). The full-send fallback is
+always logged at `INFO` with its reason. snappersend exits non-zero if any subvolume
+fails, leaving the chains intact for retry. A `flock` (`/var/lock/snappersend.lock`)
+prevents overlapping runs.
 
-### Which policy actually governs (per tier)
+## Install / first run
 
-Because it's a union, **whichever retention reaches further back wins, at each tier
-independently:**
+snappersend is a single Python script plus its config; the destination transport
+(least-privilege user, scoped sudoers, forced-command SSH key) is provisioned exactly as
+for di-snapsend and is reused unchanged — the remote command set
+(`btrfs receive`/`subvolume`/`property`, `mkdir`, `rmdir`, `ls`, `ln`, `rsync`) is
+identical.
 
-- **Destination longer than source (the intended setup):** di-snapsend's numbers
-  govern the archive depth; source-backed just protects the recent dense history from
-  being pruned while the source still references it. The two cooperate. **Recommended.**
-- **Source longer than destination at some tier:** the source-backed rule overrides
-  di-snapsend's shorter limit *at that tier* — the destination can't prune something
-  the source still has, so that tier's config is **effectively dead** (it never gets
-  to act). Not a bug and not data loss (you simply keep more), but the config doesn't
-  mean what it says. di-snapsend logs an INFO line per run/subvolume when this
-  happens (`source retention is holding N extra snapshot(s) beyond the destination
-  policy …`) so it isn't invisible.
-- **Mixed:** resolved per-tier — the larger reach wins at each of hourly/daily/weekly/
-  monthly in the same run.
+1. Install the script and `python3-dotenv`:
+   ```sh
+   sudo install -m 0755 snappersend /usr/local/bin/snappersend
+   sudo apt-get install -y python3-dotenv btrfs-progs openssh-client mbuffer rsync
+   ```
+2. Write `/etc/snappersend/config` from `config.example`; set `SERVER_HOST` and your
+   `SUBVOLUMES`.
+3. Make sure the source can reach the destination over the transport key (host key
+   pinned in root's `known_hosts`).
+4. **First run** does a **full send** per subvolume, which **seeds the parent tree**.
+   Do the seed over a wired link if you can; subsequent incrementals are small.
+   ```sh
+   sudo snappersend --dry-run     # check the plan
+   sudo snappersend               # seed
+   ```
 
-### The hourly tier and the "source holding extra" line
+The first run logs `no shared parent with destination — full send` for each subvolume
+(expected — there's no parent clone yet). After it, `/.snappersend/<subvol>/` holds the
+seed clone, and every later run is a small incremental off the preserved parent.
 
-`keep_hourly` is the **finest** GFS tier (added after daily/weekly/monthly): it keeps the
-newest snapshot of each of the most recent N hours. It exists to **match Snapper's
-granularity**. Snapper typically keeps a couple of days of *hourlies* on the source; if
-di-snapsend's smallest bucket is daily, every intra-day hourly is "beyond the destination
-policy" yet source-backed — so rule (b) keeps it and the INFO line above reports a count
-that climbs through the day and drops at the daily rollover. Accurate, but noisy.
-
-Set `keep_hourly ≥ the source's hourly count` (e.g. `keep_hourly = 48` for Snapper's
-default ~48 hourlies) and those snapshots get a **real destination bucket** — they're
-kept by rule (a) as policy, not by rule (b) as overflow — so the override line stops
-reporting the hourly band. Leaving `keep_hourly` unset (or `0`) **disables the tier
-entirely**, which is exactly the behaviour of releases before it existed: a config
-without the key prunes identically to today. New installs default to `keep_hourly = 24`.
-
-### Rule of thumb
-
-> For di-snapsend's retention to be the thing that governs your destination archive,
-> set **each tier of the destination retention ≥ the corresponding tier on the
-> source**, and keep the source retention short. A common, sensible setup: the source
-> keeps a week or two of recent snapshots (quick rollback on a small disk), while the
-> destination keeps a long GFS taper (e.g. 14 daily / 8 weekly / 6 monthly, or
-> longer) for archival/DR. Configured this way the source stays lean, the destination
-> holds the deep history, and **shortening the source retention never reduces
-> recoverability** — the destination is a superset and still holds everything the
-> source does, plus more.
-
-**Why it's designed this way:** the union rule is what eliminates pointless
-re-send/re-prune churn — di-snapsend never deletes a destination copy only to re-send
-it next run because its source still exists.
-
-The **pinned** newest correlated pair (Rule 3) is always kept regardless of the
-numbers, so the next incremental's parent always survives.
-
-### Retention timezone
-
-`[retention].timezone` chooses the calendar used for the hourly/daily/weekly/monthly
-bucket boundaries (global, all subvols):
-
-- `"local"` (**default**) — boundaries align to **the source machine's local
-  calendar**, so a "Monday weekly" is genuinely your local Monday. Recommended. (For
-  example, on a machine at UTC+10, a snapshot taken Monday 08:00 local is correctly
-  bucketed into the local Monday's week.)
-- `"utc"` — UTC boundaries; timezone-independent, for strict cross-zone determinism
-  or shared/relocating setups.
-
-Folder **names** are always local-time **+ UTC offset** (e.g. `…+1000…`) regardless of
-this setting. The hourly tier honours this timezone exactly like the coarser tiers —
-its bucket key is `(year, month, day, hour)` taken from the same zone-shifted instant.
-Local bucketing in a DST zone is cosmetically imperfect for exactly one day a year — a
-fall-back day/hour may keep one extra snapshot, a spring-forward one fewer — but never
-loses data or breaks the chain; no DST configuration is needed.
-
-## Destination layout & the restore pointer
-
-Every tier lands under a **per-source-host** subtree, so several source machines can
-share one destination with zero collision. The host segment is the source machine's
-name, derived automatically (`socket.gethostname()`), not configured:
-
-```
-/srv/snapshots-recv/                 # = [server].recv_base, on the destination
-└── <source-hostname>/               # e.g. source-host/
-    ├── home/<localdate>-<offset>-<num>-<short_uuid>/snapshot   # 20260627-2300+1000-8-a2159d69
-    ├── root/<localdate>-<offset>-<num>-<short_uuid>/snapshot
-    ├── boot/                        # boot tier (rsync mirror)
-    └── boot-efi/
-```
-
-Received subvolumes are named `<localdate>-<offset>-<num>-<short_uuid>` — the **date
-leads** (source-local time, `%Y%m%d-%H%M`, colon-free) so `ls` sorts chronologically;
-`<offset>` is the UTC offset (`+1000`, `+0000`) which self-documents the source's zone
-and keeps names unique across a DST fall-back; `<num>` mirrors Snapper's number and
-`<short_uuid>` is the uniqueness backstop / correlation key. The name carries *local*
-time for readability, but **the authoritative retention timestamp is parsed back out
-of the name** (to UTC).
-
-> **Don't manually rename received snapshot folders.** The folder name encodes the
-> snapshot's original source timestamp, which retention parses back to decide the
-> snapshot's "when" for daily/weekly/monthly bucketing. Renaming a folder corrupts its
-> apparent timestamp and can make retention mis-bucket it.
-
-`<recv_base>/<source-host>/<subvol>/<subvol>.latest` always points at the newest
-received subvol's `…/snapshot` — a stable target for a downstream archiver (e.g.
-restic) running **on the destination**.
-
-> **Note for maintainers — `.latest` is write-only over the transport.** di-snapsend
-> only ever *writes* `.latest` (via `ln -sfn`, which the forced-command filter
-> allows); it never *reads* it back over SSH. The symlink is for a consumer running
-> locally on the destination, which reads it server-side. So `readlink` is
-> deliberately **not** in `snapsend-ssh-filter`'s allowlist — don't add it, and don't
-> introduce an over-the-transport `.latest` read without also widening the filter.
-
-The boot tier (`/boot` ext4, `/boot/efi` FAT32) is mirrored with `rsync -aAX --delete`
-to `<recv_base>/<source-host>/{boot,boot-efi}` — a single current copy, not versioned
-here (a downstream archiver versions the receive area), under the **same**
-`<source-host>/` as the snapshot tiers. It feeds an external bare-metal restore flow
-(format EFI/boot, restore both, rebuild initramfs + GRUB); this tool only *produces*
-the mirror.
-
-> **Layout note (if upgrading from an older version):** the destination path is
-> `<recv_base>/<source-host>/<subvol>/<localdate>-<offset>-<num>-<uuid>/snapshot`.
-> There is no automatic migration of subvols from an older naming scheme — delete the
-> old receive area and let di-snapsend rebuild from empty (a fresh full send), e.g. on
-> the destination:
-> ```sh
-> # for each old <subvol>/<wrapper> holding a `snapshot` subvol:
-> sudo btrfs subvolume delete /srv/snapshots-recv/<old-path>/*/snapshot
-> sudo rm -rf /srv/snapshots-recv/<old-paths>
-> ```
+> **Not yet included (a later pass):** the systemd timer, the missed-run watchdog, and
+> Snapper-hook triggering. snappersend writes a success stamp
+> (`/var/lib/snappersend/last-success`) the future watchdog will read, but ships now as
+> a clean CLI that does one full replication pass per invocation.
 
 ## Tests
 
 ```sh
-SNAPSEND_QUIET=1 python3 -m unittest -v test_di_snapsend
+SNAPPERSEND_QUIET=1 python3 -m pytest test_snappersend.py -q
 ```
 
-The suite covers the silent-but-catastrophic logic: `is_correlated` (all clauses +
-guards), `choose_parent`, `_newest_correlated_pair`, the Rule-1 validity properties,
-`parse_subvolume_show` against real `btrfs subvolume show` output, exhaustive
-retention bucketing (multi-year, sporadic, boundary/DST, pin, source/destination
-interaction across tiers) under both timezones, config loading, timestamp parsing,
-and `_run_pipe`'s all-stage exit-code capture. Retention **execution** on real
-subvolumes is covered separately — see `tests/RETENTION-TESTING.md`.
+The suite covers the parent-tree invariant (failed send leaves the parent unchanged;
+success promotes and prunes; diverged destination → full send + reseed; crash-after-
+send-before-promote is safe), WYSIWYG GFS retention including the yearly tier (and that
+no source-backed snapshot survives beyond GFS), Snapper-schema config parsing, and the
+carried-over correctness logic (valid-received detection, UUID correlation,
+receive-in-place, run-lock collision).

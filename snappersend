@@ -1,0 +1,1366 @@
+#!/usr/bin/env python3
+"""
+snappersend — Snapper-native Btrfs send/receive replication with a parent tree
+==============================================================================
+
+Replicates Snapper-created Btrfs snapshots from a SOURCE host to a DESTINATION
+host over SSH via:
+
+    btrfs send [-p PARENT] CLONE | [mbuffer |] ssh DEST "sudo btrfs receive DST"
+
+It does NOT reimplement the Btrfs stream format or the network — btrfs does the
+filesystem + stream work, ssh does the (encrypted) network, snappersend does the
+bookkeeping. It is a ground-up rewrite of di-snapsend that fixes two problems:
+
+WHAT CHANGED FROM di-snapsend (and why)
+---------------------------------------
+1. WYSIWYG retention. di-snapsend kept a destination snapshot if EITHER its GFS
+   policy kept it OR its source still held it (a "superset"), so the destination
+   silently held more than its config implied. snappersend's destination retention
+   is PURE GFS — what you configure is what you get — with exactly ONE documented
+   exception: the pinned incremental parent (the most recent snapshot is always
+   kept as the next incremental's base).
+
+2. Gaps no longer force full sends. di-snapsend's `-p` parent had to still exist
+   as a *Snapper* snapshot; if Snapper pruned it during a long offline gap the next
+   run fell back to a full send. snappersend keeps its OWN parent clones in a
+   private tree, immune to Snapper retention, so incrementals survive arbitrary gaps.
+
+THE PARENT-PRESERVATION TREE (the central mechanism)
+----------------------------------------------------
+On the SOURCE, snappersend keeps a private tree of read-only clones of the
+snapshots it has successfully sent — one set per replicated subvolume, at
+`<parent_tree_base>/<subvol>/` (default /.snappersend/<subvol>/). A clone is made
+with `btrfs subvolume snapshot -r`: it shares extents via reflink (near-zero space)
+but is an INDEPENDENT subvolume, so deleting Snapper's original does not touch it.
+That is what decouples the parent's lifetime from Snapper retention.
+
+WE SEND THE CLONE, NOT THE SNAPPER SNAPSHOT. This is the crux and was validated on
+real btrfs before writing this: a `btrfs subvolume snapshot` gets a NEW uuid, so if
+we sent Snapper's snapshot and kept a clone as the parent, the destination would
+correlate on the snapshot's uuid while our retained parent carried the clone's uuid
+— they would not match next run, breaking the chain. By sending the clone itself,
+the destination's `received_uuid` equals the clone's uuid, so the clone we keep IS
+the thing the destination correlates with. `btrfs send -p` between two clones of
+different Snapper snapshots works because it simply diffs two read-only subvolumes
+that share extents (proven: a 3-line incremental vs a full send, snapper original
+deleted, still produced a correct receive).
+
+THE PROMOTE-ON-CONFIRMED-SEND INVARIANT (the whole safety story)
+---------------------------------------------------------------
+The parent tree must only ever retain clones CONFIRMED landed on the destination.
+Per run, per subvol:
+
+  1. List existing clones = prior confirmed-sent states (untouched from prior runs).
+  2. Choose the parent: the NEWEST clone that correlates with a destination
+     snapshot (proves it is a valid base the destination still holds). None -> full.
+  3. If Snapper's current newest is already represented by a correlating clone,
+     there is nothing to send (idempotent re-run); go straight to retention.
+  4. Otherwise stage a clone of Snapper's newest and send it, `-p <parent clone>`.
+  5. On a VERIFIED-GOOD receive: keep the staged clone and prune clones beyond
+     `parent_keep`. The tree advances ONLY here.
+  6. On send/receive failure: DELETE the staged clone — the tree returns to exactly
+     its prior state (old parent stays). Next run retries off the same parent.
+
+Consequences honoured here:
+  * Long gap / holiday: every failed run leaves the parent frozen and still
+    correlating with the destination's newest, so on return the incremental works
+    off the preserved clone — no full send. (The primary scenario this exists for.)
+  * Divergence (no clone correlates: first run, or destination snapshot deleted/
+    altered): full send, logged LOUDLY at INFO, parent tree reseeded on success.
+  * Crash between send-OK and prune: the staged clone is already in the tree and the
+    destination already has it, so next run simply continues off it. The invariant
+    guarantees the parent is never AHEAD of the destination; stale-behind is
+    recoverable, ahead is the corruption trap — we always stay on the safe side.
+
+SEND MODEL: NEWEST-ONLY, NOT CATCH-UP
+-------------------------------------
+Each run sends ONLY Snapper's current newest snapshot, parented off its preserved
+clone. It does not enumerate and ship every missing source snapshot. So the
+destination is a SAMPLE at snappersend's run cadence, not a faithful copy of every
+Snapper snapshot — by design, and what lets retention be WYSIWYG with no tombstones
+(the send path never looks backward, so there is no re-send-of-pruned problem).
+
+BTRFS CORRECTNESS RULES (carried over from di-snapsend — proven, distilled from btrbk)
+-------------------------------------------------------------------------------------
+(1) VALID RECEIVED SUBVOLUME: a clean receive is `readonly == true` AND
+    `received_uuid` is set; a garbled one is writable with `received_uuid == '-'`.
+    Every receive is verified; a garble is deleted and the run treated as failed.
+(2) CORRELATION BY UUID (never by number): a == b when `a.uuid == b.received_uuid`
+    OR `b.uuid == a.received_uuid` OR both `received_uuid` match. Both must be RO.
+(3) RECEIVE-IN-PLACE: Snapper's subvol is literally named `snapshot`, so we receive
+    into the final per-transfer directory directly — never `mv` a received RO subvol
+    (copy fallback fails on the RO source) nor flip it RW (resets received_uuid).
+(4) DESTINATION SNAPSHOTS STAY READ-ONLY — RO is what makes received_uuid a
+    trustworthy base.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+
+# ============================================================================
+# LOGGING  ([STEP]/[INFO]/[OK]/[WARN]/[ERROR], di-* house style — reused verbatim)
+# ============================================================================
+# Structured logging to a file (default /var/log/snappersend.log, override with
+# $SNAPPERSEND_LOG) plus the terminal (coloured when stderr is a tty). File logging
+# is best-effort: an unwritable log path degrades to stderr only rather than
+# aborting. Set $SNAPPERSEND_QUIET to silence (used by tests).
+
+_VERBOSE = False
+_QUIET = bool(os.environ.get("SNAPPERSEND_QUIET"))
+_LOG_PATH = os.environ.get("SNAPPERSEND_LOG", "/var/log/snappersend.log")
+_RESET = "\033[0m"
+_LEVEL_COLOR = {
+    "STEP":  "\033[1;36m",   # bold cyan
+    "INFO":  "\033[0;34m",   # blue
+    "OK":    "\033[0;32m",   # green
+    "WARN":  "\033[0;33m",   # yellow
+    "ERROR": "\033[0;31m",   # red
+}
+_logfile = None  # None=untried, False=tried-and-failed, else file object
+
+
+def _open_logfile():
+    global _logfile
+    if _logfile is not None:
+        return _logfile
+    try:
+        _logfile = open(_LOG_PATH, "a", encoding="utf-8")
+    except OSError:
+        _logfile = False
+    return _logfile
+
+
+def _emit(level: str, msg: str) -> None:
+    if _QUIET:
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    plain = f"{ts} [{level}] {msg}"
+    lf = _open_logfile()
+    if lf:
+        try:
+            lf.write(plain + "\n")
+            lf.flush()
+        except OSError:
+            pass
+    if sys.stderr.isatty():
+        color = _LEVEL_COLOR.get(level, "")
+        sys.stderr.write(f"{ts} {color}[{level}]{_RESET} {msg}\n")
+    else:
+        sys.stderr.write(plain + "\n")
+
+
+def log_step(m: str) -> None:  _emit("STEP", m)
+def log_info(m: str) -> None:  _emit("INFO", m)
+def log_ok(m: str) -> None:    _emit("OK", m)
+def log_warn(m: str) -> None:  _emit("WARN", m)
+def log_error(m: str) -> None: _emit("ERROR", m)
+
+
+def log_debug(m: str) -> None:
+    if _VERBOSE:
+        _emit("INFO", m)
+
+
+# ============================================================================
+# SUBVOLUME IDENTITY  (the fields the correctness rules depend on)
+# ============================================================================
+
+@dataclass
+class Subvol:
+    """One Btrfs subvolume's identity, parsed from `btrfs subvolume show`."""
+    path: str
+    uuid: str
+    parent_uuid: str            # '-' if none
+    received_uuid: str          # '-' if not a received subvol
+    readonly: bool
+    # Snapper number: for a source snapshot, Snapper's own number; for a parent
+    # clone or a received target, parsed back from the <...>-<num>-<...> name so
+    # ordering/naming reflect the ORIGINAL snapshot's identity, not the clone's.
+    snapper_num: Optional[int] = None
+    snapper_time: Optional[str] = None        # raw info.xml <date> (source only)
+    info_time: Optional[datetime] = None      # parsed snapshot date (authoritative)
+    creation_time: Optional[datetime] = None  # parsed `btrfs ... show` Creation
+    snapper_type: Optional[str] = None        # 'single'|'pre'|'post' (source)
+    pre_num: Optional[int] = None             # paired pre num for a 'post' (src)
+
+    # --- rule (1): is this a cleanly-received target subvol? ---------------
+    @property
+    def is_valid_received(self) -> bool:
+        """A clean receive is readonly AND has received_uuid set."""
+        return self.readonly and self.received_uuid != "-"
+
+    @property
+    def is_garbled(self) -> bool:
+        """Partial/interrupted receive: writable AND no received_uuid."""
+        return (not self.readonly) and self.received_uuid == "-"
+
+    @property
+    def when(self) -> Optional[datetime]:
+        """Best-known timestamp for ordering / retention bucketing. Prefers the
+        snapshot's own info.xml/name date; falls back to the Btrfs creation time."""
+        return self.info_time or self.creation_time
+
+
+# --- rule (2): correlation test (parent eligibility) -----------------------
+def is_correlated(a: Subvol, b: Subvol) -> bool:
+    """
+    True if a and b are the same Btrfs lineage and thus a valid send-parent
+    pairing. Both must be readonly. Every clause guards against '-' (Snapper's "no
+    value" and our parse fallback) so an unknown UUID never spuriously correlates.
+    (btrbk _is_correlated.)
+    """
+    if not (a.readonly and b.readonly):
+        return False
+    if a.uuid != "-" and a.uuid == b.received_uuid:
+        return True
+    if b.uuid != "-" and b.uuid == a.received_uuid:
+        return True
+    if a.received_uuid != "-" and a.received_uuid == b.received_uuid:
+        return True
+    return False
+
+
+# ============================================================================
+# CONFIG  (Snapper-schema-aligned, flat KEY="value" — parsed by python-dotenv)
+# ============================================================================
+# The retention block mirrors Snapper's own config: a flat KEY="value" file using
+# Snapper's TIMELINE_LIMIT_* names (incl. YEARLY), so a Snapper user reads it and
+# immediately understands it. Transport/layout keys live in the same flat file.
+#
+# WHY python-dotenv (python3-dotenv, Trixie main) and not configobj/configparser:
+#   * configparser (stdlib) requires a [section] header that Snapper files lack;
+#     synthesising one is a hack.
+#   * configobj parses flat files but RAISES on a duplicate key — a sharp edge
+#     against the goal of tolerantly reading a Snapper-shaped file.
+#   * python-dotenv is purpose-built for exactly KEY="value": it strips inline
+#     comments, tolerates spaces around '=', quoted values with spaces, empties,
+#     and malformed/duplicate lines (best-effort, never raises) — so a user can
+#     literally point snappersend at a Snapper config and the keys it doesn't use
+#     are ignored gracefully. Verified against the real /etc/snapper/configs/root.
+
+# Snapper-only keys snappersend deliberately IGNORES (documented; never an error):
+_SNAPPER_IGNORED_KEYS = (
+    "SUBVOLUME", "FSTYPE", "QGROUP", "SPACE_LIMIT", "FREE_LIMIT", "ALLOW_USERS",
+    "ALLOW_GROUPS", "SYNC_ACL", "BACKGROUND_COMPARISON", "NUMBER_CLEANUP",
+    "NUMBER_MIN_AGE", "NUMBER_LIMIT", "NUMBER_LIMIT_IMPORTANT", "TIMELINE_CREATE",
+    "TIMELINE_CLEANUP", "TIMELINE_MIN_AGE", "EMPTY_PRE_POST_CLEANUP",
+    "EMPTY_PRE_POST_MIN_AGE",
+)
+
+# Snapper TIMELINE_LIMIT_* tier -> snappersend GFS keep field.
+_TIER_KEYS = (
+    ("TIMELINE_LIMIT_HOURLY",  "keep_hourly"),
+    ("TIMELINE_LIMIT_DAILY",   "keep_daily"),
+    ("TIMELINE_LIMIT_WEEKLY",  "keep_weekly"),
+    ("TIMELINE_LIMIT_MONTHLY", "keep_monthly"),
+    ("TIMELINE_LIMIT_YEARLY",  "keep_yearly"),
+)
+
+
+@dataclass(frozen=True)
+class Config:
+    """Populated from the flat config file at startup. Operational flags
+    (--dry-run, --subvol, --no-mbuffer, --server) override at the CLI/env layer."""
+    server_host: str
+    server_ssh_port: int = 22
+    server_user: str = "snapsend"       # dedicated least-priv transport user
+    ssh_key: str = "/etc/snappersend/ssh/id_ed25519"
+    recv_base: str = "/srv/snapshots-recv"
+    # subvol-name -> {"mountpoint": str}. recv_dir is composed at runtime as
+    # <recv_base>/<hostname>/<name> so multiple machines share one destination.
+    subvols: dict = field(default_factory=lambda: {
+        "root": {"mountpoint": "/"},
+        "home": {"mountpoint": "/home"},
+    })
+    # Pure-GFS destination retention, Snapper's full tier set (incl. yearly).
+    # keep == 0 disables a tier. The pinned parent is the one documented exception.
+    retention: dict = field(default_factory=lambda: {
+        "default": {"keep_hourly": 24, "keep_daily": 14, "keep_weekly": 8,
+                    "keep_monthly": 6, "keep_yearly": 2},
+    })
+    retention_timezone: str = "local"   # "local" (default) | "utc" bucket boundaries
+    use_mbuffer: bool = True
+    dry_run: bool = False
+
+    # Parent-preservation tree (the new mechanism).
+    parent_tree_base: str = "/.snappersend"
+    parent_keep: int = 2                # live parent + one slot of redundancy
+
+    # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd as a single current
+    # mirror, not versioned, not through the snapshot machinery.
+    boot_backup_enabled: bool = True
+    boot_paths: tuple = ("/boot", "/boot/efi")
+
+    def retention_for(self, subvol_name: str) -> dict:
+        return self.retention.get(subvol_name, self.retention["default"])
+
+    def recv_dir_for(self, host: str, subvol_name: str) -> str:
+        return os.path.join(self.recv_base, host, subvol_name)
+
+    def parent_dir_for(self, subvol_name: str) -> str:
+        return os.path.join(self.parent_tree_base, subvol_name)
+
+
+def _parse_tiers(d: dict, prefix: str = "") -> dict:
+    """Pull TIMELINE_LIMIT_* (optionally <PREFIX>_TIMELINE_LIMIT_*) into a keep
+    dict. Missing/blank/non-numeric -> 0 (tier disabled) — never raises, so a
+    partial or Snapper-shaped file degrades gracefully."""
+    keep = {}
+    for snap_key, gfs_key in _TIER_KEYS:
+        raw = d.get(f"{prefix}{snap_key}" if prefix else snap_key)
+        try:
+            keep[gfs_key] = int(str(raw).strip()) if raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            log_warn(f"config: {prefix}{snap_key}={raw!r} is not an integer; "
+                     "treating tier as disabled (0)")
+            keep[gfs_key] = 0
+    return keep
+
+
+def load_config(path: str = "/etc/snappersend/config") -> dict:
+    """
+    Parse the flat KEY="value" config into kwargs for Config (python-dotenv).
+
+    Retention uses Snapper's vocabulary: a bare TIMELINE_LIMIT_* set is the default
+    policy for every subvol; an optional `<SUBVOL>_TIMELINE_LIMIT_*` (e.g.
+    ROOT_TIMELINE_LIMIT_DAILY) overrides one tier for one subvol. Snapper-only keys
+    present in the file are ignored without error. Raises FileNotFoundError if the
+    file is absent and KeyError only if SERVER_HOST (the one required key) is missing.
+    """
+    from dotenv import dotenv_values
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    d = dotenv_values(path)
+
+    def s(key, default=None):
+        v = d.get(key)
+        return v if v not in (None, "") else default
+
+    def b(key, default):
+        v = s(key)
+        if v is None:
+            return default
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    kwargs: dict = {}
+
+    host = s("SERVER_HOST")
+    if not host:
+        raise KeyError("SERVER_HOST is required in the config")
+    kwargs["server_host"] = host
+    if s("SSH_PORT"):
+        kwargs["server_ssh_port"] = int(s("SSH_PORT"))
+    if s("SERVER_USER"):
+        kwargs["server_user"] = s("SERVER_USER")
+    if s("SSH_KEY"):
+        kwargs["ssh_key"] = s("SSH_KEY")
+    if s("RECV_BASE"):
+        kwargs["recv_base"] = s("RECV_BASE")
+    kwargs["use_mbuffer"] = b("USE_MBUFFER", True)
+
+    # Boot tier
+    kwargs["boot_backup_enabled"] = b("BOOT_ENABLED", True)
+    if s("BOOT_PATHS"):
+        kwargs["boot_paths"] = tuple(s("BOOT_PATHS").split())
+
+    # Parent tree
+    if s("PARENT_TREE_BASE"):
+        kwargs["parent_tree_base"] = s("PARENT_TREE_BASE")
+    if s("PARENT_KEEP"):
+        with contextlib.suppress(ValueError):
+            kwargs["parent_keep"] = max(1, int(s("PARENT_KEEP")))
+
+    # Retention timezone
+    tz = (s("RETENTION_TIMEZONE", "local") or "local").strip().lower()
+    if tz not in ("local", "utc"):
+        log_warn(f"RETENTION_TIMEZONE {tz!r} unrecognized (expected 'local'/'utc'); "
+                 "using 'local'")
+        tz = "local"
+    kwargs["retention_timezone"] = tz
+
+    # Subvolumes: "root:/ home:/home"  (name:mountpoint pairs)
+    if s("SUBVOLUMES"):
+        subvols = {}
+        for token in s("SUBVOLUMES").split():
+            if ":" not in token:
+                log_warn(f"config: SUBVOLUMES token {token!r} is not name:mountpoint; "
+                         "skipping")
+                continue
+            name, mnt = token.split(":", 1)
+            subvols[name] = {"mountpoint": mnt}
+        if subvols:
+            kwargs["subvols"] = subvols
+
+    # Retention: default tiers from the bare TIMELINE_LIMIT_*, per-subvol overrides
+    # from <SUBVOL>_TIMELINE_LIMIT_*. Composed onto the default so a subvol that
+    # overrides only one tier inherits the rest.
+    default_keep = _parse_tiers(d)
+    # If the file carried no TIMELINE_LIMIT_* at all, fall back to the example/
+    # new-install defaults rather than an all-zero (all-disabled) policy.
+    if not any(default_keep.values()):
+        default_keep = {"keep_hourly": 24, "keep_daily": 14, "keep_weekly": 8,
+                        "keep_monthly": 6, "keep_yearly": 2}
+    retention = {"default": default_keep}
+    names = list(kwargs.get("subvols", {"root": 0, "home": 0}).keys())
+    for name in names:
+        override = _parse_tiers(d, prefix=f"{name.upper()}_")
+        if any(v != 0 for v in override.values()):
+            merged = dict(default_keep)
+            # Only non-zero override tiers replace the default; a tier the user
+            # didn't mention for this subvol keeps the default value.
+            raw = {gk: d.get(f"{name.upper()}_{sk}")
+                   for sk, gk in _TIER_KEYS}
+            for gk, val in override.items():
+                if raw[gk] not in (None, ""):
+                    merged[gk] = val
+            retention[name] = merged
+    kwargs["retention"] = retention
+
+    return kwargs
+
+
+# ============================================================================
+# SHELL HELPERS
+# ============================================================================
+
+def run_local(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a local command, capturing output. Missing executables degrade to a
+    rc=127 CompletedProcess when check=False."""
+    log_debug("local: " + " ".join(shlex.quote(a) for a in argv))
+    try:
+        cp = subprocess.run(argv, check=False, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        if check:
+            raise
+        return subprocess.CompletedProcess(argv, 127, "", str(e))
+    if check and cp.returncode != 0:
+        raise subprocess.CalledProcessError(cp.returncode, argv, cp.stdout, cp.stderr)
+    return cp
+
+
+def ssh_argv(cfg: Config, remote_cmd: str) -> list[str]:
+    return [
+        "ssh", "-i", cfg.ssh_key, "-p", str(cfg.server_ssh_port),
+        "-o", "BatchMode=yes",
+        f"{cfg.server_user}@{cfg.server_host}",
+        remote_cmd,
+    ]
+
+
+def run_remote(cfg: Config, remote_cmd: str, *, check: bool = True):
+    return run_local(ssh_argv(cfg, remote_cmd), check=check)
+
+
+# ============================================================================
+# PARSING  `btrfs subvolume show`
+# ============================================================================
+
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    """Parse a Snapper/Btrfs timestamp into a NAIVE-UTC datetime. Handles
+    info.xml's `YYYY-MM-DD HH:MM:SS` (UTC) and btrfs' `... +0000`. None on
+    empty/'-'/unparseable so bucketing can fall back gracefully."""
+    if not s:
+        return None
+    txt = s.strip()
+    if not txt or txt == "-":
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(txt, fmt)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+
+def parse_subvolume_show(text: str, path: str) -> Subvol:
+    """Parse the human output of `btrfs subvolume show` into a Subvol. Field lines
+    look like `Key:\\t\\tvalue`; matching is on a normalised lowercased prefix so
+    btrfs-progs version differences don't matter."""
+    uuid = parent_uuid = received_uuid = "-"
+    readonly = False
+    creation_time = None
+
+    for line in text.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("received uuid:"):
+            received_uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("parent uuid:"):
+            parent_uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("uuid:"):
+            uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("flags:"):
+            readonly = "readonly" in low
+        elif low.startswith("creation time:"):
+            creation_time = _parse_dt(s.split(":", 1)[1])
+
+    return Subvol(path=path, uuid=uuid, parent_uuid=parent_uuid,
+                  received_uuid=received_uuid, readonly=readonly,
+                  creation_time=creation_time)
+
+
+def _ro_property_local(path: str) -> bool:
+    cp = run_local(["btrfs", "property", "get", path, "ro"], check=False)
+    return "ro=true" in cp.stdout.replace(" ", "").lower()
+
+
+def _ro_property_remote(cfg: Config, path: str) -> bool:
+    cp = run_remote(cfg, f"sudo btrfs property get {shlex.quote(path)} ro", check=False)
+    return "ro=true" in cp.stdout.replace(" ", "").lower()
+
+
+def show_local(path: str) -> Optional[Subvol]:
+    cp = run_local(["btrfs", "subvolume", "show", path], check=False)
+    if cp.returncode != 0:
+        log_warn(f"btrfs subvolume show failed for {path}: {cp.stderr.strip()}")
+        return None
+    sv = parse_subvolume_show(cp.stdout, path)
+    if "flags:" not in cp.stdout.lower():
+        sv.readonly = _ro_property_local(path)
+    return sv
+
+
+def show_remote(cfg: Config, path: str) -> Optional[Subvol]:
+    cp = run_remote(cfg, f"sudo btrfs subvolume show {shlex.quote(path)}", check=False)
+    if cp.returncode != 0:
+        return None
+    sv = parse_subvolume_show(cp.stdout, path)
+    if "flags:" not in cp.stdout.lower():
+        sv.readonly = _ro_property_remote(cfg, path)
+    return sv
+
+
+# ============================================================================
+# ENUMERATION
+# ============================================================================
+
+def _read_info_xml(info_path: str):
+    """Best-effort parse of Snapper's info.xml -> (num, date_str, type, pre_num)."""
+    try:
+        root = ET.parse(info_path).getroot()
+        num = root.findtext("num")
+        date = root.findtext("date")
+        typ = root.findtext("type")
+        pre = root.findtext("pre_num")
+        return (
+            int(num) if num and num.isdigit() else None,
+            date.strip() if date else None,
+            typ.strip() if typ else None,
+            int(pre) if pre and pre.strip().isdigit() else None,
+        )
+    except Exception as e:
+        log_debug(f"info.xml parse failed for {info_path}: {e}")
+        return (None, None, None, None)
+
+
+def _int_or_zero(s: str) -> int:
+    return int(s) if s.isdigit() else 0
+
+
+def list_snapper_snapshots(mountpoint: str) -> list[Subvol]:
+    """Read Snapper's RO snapshots from <mountpoint>/.snapshots/<N>/snapshot plus
+    info.xml. Only readonly snapshots are sendable, so RW ones are skipped."""
+    snaps: list[Subvol] = []
+    snap_root = os.path.join(mountpoint, ".snapshots")
+    if not os.path.isdir(snap_root):
+        log_warn(f"no .snapshots under {mountpoint} ({snap_root} absent)")
+        return snaps
+
+    for entry in sorted(os.listdir(snap_root), key=_int_or_zero):
+        if not entry.isdigit():
+            continue
+        sub_path = os.path.join(snap_root, entry, "snapshot")
+        if not os.path.isdir(sub_path):
+            continue
+        sv = show_local(sub_path)
+        if sv is None:
+            continue
+        if not sv.readonly:
+            log_debug(f"skipping non-readonly snapshot {sub_path}")
+            continue
+        sv.snapper_num = int(entry)
+        info_path = os.path.join(snap_root, entry, "info.xml")
+        if os.path.isfile(info_path):
+            num, date, typ, pre = _read_info_xml(info_path)
+            sv.snapper_time = date
+            sv.info_time = _parse_dt(date)
+            sv.snapper_type = typ
+            sv.pre_num = pre
+        snaps.append(sv)
+    return snaps
+
+
+def newest_snapshot(snaps: list[Subvol]) -> Optional[Subvol]:
+    """Snapper's current newest by number (the only one the newest-only model sends)."""
+    numbered = [s for s in snaps if s.snapper_num is not None]
+    return max(numbered, key=lambda s: s.snapper_num) if numbered else None
+
+
+def _parse_dt_name(s: str) -> Optional[datetime]:
+    """Parse a colon-free `YYYYMMDD-HHMM±ZZZZ` name label into NAIVE-UTC."""
+    try:
+        aware = datetime.strptime(s, "%Y%m%d-%H%M%z")
+    except ValueError:
+        return None
+    return aware.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+# A received/clone directory name. Two shapes share the same prefix:
+#   destination receive dir : <localdate>-<offset>-<num>-<short_uuid>  (trailing uuid)
+#   source parent-tree label: <localdate>-<offset>-<num>              (no trailing uuid)
+# date+offset = group 1, num = group 2; the num is terminated by a '-' or end-of-string
+# so both shapes parse (e.g. 20260627-1300+1000-8-a2159d69 and 20260627-1300+1000-8).
+_NAME_RE = re.compile(r"^(\d{8}-\d{4}[+-]\d{4})-(\d+)(?:-|$)")
+
+
+def _apply_name_metadata(sv: Subvol, name: str) -> None:
+    """Recover the ORIGINAL snapshot's num + time from a received/clone dir name and
+    set them on the Subvol, so ordering/naming reflect the snapshot, not the clone."""
+    m = _NAME_RE.match(name)
+    if m:
+        sv.snapper_num = int(m.group(2))
+        parsed = _parse_dt_name(m.group(1))
+        if parsed is not None:
+            sv.info_time = parsed
+
+
+def list_target_snapshots(cfg: Config, recv_dir: str) -> list[Subvol]:
+    """List received subvolumes on the destination under recv_dir (over ssh). Each
+    lives at `<recv_dir>/<name>/snapshot`; <name> carries the source snapshot's date
+    + num (authoritative for ordering/retention). The `<base>.latest` symlink is
+    skipped."""
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(recv_dir)}", check=False)
+    out: list[Subvol] = []
+    if cp.returncode != 0:
+        return out
+    for name in cp.stdout.split():
+        if name.endswith(".latest"):
+            continue
+        sv = show_remote(cfg, os.path.join(recv_dir, name, "snapshot"))
+        if sv is None:
+            continue
+        _apply_name_metadata(sv, name)
+        out.append(sv)
+    return out
+
+
+# ============================================================================
+# PARENT-PRESERVATION TREE  (the central new mechanism)
+# ============================================================================
+
+def list_parent_clones(cfg: Config, subvol_name: str) -> list[Subvol]:
+    """List the read-only parent clones under <parent_tree_base>/<subvol>/, newest
+    first. Each clone lives at `<label>/snapshot` (mirroring Snapper's own wrapper +
+    `snapshot` layout, so the subvol we send is literally named `snapshot` and
+    receives in place). The clone's own uuid (what the destination correlates on)
+    comes from `btrfs subvolume show`; its num + time are recovered from the <label>
+    dir name (the original snapshot's identity)."""
+    base = cfg.parent_dir_for(subvol_name)
+    if not os.path.isdir(base):
+        return []
+    clones: list[Subvol] = []
+    for label in os.listdir(base):
+        path = os.path.join(base, label, "snapshot")
+        if not os.path.isdir(path):
+            continue
+        sv = show_local(path)
+        if sv is None:
+            continue
+        _apply_name_metadata(sv, label)
+        clones.append(sv)
+    clones.sort(key=lambda c: (c.when or datetime.min, c.snapper_num or 0),
+                reverse=True)
+    return clones
+
+
+def choose_parent_clone(clones: list[Subvol],
+                        target_snaps: list[Subvol]) -> Optional[Subvol]:
+    """The send parent: the NEWEST clone that correlates with a snapshot the
+    destination still holds (proving it is a valid `-p` base there). Naturally skips
+    an orphan clone from a crash-before-receive (the destination never got it) and
+    detects divergence (returns None -> full send). Selects by max time/num rather
+    than trusting input order, so it is correct regardless of how `clones` is sorted."""
+    correlating = [c for c in clones
+                   if any(is_correlated(c, t) for t in target_snaps)]
+    if not correlating:
+        return None
+    return max(correlating, key=lambda c: (c.when or datetime.min, c.snapper_num or 0))
+
+
+def _clone_label(snap: Subvol) -> str:
+    """Directory label for a clone of `snap`: <localdate>-<offset>-<num>. Derived
+    purely from the snapshot so a re-clone of the same snapshot is deterministic
+    (and any orphan from a crash is overwritten, not duplicated)."""
+    dt = snap.when
+    if dt:
+        aware = dt.replace(tzinfo=timezone.utc).astimezone()
+        date_part = aware.strftime("%Y%m%d-%H%M%z")
+    else:
+        date_part = "nodate"
+    num = snap.snapper_num if snap.snapper_num is not None else 0
+    return f"{date_part}-{num}"
+
+
+def make_clone(cfg: Config, subvol_name: str, snap: Subvol) -> Optional[Subvol]:
+    """Stage a read-only clone of Snapper's snapshot `snap` in the parent tree and
+    return it carrying `snap`'s num/time. The clone lands at `<label>/snapshot` so
+    the subvol we later send is literally named `snapshot` (it then receives in place
+    on the destination, rule 3). Reflink-shared (near-zero space) but an independent
+    subvolume. A pre-existing clone at the same label is an orphan from a prior crash
+    (we only get here when `snap` is NOT yet confirmed sent) and is replaced. The
+    staged clone is RETAINED only if the subsequent send verifies — see
+    replicate_subvol; on failure it is deleted (promote-on-confirmed-send)."""
+    base = cfg.parent_dir_for(subvol_name)
+    label = _clone_label(snap)
+    wrapper = os.path.join(base, label)
+    path = os.path.join(wrapper, "snapshot")
+
+    if cfg.dry_run:
+        log_info(f"[dry-run] would clone {snap.path} -> {path}")
+        # Synthetic clone carrying snap's identity so the dry-run send log is realistic.
+        c = Subvol(path=path, uuid=snap.uuid, parent_uuid=snap.uuid,
+                   received_uuid="-", readonly=True)
+        c.snapper_num, c.info_time = snap.snapper_num, snap.info_time
+        return c
+
+    if os.path.isdir(path):
+        log_debug(f"replacing orphan clone {path}")
+        delete_clone(path)
+    os.makedirs(wrapper, exist_ok=True)
+    cp = run_local(["btrfs", "subvolume", "snapshot", "-r", snap.path, path],
+                   check=False)
+    if cp.returncode != 0:
+        log_error(f"failed to clone {snap.path} -> {path}: {cp.stderr.strip()}")
+        with contextlib.suppress(OSError):
+            os.rmdir(wrapper)
+        return None
+    clone = show_local(path)
+    if clone is None:
+        log_error(f"clone {path} unreadable after creation")
+        return None
+    clone.snapper_num, clone.info_time = snap.snapper_num, snap.info_time
+    return clone
+
+
+def delete_clone(path: str) -> None:
+    """Delete a parent clone subvolume and its now-empty wrapper dir (best-effort).
+    `path` is the `<label>/snapshot` subvol."""
+    run_local(["btrfs", "subvolume", "delete", path], check=False)
+    with contextlib.suppress(OSError):
+        os.rmdir(os.path.dirname(path))
+
+
+def prune_parent_clones(cfg: Config, subvol_name: str, keep: int) -> None:
+    """Keep the newest `keep` clones; delete older ones. Space hygiene only —
+    correctness comes from choose_parent_clone correlating against the destination,
+    so an extra orphan never misleads parent selection."""
+    clones = list_parent_clones(cfg, subvol_name)
+    for old in clones[keep:]:
+        if cfg.dry_run:
+            log_info(f"[dry-run] would prune parent clone {old.path}")
+            continue
+        delete_clone(old.path)
+        log_info(f"  pruned parent clone "
+                 f"{os.path.basename(os.path.dirname(old.path))}")
+
+
+# ============================================================================
+# TRANSFER  (send the CLONE + rule 1 verification)
+# ============================================================================
+
+def send_receive(cfg: Config, clone: Subvol, recv_dir: str,
+                 parent: Optional[Subvol]) -> bool:
+    """
+    Stream one parent-tree CLONE to the destination, then VERIFY it landed cleanly
+    (rule 1). Returns True only on a verified-good receive. On garble (or pipe
+    error) it deletes the partial subvol on the destination and returns False,
+    leaving the existing chain intact for a clean retry.
+
+    We send the clone (not Snapper's snapshot) so the destination's received_uuid
+    equals the clone's uuid — the clone we retain IS the destination's correlation
+    key. The destination dir is named from the ORIGINAL snapshot's date+num (carried
+    on the clone) so the receive area sorts chronologically and retention buckets by
+    snapshot time; the short_uuid is the clone's (what correlates). Receive-in-place
+    (rule 3): we receive directly into the final per-transfer directory.
+    """
+    send_cmd = ["btrfs", "send"]
+    if parent is not None:
+        send_cmd += ["-p", parent.path]
+    send_cmd += [clone.path]
+
+    dt = clone.when
+    if dt:
+        aware = dt.replace(tzinfo=timezone.utc).astimezone()
+        date_part = aware.strftime("%Y%m%d-%H%M%z")
+    else:
+        date_part = "nodate"
+    short_uuid = clone.uuid.split("-")[0] if clone.uuid not in ("", "-") else "nouuid"
+    num = clone.snapper_num if clone.snapper_num is not None else 0
+    received_name = f"{date_part}-{num}-{short_uuid}"
+
+    final_dir = os.path.join(recv_dir, received_name)
+    final_path = os.path.join(final_dir, "snapshot")
+    recv_remote = f"sudo btrfs receive {shlex.quote(final_dir)}"
+
+    if cfg.dry_run:
+        kind = f"-p {parent.path} " if parent else "(FULL) "
+        log_info(f"[dry-run] btrfs send {kind}{clone.path} | ssh ... {recv_remote}"
+                 f"  ->  {final_path}")
+        return True
+
+    _cleanup_final(cfg, final_dir)
+    run_remote(cfg, f"sudo mkdir -p {shlex.quote(final_dir)}", check=False)
+
+    pipe_ok = _run_pipe(send_cmd, ssh_argv(cfg, recv_remote), cfg.use_mbuffer)
+
+    received_sv = show_remote(cfg, final_path)
+    if received_sv is None or received_sv.is_garbled or not received_sv.is_valid_received:
+        log_error(f"garbled/incomplete receive in {final_dir} — cleaning up")
+        _cleanup_final(cfg, final_dir)
+        return False
+    if not pipe_ok:
+        log_warn(f"pipe reported error though received subvol looks valid; "
+                 f"discarding {final_dir} and retrying next run")
+        _cleanup_final(cfg, final_dir)
+        return False
+
+    _update_latest_symlink(cfg, recv_dir, received_name)
+    log_ok(f"received #{num} -> {received_name}/snapshot")
+    return True
+
+
+def _cleanup_final(cfg: Config, final_dir: str) -> None:
+    """Remove a received (or partial) subvol + its per-transfer dir without needing
+    `rm -rf` on the destination (keeps the transport sudoers grant tight)."""
+    subvol = os.path.join(final_dir, "snapshot")
+    run_remote(cfg, f"sudo btrfs subvolume delete {shlex.quote(subvol)}", check=False)
+    run_remote(cfg, f"sudo rmdir {shlex.quote(final_dir)}", check=False)
+
+
+def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
+    """
+    Connect `btrfs send` -> [mbuffer ->] ssh receive and return True iff EVERY stage
+    exits 0 (a failure in `btrfs send` must not be masked by a 0 from ssh). Each
+    stage's stderr is captured to a temp file (never a pipe, so a chatty stage can't
+    deadlock the data flow) — except interactive mbuffer, which inherits the terminal
+    for its live throughput readout.
+    """
+    stages: list[tuple[str, list[str], bool]] = [("btrfs send", list(send_argv), True)]
+    mb = bool(use_mbuffer) and shutil.which("mbuffer") is not None
+    if use_mbuffer and not mb:
+        log_warn("use_mbuffer set but mbuffer not on PATH; continuing without it")
+    if mb:
+        if sys.stderr.isatty():
+            stages.append(("mbuffer", ["mbuffer", "-m", "256M"], False))
+        else:
+            stages.append(("mbuffer", ["mbuffer", "-q", "-m", "256M"], True))
+    stages.append(("ssh receive", list(ssh_argv_list), True))
+
+    procs: list[tuple[str, subprocess.Popen, object]] = []
+    errfiles: list = []
+    prev_stdout = None
+    try:
+        for i, (name, argv, capture) in enumerate(stages):
+            errf = tempfile.TemporaryFile() if capture else None
+            if errf is not None:
+                errfiles.append(errf)
+            is_last = (i == len(stages) - 1)
+            p = subprocess.Popen(
+                argv,
+                stdin=prev_stdout,
+                stdout=(subprocess.DEVNULL if is_last else subprocess.PIPE),
+                stderr=errf,
+            )
+            if prev_stdout is not None:
+                prev_stdout.close()
+            procs.append((name, p, errf))
+            prev_stdout = p.stdout
+    except (FileNotFoundError, OSError) as e:
+        log_error(f"failed to start pipe: {e}")
+        for _, p, _ef in procs:
+            with contextlib.suppress(Exception):
+                p.kill()
+        for ef in errfiles:
+            with contextlib.suppress(Exception):
+                ef.close()
+        return False
+
+    all_ok = True
+    for name, p, errf in procs:
+        rc = p.wait()
+        err = ""
+        if errf is not None:
+            try:
+                errf.seek(0)
+                err = errf.read().decode("utf-8", "replace").strip()
+            finally:
+                errf.close()
+        if rc != 0:
+            all_ok = False
+            log_error(f"  pipe stage '{name}' exited {rc}" + (f": {err}" if err else ""))
+        elif err:
+            log_debug(f"  pipe stage '{name}': {err}")
+    return all_ok
+
+
+def _update_latest_symlink(cfg: Config, recv_dir: str, name: str) -> None:
+    """Maintain <recv_dir>/<subvol>.latest -> newest received SUBVOL, a stable
+    target for a downstream archiver (e.g. restic) running on the destination."""
+    base = os.path.basename(recv_dir.rstrip("/"))
+    link = os.path.join(recv_dir, f"{base}.latest")
+    target = os.path.join(recv_dir, name, "snapshot")
+    run_remote(cfg, f"sudo ln -sfn {shlex.quote(target)} {shlex.quote(link)}", check=False)
+
+
+# ============================================================================
+# BOOT TIER  (non-Btrfs: EFI=FAT32, /boot=ext4 — rsync mirror, not versioned)
+# ============================================================================
+
+def boot_backup(cfg: Config, hostname: str) -> bool:
+    """rsync each non-Btrfs boot path to <recv_base>/<hostname>/<name>/ over SSH.
+    True iff every path synced cleanly. Fail-safe: a failure warns but does not
+    abort the run (the boot tier is independent of the snapshot tiers)."""
+    if not cfg.boot_backup_enabled:
+        log_info("Boot backup disabled — skipping.")
+        return True
+
+    log_step(f"Boot mirror ({', '.join(cfg.boot_paths)} -> {cfg.recv_base}/{hostname}/)")
+    rsh = f"ssh -i {cfg.ssh_key} -p {cfg.server_ssh_port} -o BatchMode=yes"
+    all_ok = True
+
+    for src in cfg.boot_paths:
+        if not os.path.ismount(src) and not os.path.isdir(src):
+            log_warn(f"  boot path {src} not present — skipping")
+            continue
+        name = src.strip("/").replace("/", "-")   # /boot -> boot, /boot/efi -> boot-efi
+        dest = f"{cfg.recv_base}/{hostname}/{name}"
+        run_remote(cfg, f"sudo mkdir -p {shlex.quote(dest)}", check=False)
+
+        rsync_argv = [
+            "rsync", "-aAX", "--delete",
+            "-e", rsh,
+            "--rsync-path", "sudo rsync",
+            f"{src.rstrip('/')}/",
+            f"{cfg.server_user}@{cfg.server_host}:{dest}/",
+        ]
+        if cfg.dry_run:
+            log_info(f"[dry-run] rsync {src}/ -> {dest}/")
+            continue
+
+        cp = run_local(rsync_argv, check=False)
+        # EFI (FAT32) has no perms/ACLs/xattrs, so -aAX emits benign warnings (rc 24
+        # = vanished files). Treat rc 0 and 24 as success; warn (don't fail) otherwise.
+        if cp.returncode in (0, 24):
+            log_ok(f"  {src} mirrored to {dest}")
+        else:
+            log_warn(f"  rsync of {src} failed (rc={cp.returncode}) — continuing; "
+                     "boot tier is independent of the snapshot tiers"
+                     + (f": {cp.stderr.strip()}" if cp.stderr.strip() else ""))
+            all_ok = False
+    return all_ok
+
+
+# ============================================================================
+# RETENTION  (WYSIWYG pure GFS over the destination + the one pinned-parent asterisk)
+# ============================================================================
+
+def _bucket_keep(targets_newest_first: list[Subvol],
+                 keep_hourly: int, keep_daily: int, keep_weekly: int,
+                 keep_monthly: int, keep_yearly: int, tz: str = "local") -> set:
+    """
+    GFS (grandfather-father-son) keep-set over already-newest-first targets. Returns
+    the set of target.path to KEEP: the newest snapshot of each of the most recent
+    `keep_<tier>` distinct buckets, unioned across hourly/daily/weekly/monthly/yearly.
+    Undatable targets are always kept (we never delete what we can't place).
+
+    Bucket BOUNDARIES are computed in `tz`: "local" (default) aligns hour/day/week/
+    month/year boundaries to this machine's local calendar; "utc" uses UTC. Only the
+    bucket-KEY extraction is zone-aware; `when` is a true instant (naive-UTC) and the
+    newest-first ORDERING is by that instant, which a zone shift never changes.
+    A tier with keep == 0 is disabled (the `lim[p] > 0` guard).
+    """
+    keep: set = set()
+    last = {"h": None, "d": None, "w": None, "m": None, "y": None}
+    cnt = {"h": 0, "d": 0, "w": 0, "m": 0, "y": 0}
+    lim = {"h": keep_hourly, "d": keep_daily, "w": keep_weekly,
+           "m": keep_monthly, "y": keep_yearly}
+
+    for t in targets_newest_first:
+        w = t.when
+        if w is None:
+            keep.add(t.path)
+            continue
+        keyed = w.replace(tzinfo=timezone.utc).astimezone() if tz == "local" else w
+        iso = keyed.isocalendar()
+        keys = {
+            "h": (keyed.year, keyed.month, keyed.day, keyed.hour),
+            "d": (keyed.year, keyed.month, keyed.day),
+            "w": (iso[0], iso[1]),
+            "m": (keyed.year, keyed.month),
+            "y": (keyed.year,),
+        }
+        for p in ("h", "d", "w", "m", "y"):
+            if lim[p] > 0 and keys[p] != last[p] and cnt[p] < lim[p]:
+                keep.add(t.path)
+                last[p] = keys[p]
+                cnt[p] += 1
+    return keep
+
+
+def _keep_prepost_partners(keep_paths: set, source_snaps: list[Subvol],
+                           target_snaps: list[Subvol]) -> set:
+    """Root-only nicety: avoid orphaning half an apt pre/post pair. For every kept
+    target whose correlated source is a 'post' (or 'pre'), also keep the target
+    correlated with its partner. Best-effort; silently does nothing when the source
+    side has already been pruned by Snapper. Composes fine with pure GFS."""
+    extra: set = set()
+
+    def corr_source(t: Subvol) -> Optional[Subvol]:
+        for s in source_snaps:
+            if is_correlated(s, t):
+                return s
+        return None
+
+    tgt_by_src_num: dict = {}
+    src_of_tgt: dict = {}
+    for t in target_snaps:
+        s = corr_source(t)
+        if s and s.snapper_num is not None:
+            tgt_by_src_num[s.snapper_num] = t
+            src_of_tgt[t.path] = s
+
+    for t in target_snaps:
+        if t.path not in keep_paths:
+            continue
+        s = src_of_tgt.get(t.path)
+        if not s:
+            continue
+        if s.snapper_type == "post" and s.pre_num is not None:
+            partner = tgt_by_src_num.get(s.pre_num)
+            if partner:
+                extra.add(partner.path)
+        elif s.snapper_type == "pre" and s.snapper_num is not None:
+            for s2 in source_snaps:
+                if s2.snapper_type == "post" and s2.pre_num == s.snapper_num:
+                    partner = tgt_by_src_num.get(s2.snapper_num)
+                    if partner:
+                        extra.add(partner.path)
+    return extra
+
+
+def pinned_target(clones: list[Subvol], target_snaps: list[Subvol]) -> Optional[Subvol]:
+    """The destination snapshot the NEXT incremental will parent against: the dest
+    copy correlating with the newest parent clone. Never pruned (the one WYSIWYG
+    exception) so the chain base always survives."""
+    parent = choose_parent_clone(clones, target_snaps)
+    if parent is None:
+        return None
+    for t in target_snaps:
+        if is_correlated(parent, t):
+            return t
+    return None
+
+
+def apply_retention(cfg: Config, subvol_name: str, source_snaps: list[Subvol],
+                    target_snaps: list[Subvol], clones: list[Subvol],
+                    recv_dir: str) -> None:
+    """
+    Prune the DESTINATION to EXACTLY the GFS keep-set (WYSIWYG) plus the single
+    pinned parent. No source-backed union, no override logging — what the policy
+    says is what survives. Source snapshots are never touched (Snapper owns them).
+    """
+    policy = cfg.retention_for(subvol_name)
+    kh = int(policy.get("keep_hourly", 0))
+    kd = int(policy.get("keep_daily", 0))
+    kw = int(policy.get("keep_weekly", 0))
+    km = int(policy.get("keep_monthly", 0))
+    ky = int(policy.get("keep_yearly", 0))
+
+    pin = pinned_target(clones, target_snaps)
+    log_step(f"[{subvol_name}] retention (WYSIWYG GFS) hourly={kh} daily={kd} "
+             f"weekly={kw} monthly={km} yearly={ky}; pinned parent="
+             f"{os.path.basename(os.path.dirname(pin.path)) if pin else None}")
+
+    if not target_snaps:
+        return
+
+    targets_sorted = sorted(target_snaps, key=lambda t: (t.when or datetime.min),
+                            reverse=True)
+    keep_paths = _bucket_keep(targets_sorted, kh, kd, kw, km, ky,
+                              cfg.retention_timezone)
+
+    # The one documented exception to WYSIWYG: never prune the incremental base.
+    if pin is not None:
+        keep_paths.add(pin.path)
+
+    if subvol_name == "root":
+        keep_paths |= _keep_prepost_partners(keep_paths, source_snaps, target_snaps)
+
+    to_delete = [t for t in target_snaps if t.path not in keep_paths]
+    log_info(f"[{subvol_name}] retention: {len(keep_paths)} kept "
+             f"(GFS + pinned parent), {len(to_delete)} pruned.")
+    if not to_delete:
+        return
+
+    for t in to_delete:
+        wrapper_dir = os.path.dirname(t.path)
+        if cfg.dry_run:
+            log_info(f"[dry-run] would prune {wrapper_dir}")
+            continue
+        cp = run_remote(cfg, f"sudo btrfs subvolume delete {shlex.quote(t.path)}",
+                        check=False)
+        if cp.returncode == 0:
+            run_remote(cfg, f"sudo rmdir {shlex.quote(wrapper_dir)}", check=False)
+            log_info(f"  pruned {os.path.basename(wrapper_dir)}")
+        else:
+            log_warn(f"  failed to prune {t.path}: {cp.stderr.strip()}")
+
+    if not cfg.dry_run:
+        survivors = [t for t in target_snaps if t.path in keep_paths]
+        if survivors:
+            newest = max(survivors, key=lambda t: (t.when or datetime.min))
+            _update_latest_symlink(cfg, recv_dir,
+                                   os.path.basename(os.path.dirname(newest.path)))
+
+
+# ============================================================================
+# MAIN PER-SUBVOL FLOW  (newest-only + parent tree + promote-on-confirmed-send)
+# ============================================================================
+
+def replicate_subvol(cfg: Config, name: str, mountpoint: str, recv_dir: str) -> bool:
+    """Full flow for one subvol: pick newest Snapper snapshot -> choose preserved
+    parent -> (skip if already sent) -> stage clone -> send -> verify -> promote ->
+    prune parent tree -> WYSIWYG retention."""
+    log_step(f"Replicating '{name}' ({mountpoint} -> {recv_dir})")
+
+    source_snaps = list_snapper_snapshots(mountpoint)
+    newest = newest_snapshot(source_snaps)
+    if newest is None:
+        log_info(f"No snapper snapshots under {mountpoint}/.snapshots — nothing to do.")
+        return True
+
+    run_remote(cfg, f"sudo mkdir -p {shlex.quote(recv_dir)}", check=False)
+    target_snaps = list_target_snapshots(cfg, recv_dir)
+    clones = list_parent_clones(cfg, name)
+
+    parent = choose_parent_clone(clones, target_snaps)
+    log_info(f"[{name}] newest snapper #{newest.snapper_num}; "
+             f"{len(clones)} parent clone(s); {len(target_snaps)} on destination; "
+             f"parent={'#' + str(parent.snapper_num) if parent else 'none (full send)'}")
+
+    # Idempotent re-run: if a clone of the current newest already correlates with the
+    # destination, this snapshot is already replicated — go straight to retention.
+    already = any(c.snapper_num == newest.snapper_num and
+                  any(is_correlated(c, t) for t in target_snaps)
+                  for c in clones)
+    if already:
+        log_info(f"[{name}] newest #{newest.snapper_num} already on destination — "
+                 "no send needed.")
+    else:
+        if parent is None:
+            log_info(f"[{name}] no shared parent with destination — full send "
+                     f"(first run or divergence) of #{newest.snapper_num}.")
+        # Stage the clone we will actually send (promote-on-confirmed-send: it is
+        # retained only if the send verifies, else deleted below).
+        clone = make_clone(cfg, name, newest)
+        if clone is None:
+            log_error(f"[{name}] could not stage parent clone — aborting subvol.")
+            return False
+
+        if not send_receive(cfg, clone, recv_dir, parent):
+            log_error(f"[{name}] transfer of #{newest.snapper_num} failed; "
+                      "deleting staged clone, leaving prior parent intact for retry.")
+            if not cfg.dry_run:
+                delete_clone(clone.path)
+            return False
+
+        # Verified-good receive: the staged clone is now confirmed -> promote by
+        # keeping it and pruning the tree to parent_keep.
+        prune_parent_clones(cfg, name, cfg.parent_keep)
+        if not cfg.dry_run:
+            target_snaps = list_target_snapshots(cfg, recv_dir)
+            clones = list_parent_clones(cfg, name)
+
+    apply_retention(cfg, name, source_snaps, target_snaps, clones, recv_dir)
+    return True
+
+
+# ============================================================================
+# RUN LOCK  (so two runs can't overlap — the future watchdog relies on it)
+# ============================================================================
+
+class _AlreadyRunning(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def run_lock(path: Optional[str] = None):
+    """flock a lockfile for the whole run. If another run holds it, raise
+    _AlreadyRunning (main exits cleanly). If the lockfile can't be opened (e.g.
+    unprivileged dev run), warn and proceed lock-less rather than abort."""
+    path = path or os.environ.get("SNAPPERSEND_LOCK", "/var/lock/snappersend.lock")
+    try:
+        f = open(path, "w")
+    except OSError as e:
+        log_warn(f"could not open lockfile {path} ({e}); proceeding without lock")
+        yield
+        return
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        log_error(f"another snappersend run holds {path}; exiting")
+        raise _AlreadyRunning()
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
+def _write_success_stamp() -> None:
+    """Touch a stamp the future watchdog reads to detect missed/failed runs."""
+    stamp = os.environ.get("SNAPPERSEND_STAMP", "/var/lib/snappersend/last-success")
+    try:
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        with open(stamp, "w") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
+    except OSError as e:
+        log_debug(f"could not write success stamp {stamp}: {e}")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def _truthy(v: Optional[str]) -> bool:
+    return v not in (None, "", "0", "false", "False", "no", "off")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="snappersend",
+        description="Snapper-native Btrfs snapshot replication with a parent tree.",
+    )
+    p.add_argument("--config",
+                   default=os.environ.get("SNAPPERSEND_CONFIG", "/etc/snappersend/config"),
+                   help="config file (default /etc/snappersend/config, $SNAPPERSEND_CONFIG)")
+    p.add_argument("--server", "--dest", "--destination", default=None,
+                   help="override the destination host from config ($SNAPPERSEND_SERVER)")
+    p.add_argument("--subvol", default=None,
+                   help="replicate only this subvolume (name from config)")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", default=None,
+                   help="log what would happen; change nothing ($SNAPPERSEND_DRY_RUN)")
+    p.add_argument("--skip-boot", action="store_true",
+                   help="skip the non-Btrfs /boot + /boot/efi rsync tier")
+    p.add_argument("--no-mbuffer", action="store_true",
+                   help="do not pipe through mbuffer even if configured")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log every shell command and extra detail")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+
+    global _VERBOSE
+    _VERBOSE = args.verbose
+
+    try:
+        kwargs = load_config(args.config)
+    except FileNotFoundError:
+        log_error(f"config not found: {args.config}")
+        return 2
+    except Exception as e:   # KeyError / ValueError / dotenv issues
+        log_error(f"invalid config {args.config}: {e}")
+        return 2
+
+    server = args.server or os.environ.get("SNAPPERSEND_SERVER")
+    if server:
+        kwargs["server_host"] = server
+
+    if args.dry_run is not None:
+        kwargs["dry_run"] = True
+    elif "SNAPPERSEND_DRY_RUN" in os.environ:
+        kwargs["dry_run"] = _truthy(os.environ.get("SNAPPERSEND_DRY_RUN"))
+
+    if args.no_mbuffer:
+        kwargs["use_mbuffer"] = False
+
+    try:
+        cfg = Config(**kwargs)
+    except TypeError as e:
+        log_error(f"config produced invalid settings: {e}")
+        return 2
+
+    if args.subvol and args.subvol not in cfg.subvols:
+        log_error(f"--subvol {args.subvol!r} not in config subvols {list(cfg.subvols)}")
+        return 2
+
+    try:
+        with run_lock():
+            return _run(cfg, args)
+    except _AlreadyRunning:
+        return 1
+
+
+def _run(cfg: Config, args: argparse.Namespace) -> int:
+    hostname = socket.gethostname()
+    log_step(f"snappersend on {hostname} -> {cfg.server_user}@{cfg.server_host}"
+             + (" [DRY-RUN]" if cfg.dry_run else ""))
+
+    snapshots_ok = True
+    for name, sv in cfg.subvols.items():
+        if args.subvol and name != args.subvol:
+            continue
+        recv_dir = cfg.recv_dir_for(hostname, name)
+        try:
+            ok = replicate_subvol(cfg, name, sv["mountpoint"], recv_dir)
+        except Exception as e:
+            log_error(f"[{name}] unexpected error: {e}")
+            ok = False
+        snapshots_ok = snapshots_ok and ok
+
+    boot_ok = True
+    if not args.skip_boot:
+        try:
+            boot_ok = boot_backup(cfg, hostname)
+        except Exception as e:
+            log_error(f"boot backup error: {e}")
+            boot_ok = False
+
+    if snapshots_ok and boot_ok:
+        if not cfg.dry_run:
+            _write_success_stamp()
+        log_ok("snappersend finished: all tiers OK")
+        return 0
+
+    log_warn(f"snappersend finished with failures "
+             f"(snapshots_ok={snapshots_ok} boot_ok={boot_ok}) — see log")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

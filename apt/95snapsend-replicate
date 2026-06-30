@@ -1,0 +1,14 @@
+// di-snapsend — replicate immediately after a successful apt transaction.
+//
+// Fires AFTER snapper's post snapshot (80snapper) so the replicated state is the
+// consistent post-change @, including any kernel/grub/initramfs updates written by
+// package postinst scripts. This pairs the live /boot + /boot/efi rsync tier with the
+// matching snapshot, closing the timer's randomized-offset skew window for the case that
+// matters (apt-driven OS/boot changes).
+//
+// --no-block: don't make apt wait for the (possibly minutes-long) btrfs send.
+// start (not the script): reuse snapsend.service so the engine's flock, logging, and
+//   resource limits apply. A collision with an in-flight run is a clean no-op (the engine
+//   takes a non-blocking flock and exits via _AlreadyRunning).
+// || true: a queued/failed service start must never fail the apt transaction.
+DPkg::Post-Invoke-Success { "if [ -x /usr/bin/systemctl ] || [ -x /bin/systemctl ]; then systemctl --no-block start snapsend.service || true; fi"; };

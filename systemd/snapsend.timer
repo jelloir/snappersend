@@ -3,6 +3,13 @@ Description=Run di-snapsend hourly (snapshot replication to the destination host
 Documentation=file:/usr/local/share/doc/di-snapsend/README.md
 
 [Timer]
+# This timer is the PERIODIC BASELINE only. apt-driven OS changes (kernel, grub,
+# initramfs) are additionally replicated immediately via the apt Post-Invoke-Success
+# hook (/etc/apt/apt.conf.d/95snapsend-replicate), which starts snapsend.service the
+# moment a package transaction finishes — so this is not the only trigger. The
+# randomized offset below stays fine (and desirable) for the baseline; the apt hook
+# handles the time-critical, boot-aligned case.
+#
 # Hourly aligns with Snapper's TIMELINE_LIMIT_HOURLY window, keeping the
 # destination's incremental parent well inside the 48-hourly margin (SPEC §3).
 OnCalendar=hourly

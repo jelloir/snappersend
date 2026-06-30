@@ -10,7 +10,9 @@
 # sudoers, and an optional forced-command ssh filter — reusable, tool-agnostic
 # (mirrors di-btrbk-send.sh's destination role).
 # Source role: install /usr/local/bin/di-snapsend, write /etc/snapsend/config,
-# generate the transport ssh key, install + enable the systemd timer + watchdog.
+# generate the transport ssh key, install + enable the systemd timer + watchdog,
+# and install an apt Post-Invoke-Success hook so OS/package updates replicate
+# immediately (in addition to the hourly timer).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +39,7 @@ KEY_PATH="${KEY_PATH:-$ETC_DIR/ssh/id_ed25519}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 DOC_DIR="${DOC_DIR:-/usr/local/share/doc/di-snapsend}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+APT_CONF_DIR="${APT_CONF_DIR:-/etc/apt/apt.conf.d}"
 
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root"; }
 
@@ -63,8 +66,10 @@ Source role (idempotent) — run on the sending host:
   - writes ${ETC_DIR}/config (from config.example.toml) if absent
   - generates the transport key at ${KEY_PATH} if absent, prints the pubkey line
   - pins the destination SSH host key, installs + enables snapsend timers
+  - installs an apt Post-Invoke-Success hook so OS/package updates replicate
+    immediately (in addition to the hourly timer)
 
-Env overrides: SNAPSEND_USER RECV_BASE ETC_DIR KEY_PATH BIN_DIR UNIT_DIR
+Env overrides: SNAPSEND_USER RECV_BASE ETC_DIR KEY_PATH BIN_DIR UNIT_DIR APT_CONF_DIR
 EOF
     exit "${1:-1}"
 }
@@ -276,6 +281,64 @@ PY
         info "first run:  sudo di-snapsend --dry-run     (verify), then:  sudo systemctl start snapsend.service"
     else
         warn "systemctl not found — units installed but not enabled"
+    fi
+
+    # 8) apt replication hook — fire a replication run immediately after every
+    #    successful apt transaction (after snapper's apt post-snapshot), so a
+    #    kernel/grub/initramfs change and its matching snapshot replicate together
+    #    instead of waiting up to ~an hour for the next (randomized) timer tick.
+    #    Best-effort: a host without apt simply keeps the timer as its only trigger.
+    step "Installing apt Post-Invoke-Success replication hook"
+    if [[ -d "$APT_CONF_DIR" ]]; then
+        need_file "$SCRIPT_DIR/apt/95snapsend-replicate"
+        # Idempotent: identical content overwrites in place.
+        install -m 0644 "$SCRIPT_DIR/apt/95snapsend-replicate" "$APT_CONF_DIR/95snapsend-replicate"
+        ok "installed ${APT_CONF_DIR}/95snapsend-replicate"
+
+        # Ordering sanity check (advisory only — never fail the install). The hook
+        # must run AFTER snapper's apt post-snapshot so it replicates the consistent
+        # post-change @. apt runs each DPkg::Post-Invoke-Success entry in filename
+        # sort order, so our 95* must sort after snapper's apt hook file.
+        # Our own hook file mentions "snapper" in its header comment, so exclude it
+        # from the grep — otherwise the dpkg-layer "not found" branch never fires.
+        local ours="95snapsend-replicate" snapper_hooks
+        snapper_hooks="$(grep -rl -i snapper "$APT_CONF_DIR"/ 2>/dev/null \
+            | grep -v "/${ours}\$" || true)"
+        if [[ -n "$snapper_hooks" ]]; then
+            local base last
+            while IFS= read -r f; do
+                [[ -z "$f" ]] && continue
+                base="$(basename "$f")"
+                # Sort the two basenames C-locale; ours must come last.
+                last="$(printf '%s\n%s\n' "$ours" "$base" | LC_ALL=C sort | tail -n1)"
+                if [[ "$last" != "$ours" ]]; then
+                    warn "apt hook ordering: ${ours} sorts BEFORE snapper's ${base} —"
+                    warn "  replication may run before the post-snapshot. Rename so ours sorts last."
+                else
+                    info "apt hook ordering ok: ${ours} sorts after snapper's ${base}"
+                fi
+                # Snapper conventionally uses DPkg::Post-Invoke (not -Success); we use
+                # Post-Invoke-Success, which apt runs strictly AFTER Post-Invoke — so we
+                # always fire after snapper's post-snapshot regardless of filename sort
+                # (sort only orders within a stage). Surface the stage difference as a
+                # durable heads-up against future snapper rewiring, not as a doubt.
+                if grep -q -i 'Post-Invoke-Success' "$f" 2>/dev/null; then
+                    : # same stage as us — filename sort governs, nothing to flag
+                elif grep -q -i 'Post-Invoke' "$f" 2>/dev/null; then
+                    info "  (${base} uses DPkg::Post-Invoke; we use Post-Invoke-Success, which apt runs"
+                    info "   after Post-Invoke — so we fire after snapper's post-snapshot by stage order,"
+                    info "   not filename sort. VM check: journalctl -u snapsend.service after an apt run.)"
+                fi
+            done <<< "$snapper_hooks"
+        else
+            warn "no snapper apt hook found under ${APT_CONF_DIR} — snapper may be wired at the"
+            warn "  dpkg layer (/etc/dpkg/dpkg.cfg.d/) or via snapper-pkg. Ordering can't be"
+            warn "  confirmed by filename sort; verify a snapper post-snapshot is created before"
+            warn "  replication runs."
+        fi
+        info "trigger model: timer = periodic baseline; apt hook = immediate post-update replication"
+    else
+        warn "${APT_CONF_DIR} not found (no apt?) — skipping apt hook; the timer remains the only trigger"
     fi
 
     ok "source installation complete"

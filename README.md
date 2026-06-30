@@ -245,6 +245,45 @@ snapshots are kept.
 Precedence for operational settings is **CLI flag > env var > config file**.
 Retention is policy and lives only in the config file.
 
+### When replication runs (the hybrid trigger model)
+
+Replication fires from **two** triggers:
+
+- **`snapsend.timer` (hourly)** — the periodic baseline. It catches everything,
+  eventually, and bounds how old the destination's incremental parent can get
+  (SPEC §3). It carries a `RandomizedDelaySec` so a fleet of sources doesn't hit the
+  destination on the dot.
+- **An apt `Post-Invoke-Success` hook** (`/etc/apt/apt.conf.d/95snapsend-replicate`,
+  installed by `--source`) — fires a replication run immediately after every
+  *successful* apt transaction, once Snapper's apt post-snapshot exists.
+
+The reason for the second trigger is the **boot tier**. `/boot` + `/boot/efi` are
+replicated as a live `rsync` mirror, not a snapshot, so on the timer alone they could
+be captured up to ~an hour after — and decoupled from — the Snapper snapshot they
+should pair with. If a kernel/grub/initramfs change lands in that randomized-offset
+gap, the replicated boot files can be newer than the newest replicated `@`/`@root`
+snapshot, risking an inconsistent boot in a DR restore. Real OS/boot changes are almost
+always apt-driven, so firing right after the apt post-snapshot captures that case
+promptly and boot-aligned.
+
+The hook **starts the same `snapsend.service`** (`systemctl --no-block start`) rather
+than running the engine directly — so the engine's `flock`, logging, and resource
+limits all still apply. If a timer-started run is already in flight, the hook's start is
+a clean no-op (the engine takes a non-blocking lock and exits via `_AlreadyRunning`); a
+failed apt transaction triggers nothing (`Post-Invoke-Success`, not `Post-Invoke`).
+
+The hook fires at `Post-Invoke-Success` *by design*, even though Snapper snapshots at the
+earlier `Post-Invoke` stage. apt runs the stages in a fixed order — `Post-Invoke` then
+`Post-Invoke-Success` (the latter only on success) — so snapsend is **guaranteed** to run
+after Snapper's post-snapshot is committed, by stage order rather than filename sort
+(filename sort only orders entries *within* a stage). This is deliberately more robust
+than matching Snapper's stage: it keeps working even if Snapper's apt hook is later
+renamed or restructured. See SPEC §3 for the full rationale and the one benign edge case.
+
+The one accepted residual: a purely **manual, non-apt** boot change (e.g. a hand
+`update-grub`) isn't caught until the next snapshot/timer tick — a tiny, self-healing
+window.
+
 ## Retention — how source and destination retention interact
 
 This trips people up, so read this once. **There are two independent retention

@@ -253,9 +253,9 @@ Replication fires from **two** triggers:
   eventually, and bounds how old the destination's incremental parent can get
   (SPEC §3). It carries a `RandomizedDelaySec` so a fleet of sources doesn't hit the
   destination on the dot.
-- **An apt `Post-Invoke-Success` hook** (`/etc/apt/apt.conf.d/95snapsend-replicate`,
-  installed by `--source`) — fires a replication run immediately after every
-  *successful* apt transaction, once Snapper's apt post-snapshot exists.
+- **An apt `DPkg::Post-Invoke` hook** (`/etc/apt/apt.conf.d/95snapsend-replicate`,
+  installed by `--source`) — fires a replication run immediately after every apt
+  transaction, after Snapper's apt post-snapshot exists.
 
 The reason for the second trigger is the **boot tier**. `/boot` + `/boot/efi` are
 replicated as a live `rsync` mirror, not a snapshot, so on the timer alone they could
@@ -269,16 +269,19 @@ promptly and boot-aligned.
 The hook **starts the same `snapsend.service`** (`systemctl --no-block start`) rather
 than running the engine directly — so the engine's `flock`, logging, and resource
 limits all still apply. If a timer-started run is already in flight, the hook's start is
-a clean no-op (the engine takes a non-blocking lock and exits via `_AlreadyRunning`); a
-failed apt transaction triggers nothing (`Post-Invoke-Success`, not `Post-Invoke`).
+a clean no-op (the engine takes a non-blocking lock and exits via `_AlreadyRunning`).
 
-The hook fires at `Post-Invoke-Success` *by design*, even though Snapper snapshots at the
-earlier `Post-Invoke` stage. apt runs the stages in a fixed order — `Post-Invoke` then
-`Post-Invoke-Success` (the latter only on success) — so snapsend is **guaranteed** to run
-after Snapper's post-snapshot is committed, by stage order rather than filename sort
-(filename sort only orders entries *within* a stage). This is deliberately more robust
-than matching Snapper's stage: it keeps working even if Snapper's apt hook is later
-renamed or restructured. See SPEC §3 for the full rationale and the one benign edge case.
+The hook fires at `DPkg::Post-Invoke` — the **same** stage Snapper snapshots at — and
+relies on apt running same-stage entries in **filename sort order**: `95snapsend-replicate`
+sorts after Snapper's `80snapper`/`81snapper-enhanced`, so Snapper's post-snapshot is
+already committed before snapsend starts. (An earlier version used
+`DPkg::Post-Invoke-Success` to fire only on a clean transaction, but **apt 3.0.x / Debian
+13 does not execute that stage for normal package operations** — a hook there silently
+never runs, which is the bug this replaces. `Post-Invoke` is the stage that actually
+fires.) Because `Post-Invoke` runs regardless of outcome, a *failed* apt transaction also
+triggers a run; that's benign — snapsend only mirrors already-committed snapshots plus the
+live boot tier, and the hourly timer would replicate the same state anyway. See SPEC §3
+for the full rationale.
 
 The one accepted residual: a purely **manual, non-apt** boot change (e.g. a hand
 `update-grub`) isn't caught until the next snapshot/timer tick — a tiny, self-healing

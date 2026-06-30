@@ -4,7 +4,7 @@ Documentation=file:/usr/local/share/doc/di-snapsend/README.md
 
 [Timer]
 # This timer is the PERIODIC BASELINE only. apt-driven OS changes (kernel, grub,
-# initramfs) are additionally replicated immediately via the apt Post-Invoke-Success
+# initramfs) are additionally replicated immediately via the apt DPkg::Post-Invoke
 # hook (/etc/apt/apt.conf.d/95snapsend-replicate), which starts snapsend.service the
 # moment a package transaction finishes — so this is not the only trigger. The
 # randomized offset below stays fine (and desirable) for the baseline; the apt hook

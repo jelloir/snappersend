@@ -177,46 +177,51 @@ margin. If the source were offline for >48h, the next run would correctly fall
 back to a full send (no breakage, just a bigger transfer).
 
 **Replication is event-aligned in addition to the hourly timer.** As of the apt-hook
-addition, a replication run also fires immediately after every *successful* apt
-transaction (an `apt.conf.d` `DPkg::Post-Invoke-Success` hook starting the same
-`snapsend.service`), once Snapper's apt post-snapshot has been taken. This is what
-captures the dangerous case — a kernel/grub/initramfs change written by package
-postinst scripts — promptly and boot-aligned, instead of up to ~an hour later (the
-timer's `RandomizedDelaySec`), decoupled from the matching `@` snapshot and so newer
-than the newest replicated snapshot in the live `/boot` rsync tier (§11). The apt hook
-**only adds runs**; it never removes the periodic baseline. The hourly cadence and the
-48-hourly parent margin reasoning above are therefore **unchanged** — the baseline still
-bounds the incremental-parent age; the hook just tightens alignment for OS/boot changes.
-The one accepted residual is a purely manual, non-apt boot change (e.g. a hand
-`update-grub`): not caught until the next snapshot/timer tick — a tiny, self-healing
-window. The hook starts the existing service, so the engine's `flock` makes a collision
-with an in-flight (timer-started) run a clean no-op (`_AlreadyRunning`).
+addition, a replication run also fires immediately after every apt transaction (an
+`apt.conf.d` `DPkg::Post-Invoke` hook starting the same `snapsend.service`), after
+Snapper's apt post-snapshot has been taken. This is what captures the dangerous case — a
+kernel/grub/initramfs change written by package postinst scripts — promptly and
+boot-aligned, instead of up to ~an hour later (the timer's `RandomizedDelaySec`),
+decoupled from the matching `@` snapshot and so newer than the newest replicated snapshot
+in the live `/boot` rsync tier (§11). The apt hook **only adds runs**; it never removes
+the periodic baseline. The hourly cadence and the 48-hourly parent margin reasoning above
+are therefore **unchanged** — the baseline still bounds the incremental-parent age; the
+hook just tightens alignment for OS/boot changes. The one accepted residual is a purely
+manual, non-apt boot change (e.g. a hand `update-grub`): not caught until the next
+snapshot/timer tick — a tiny, self-healing window. The hook starts the existing service,
+so the engine's `flock` makes a collision with an in-flight (timer-started) run a clean
+no-op (`_AlreadyRunning`).
 
-**Why the apt hook uses `Post-Invoke-Success` while snapper uses `Post-Invoke`.** The
-replication hook (`apt/95snapsend-replicate`) fires at `DPkg::Post-Invoke-Success`,
-whereas the snapper apt integration (`81snapper-enhanced`) snapshots at
-`DPkg::Post-Invoke`. This stage difference is **deliberate and correct, not an
-oversight.** APT executes these stages in a fixed sequence — `Pre-Invoke` → dpkg work →
-`Post-Invoke` → `Post-Invoke-Success` (the last running **only** when the transaction
-succeeds) — and that order is a property of the *stage sequence*, not of filename sort.
-Filename sort (`95…` vs `81…`) only orders entries *within a single stage*; it does not
-and cannot order one stage against another. Because `Post-Invoke-Success` runs strictly
-after `Post-Invoke`, snapsend is **guaranteed** to fire after snapper's post-snapshot has
-already been committed, so the replicated state is the consistent post-change `@`.
+**Why the apt hook uses `DPkg::Post-Invoke` (and ordering by filename sort).** The
+replication hook (`apt/95snapsend-replicate`) fires at `DPkg::Post-Invoke` — the **same**
+stage the snapper apt integration (`80snapper` / `81snapper-enhanced`) uses. The original
+design used `DPkg::Post-Invoke-Success` (to gate on a clean transaction), but **VM testing
+on apt 3.0.x (Debian 13 / trixie) proved that stage is never executed for normal package
+operations** — `apt install` / `reinstall` / `remove` all complete without running any
+`DPkg::Post-Invoke-Success` hook, so a hook placed there silently never fires. (The string
+still exists in `libapt-pkg`; apt 3.0's `pkgDPkgPM::Go()` only invokes `DPkg::Post-Invoke`,
+and whatever path still wires `-Success` is not reached by ordinary front-end operations.)
+`DPkg::Post-Invoke` runs reliably — it is the very stage snapper depends on.
 
-This cross-stage approach is intentionally **more robust** than matching snapper's stage
-and leaning on filename sort would be: it does not depend on snapper's exact filename or
-stage choice, so it keeps working if snapper's apt wiring is renamed or restructured. It
-also preserves the **clean-transaction-only** semantics the design requires — a failed or
-partial apt run never triggers replication. The one benign edge case: if snapper's
-`Post-Invoke` snapshot is taken but the overall transaction then *fails*, a local snapshot
-of that failed state exists but is **not** replicated; it is simply superseded or repaired
-before the next successful apt run (or timer tick) replicates — the intended behaviour.
+Because we now share snapper's stage, **ordering is by filename sort**, which apt applies
+to the entries *within* a stage: `95snapsend-replicate` sorts after `80snapper` /
+`81snapper-enhanced`, so snapper's post-snapshot is created (synchronously, in its hook)
+before snapsend's entry starts the service. The replicated state is therefore the
+consistent post-change `@`. This makes the `95`-vs-`80/81` filename relationship
+**load-bearing**; the installer emits a warn-only check that our file sorts last and flags
+the case where snapper is wired on a different stage (where filename sort would not order
+us against it).
 
-The post-install INFO that surfaces this stage difference is retained **not** because the
-ordering is in doubt but as a durable, low-cost check against future snapper rewiring. The
-VM validation (a successful `apt-get install` must show a `snapsend.service` start in
-`journalctl` after the snapper post-snapshot) is the authoritative end-to-end confirmation.
+**No clean-transaction gating.** `Post-Invoke` runs on every transaction, success or
+failure, and apt exposes **no** success/status signal to the hook (verified: the hook
+environment carries only `DPKG_FRONTEND_LOCKED`). So unlike the original `-Success` intent
+we do **not** gate on a clean transaction. This is benign and the safe direction: snapsend
+only mirrors already-committed snapshots plus the live boot tier (it never propagates
+anything irreversibly, and the destination retains history), snapper itself snapshots on
+this same stage regardless of outcome, and the hourly timer would replicate the identical
+state on its next tick anyway. The VM validation (an `apt reinstall` shows a
+`snapsend.service` start in `journalctl`, with the snapper post-snapshot timestamp
+preceding it) is the authoritative end-to-end confirmation.
 
 ---
 
@@ -447,12 +452,13 @@ Bodies to fill in the skeleton (search for `NotImplementedError` /
 10. **systemd units + apt hook** — `snapsend.service` (oneshot) + `snapsend.timer`
     (hourly + randomized delay, `Persistent=true`) as the periodic baseline, plus a
     missed-run watchdog mirroring the di-btrbk-send pattern. Additionally an apt
-    `DPkg::Post-Invoke-Success` hook (`/etc/apt/apt.conf.d/95snapsend-replicate`,
-    sorted after snapper's apt post-snapshot hook) `systemctl --no-block start`s the
-    **same** `snapsend.service` after every successful apt transaction — a trigger into
-    the existing service, not a second execution path, so `flock`/logging/limits all
-    apply and a collision is a clean `_AlreadyRunning` no-op (see §3). Generated by an
-    installer step (see §8).
+    `DPkg::Post-Invoke` hook (`/etc/apt/apt.conf.d/95snapsend-replicate`, filename-sorted
+    after snapper's apt post-snapshot hook so it runs after it within the same stage)
+    `systemctl --no-block start`s the **same** `snapsend.service` after every apt
+    transaction — a trigger into the existing service, not a second execution path, so
+    `flock`/logging/limits all apply and a collision is a clean `_AlreadyRunning` no-op
+    (see §3; the `Post-Invoke` stage choice and why not `-Success` is explained there).
+    Generated by an installer step (see §8).
 
 11. **Tests** — unit-test the pure logic with synthetic `Subvol` objects:
     `is_correlated()` (all three clauses + the readonly guard), `choose_parent()`

@@ -618,20 +618,27 @@ def newest_snapshot(snaps: list[Subvol]) -> Optional[Subvol]:
 
 
 def _parse_dt_name(s: str) -> Optional[datetime]:
-    """Parse a colon-free `YYYYMMDD-HHMM±ZZZZ` name label into NAIVE-UTC."""
-    try:
-        aware = datetime.strptime(s, "%Y%m%d-%H%M%z")
-    except ValueError:
-        return None
-    return aware.astimezone(timezone.utc).replace(tzinfo=None)
+    """Parse a colon-free `YYYYMMDD-HHMMSS±ZZZZ` name label into NAIVE-UTC. Falls
+    back to the older minute-precision `YYYYMMDD-HHMM±ZZZZ` so names written by an
+    earlier version still parse."""
+    for fmt in ("%Y%m%d-%H%M%S%z", "%Y%m%d-%H%M%z"):
+        try:
+            aware = datetime.strptime(s, fmt)
+            return aware.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError:
+            continue
+    return None
 
 
-# A received/clone directory name. Two shapes share the same prefix:
-#   destination receive dir : <localdate>-<offset>-<num>-<short_uuid>  (trailing uuid)
-#   source parent-tree label: <localdate>-<offset>-<num>              (no trailing uuid)
-# date+offset = group 1, num = group 2; the num is terminated by a '-' or end-of-string
-# so both shapes parse (e.g. 20260627-1300+1000-8-a2159d69 and 20260627-1300+1000-8).
-_NAME_RE = re.compile(r"^(\d{8}-\d{4}[+-]\d{4})-(\d+)(?:-|$)")
+# A received/clone directory name. Both shapes share the same prefix:
+#   destination receive dir : <localdate>-<offset>-<num>-<clone_short_uuid>
+#   source parent-tree label: <localdate>-<offset>-<num>-<snapshot_short_uuid>
+# <localdate> is SECOND precision (HHMMSS) so two snapshots in the same minute order
+# correctly — minute precision was ambiguous and, combined with Snapper RECYCLING a
+# number after a delete, could misorder "newest" and mis-pin retention. date+offset =
+# group 1, num = group 2; num is terminated by '-' or end-of-string. The older
+# minute-precision form (HHMM, 4 digits) is still accepted for back-compat.
+_NAME_RE = re.compile(r"^(\d{8}-\d{4,6}[+-]\d{4})-(\d+)(?:-|$)")
 
 
 def _apply_name_metadata(sv: Subvol, name: str) -> None:
@@ -708,18 +715,27 @@ def choose_parent_clone(clones: list[Subvol],
     return max(correlating, key=lambda c: (c.when or datetime.min, c.snapper_num or 0))
 
 
+def _name_date_part(dt: Optional[datetime]) -> str:
+    """Render a naive-UTC instant as the colon-free, SECOND-precision local label
+    `YYYYMMDD-HHMMSS±ZZZZ` used in clone labels and destination dir names."""
+    if not dt:
+        return "nodate"
+    return dt.replace(tzinfo=timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S%z")
+
+
+def _short_uuid(uuid: str) -> str:
+    return uuid.split("-")[0] if uuid not in ("", "-") else "nouuid"
+
+
 def _clone_label(snap: Subvol) -> str:
-    """Directory label for a clone of `snap`: <localdate>-<offset>-<num>. Derived
-    purely from the snapshot so a re-clone of the same snapshot is deterministic
-    (and any orphan from a crash is overwritten, not duplicated)."""
-    dt = snap.when
-    if dt:
-        aware = dt.replace(tzinfo=timezone.utc).astimezone()
-        date_part = aware.strftime("%Y%m%d-%H%M%z")
-    else:
-        date_part = "nodate"
+    """Directory label for a clone of `snap`: <localdate>-<offset>-<num>-<short_uuid>,
+    where short_uuid is the SOURCE SNAPSHOT's uuid. Derived purely from the snapshot,
+    so a re-clone of the SAME snapshot is deterministic (an orphan from a crash is
+    overwritten in place) while two DIFFERENT snapshots can never collide on a label —
+    which is what prevents make_clone from ever deleting a still-needed parent when
+    Snapper recycles a number into the same second."""
     num = snap.snapper_num if snap.snapper_num is not None else 0
-    return f"{date_part}-{num}"
+    return f"{_name_date_part(snap.when)}-{num}-{_short_uuid(snap.uuid)}"
 
 
 def make_clone(cfg: Config, subvol_name: str, snap: Subvol) -> Optional[Subvol]:
@@ -809,13 +825,11 @@ def send_receive(cfg: Config, clone: Subvol, recv_dir: str,
         send_cmd += ["-p", parent.path]
     send_cmd += [clone.path]
 
-    dt = clone.when
-    if dt:
-        aware = dt.replace(tzinfo=timezone.utc).astimezone()
-        date_part = aware.strftime("%Y%m%d-%H%M%z")
-    else:
-        date_part = "nodate"
-    short_uuid = clone.uuid.split("-")[0] if clone.uuid not in ("", "-") else "nouuid"
+    # The destination dir name carries the ORIGINAL snapshot's date (second precision)
+    # + num for chronological sort/retention, and the CLONE's own short uuid (what the
+    # destination correlates on) for uniqueness.
+    date_part = _name_date_part(clone.when)
+    short_uuid = _short_uuid(clone.uuid)
     num = clone.snapper_num if clone.snapper_num is not None else 0
     received_name = f"{date_part}-{num}-{short_uuid}"
 

@@ -480,6 +480,42 @@ def test_receive_in_place_naming(monkeypatch, cfg):
     assert "-p" not in captured["send"]
 
 
+def test_second_precision_names_order_same_minute():
+    # Two snapshots in the SAME MINUTE but different seconds must produce distinct
+    # labels that round-trip to distinct, correctly-ordered times. (Minute precision
+    # tied them, and with Snapper recycling a number the tiebreak misordered "newest".)
+    from datetime import datetime
+    a = src_snap(90, datetime(2026, 7, 1, 1, 21, 13), uuid="aaaa1111-x")
+    b = src_snap(91, datetime(2026, 7, 1, 1, 21, 41), uuid="bbbb2222-x")  # later second
+    la, lb = ss._clone_label(a), ss._clone_label(b)
+    assert la != lb                                   # distinct labels
+    # parse the date part back out and confirm b (later second) > a
+    ma = ss._NAME_RE.match(la); mb = ss._NAME_RE.match(lb)
+    ta = ss._parse_dt_name(ma.group(1)); tb = ss._parse_dt_name(mb.group(1))
+    assert ta is not None and tb is not None and tb > ta
+
+    # Even though a has the LOWER snapper num that here belongs to the NEWER snapshot
+    # (recycled number), choose_parent_clone must pick by time, i.e. b is newest...
+    # and a real recycled case: the newer snapshot has the lower number.
+    newer_lower_num = src_snap(90, datetime(2026, 7, 1, 1, 21, 41), uuid="newer-90")
+    older_high_num = src_snap(91, datetime(2026, 7, 1, 1, 21, 13), uuid="older-91")
+    cn = clone_snap(90, newer_lower_num.info_time, uuid="cn")
+    co = clone_snap(91, older_high_num.info_time, uuid="co")
+    dest = [target_of(cn), target_of(co)]
+    # time-based selection picks the genuinely newest (cn, the recycled #90)
+    assert ss.choose_parent_clone([co, cn], dest) is cn
+
+
+def test_clone_label_unique_per_snapshot_not_per_number():
+    # Two DIFFERENT snapshots that share a recycled number + same second must NOT
+    # collide on a clone label (else make_clone would delete a still-needed parent).
+    from datetime import datetime
+    when = datetime(2026, 7, 1, 1, 21, 41)
+    s1 = src_snap(90, when, uuid="11111111-aaaa")
+    s2 = src_snap(90, when, uuid="22222222-bbbb")   # same num + same second, diff uuid
+    assert ss._clone_label(s1) != ss._clone_label(s2)
+
+
 def test_run_lock_collision(tmp_path, monkeypatch):
     import fcntl
     lock = tmp_path / "snappersend.lock"

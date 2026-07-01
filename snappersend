@@ -1029,6 +1029,58 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
 # RETENTION  (WYSIWYG pure GFS over the destination + the one pinned-parent asterisk)
 # ============================================================================
 
+# Tier codes -> human names, in the fixed grandfather-father-son order the loop walks.
+_TIER_ORDER = ("h", "d", "w", "m", "y")
+_TIER_CODE_LABEL = {"h": "hourly", "d": "daily", "w": "weekly",
+                    "m": "monthly", "y": "yearly"}
+# Sentinel used in _bucket_attribute for an undatable target (always kept, no tier).
+_UNDATABLE = "undatable"
+
+
+def _bucket_attribute(targets_newest_first: list[Subvol],
+                      keep_hourly: int, keep_daily: int, keep_weekly: int,
+                      keep_monthly: int, keep_yearly: int,
+                      tz: str = "local") -> dict:
+    """
+    THE ONE COPY of the GFS bucketing loop. Walks already-newest-first targets and
+    records, per KEPT path, WHICH tier(s) caused it to be kept — returning
+    `{target.path: [tier_code, ...]}` where each tier_code is one of 'h','d','w','m','y'
+    (in that grandfather-father-son order) or the sentinel `_UNDATABLE`. A path can
+    occupy several tiers at once (the newest snapshot is simultaneously the hourly,
+    daily, weekly, ... survivor); every tier it satisfies is recorded, coarsest-last.
+
+    `_bucket_keep` derives its keep-SET as `set(this.keys())`, so retention and any
+    reporting view share the exact same logic and can never drift. See `_bucket_keep`
+    for the tz/boundary semantics — this is that function with attribution bolted on.
+    """
+    attrib: dict = {}
+    last = {"h": None, "d": None, "w": None, "m": None, "y": None}
+    cnt = {"h": 0, "d": 0, "w": 0, "m": 0, "y": 0}
+    lim = {"h": keep_hourly, "d": keep_daily, "w": keep_weekly,
+           "m": keep_monthly, "y": keep_yearly}
+
+    for t in targets_newest_first:
+        w = t.when
+        if w is None:
+            attrib.setdefault(t.path, []).append(_UNDATABLE)
+            continue
+        keyed = w.replace(tzinfo=timezone.utc).astimezone() if tz == "local" else w
+        iso = keyed.isocalendar()
+        keys = {
+            "h": (keyed.year, keyed.month, keyed.day, keyed.hour),
+            "d": (keyed.year, keyed.month, keyed.day),
+            "w": (iso[0], iso[1]),
+            "m": (keyed.year, keyed.month),
+            "y": (keyed.year,),
+        }
+        for p in _TIER_ORDER:
+            if lim[p] > 0 and keys[p] != last[p] and cnt[p] < lim[p]:
+                attrib.setdefault(t.path, []).append(p)
+                last[p] = keys[p]
+                cnt[p] += 1
+    return attrib
+
+
 def _bucket_keep(targets_newest_first: list[Subvol],
                  keep_hourly: int, keep_daily: int, keep_weekly: int,
                  keep_monthly: int, keep_yearly: int, tz: str = "local") -> set:
@@ -1043,33 +1095,12 @@ def _bucket_keep(targets_newest_first: list[Subvol],
     bucket-KEY extraction is zone-aware; `when` is a true instant (naive-UTC) and the
     newest-first ORDERING is by that instant, which a zone shift never changes.
     A tier with keep == 0 is disabled (the `lim[p] > 0` guard).
-    """
-    keep: set = set()
-    last = {"h": None, "d": None, "w": None, "m": None, "y": None}
-    cnt = {"h": 0, "d": 0, "w": 0, "m": 0, "y": 0}
-    lim = {"h": keep_hourly, "d": keep_daily, "w": keep_weekly,
-           "m": keep_monthly, "y": keep_yearly}
 
-    for t in targets_newest_first:
-        w = t.when
-        if w is None:
-            keep.add(t.path)
-            continue
-        keyed = w.replace(tzinfo=timezone.utc).astimezone() if tz == "local" else w
-        iso = keyed.isocalendar()
-        keys = {
-            "h": (keyed.year, keyed.month, keyed.day, keyed.hour),
-            "d": (keyed.year, keyed.month, keyed.day),
-            "w": (iso[0], iso[1]),
-            "m": (keyed.year, keyed.month),
-            "y": (keyed.year,),
-        }
-        for p in ("h", "d", "w", "m", "y"):
-            if lim[p] > 0 and keys[p] != last[p] and cnt[p] < lim[p]:
-                keep.add(t.path)
-                last[p] = keys[p]
-                cnt[p] += 1
-    return keep
+    Derived from `_bucket_attribute` so the bucketing logic lives in EXACTLY ONE place:
+    the keep-set is precisely the set of paths the attribution helper tiered as kept.
+    """
+    return set(_bucket_attribute(targets_newest_first, keep_hourly, keep_daily,
+                                 keep_weekly, keep_monthly, keep_yearly, tz))
 
 
 def _keep_prepost_partners(keep_paths: set, source_snaps: list[Subvol],
@@ -1305,6 +1336,205 @@ def _write_success_stamp() -> None:
 
 
 # ============================================================================
+# REPORT  (read-only: derive live tiers + KEEP/PRUNE from the SAME retention logic)
+# ============================================================================
+# --report shows, per subvol, how the destination snapshots and source parent clones
+# stand RIGHT NOW: their current GFS tier (recomputed live — a tier is never stored),
+# what the next retention run would KEEP vs PRUNE, and chain/lag health. It mutates
+# NOTHING: no sends, clones, deletes, renames, property writes, mkdir, symlink, or
+# success stamp. Tiers are derived from `_bucket_attribute` — the same loop retention
+# uses — so this view can never disagree with what a real run would actually prune.
+
+
+def _fmt_when(dt: Optional[datetime]) -> str:
+    """Render a naive-UTC instant as a readable LOCAL `YYYY-MM-DD HH:MM` for the human
+    report (the stored/label times are naive-UTC; the operator thinks in local time)."""
+    if not dt:
+        return "unknown-date"
+    return dt.replace(tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _label_of(sv: Subvol) -> str:
+    """The on-disk wrapper dir name (`<date>-<offset>-<num>-<uuid>`) for a received
+    target or a parent clone — both live at `<label>/snapshot`."""
+    return os.path.basename(os.path.dirname(sv.path))
+
+
+def _dest_reasons(t: Subvol, attrib: dict, pin: Optional[Subvol],
+                  prepost_extra: set) -> list[str]:
+    """The human reason(s) a destination snapshot is (or isn't) kept, mirroring exactly
+    how apply_retention builds its keep-set: GFS tier(s) from `attrib`, plus the
+    keeps that live OUTSIDE GFS — the pinned parent and (root) pre/post partner — shown
+    as their own reasons, never as a tier."""
+    reasons: list[str] = []
+    codes = attrib.get(t.path, [])
+    if _UNDATABLE in codes:
+        reasons.append("kept (undatable)")
+    else:
+        reasons.extend(_TIER_CODE_LABEL[c] for c in codes)
+    if pin is not None and t.path == pin.path:
+        reasons.append("pinned parent")
+    if t.path in prepost_extra:
+        reasons.append("prepost partner")
+    return reasons
+
+
+def _report_subvol(cfg: Config, name: str, mountpoint: str, recv_dir: str) -> None:
+    """Print the read-only report for one subvol. Never touches disk on either host
+    beyond the reads (list snapper snapshots / parent clones / target snapshots)."""
+    print(f"\n=== {name}  ({mountpoint} -> {recv_dir}) ===")
+
+    source_snaps = list_snapper_snapshots(mountpoint)
+    clones = list_parent_clones(cfg, name)
+
+    dest_unreachable = False
+    unreachable_reason = ""
+    target_snaps: list[Subvol] = []
+    try:
+        target_snaps = list_target_snapshots(cfg, recv_dir)
+    except RemoteUnreachable as e:
+        dest_unreachable = True
+        unreachable_reason = str(e)
+
+    policy = cfg.retention_for(name)
+    kh = int(policy.get("keep_hourly", 0))
+    kd = int(policy.get("keep_daily", 0))
+    kw = int(policy.get("keep_weekly", 0))
+    km = int(policy.get("keep_monthly", 0))
+    ky = int(policy.get("keep_yearly", 0))
+
+    # --- Destination snapshots -------------------------------------------------
+    print(f"  Destination snapshots  (policy: hourly={kh} daily={kd} weekly={kw} "
+          f"monthly={km} yearly={ky}, tz={cfg.retention_timezone}):")
+    if dest_unreachable:
+        print(f"    unreachable — cannot report dest tiers ({unreachable_reason})")
+        parent = clones[0] if clones else None        # presumptive: newest local clone
+        parent_presumed = True
+    else:
+        parent = choose_parent_clone(clones, target_snaps)
+        parent_presumed = False
+        if not target_snaps:
+            print("    (none on destination)")
+        else:
+            # Recompute the keep decision EXACTLY as apply_retention does, so the
+            # KEEP/PRUNE verdicts here are the plan the next run would execute.
+            targets_sorted = sorted(target_snaps,
+                                    key=lambda t: (t.when or datetime.min), reverse=True)
+            attrib = _bucket_attribute(targets_sorted, kh, kd, kw, km, ky,
+                                       cfg.retention_timezone)
+            keep_paths = set(attrib)
+            pin = pinned_target(clones, target_snaps)
+            if pin is not None:
+                keep_paths.add(pin.path)
+            prepost_extra: set = set()
+            if name == "root":
+                prepost_extra = _keep_prepost_partners(keep_paths, source_snaps,
+                                                       target_snaps)
+                keep_paths |= prepost_extra
+
+            for t in targets_sorted:
+                verdict = "KEEP " if t.path in keep_paths else "PRUNE"
+                reasons = _dest_reasons(t, attrib, pin, prepost_extra)
+                reason_txt = ", ".join(reasons) if reasons else "-"
+                garble = "  GARBLE!" if (t.is_garbled or not t.is_valid_received) else ""
+                num = t.snapper_num if t.snapper_num is not None else "?"
+                print(f"    {verdict}  #{num:<4} {_fmt_when(t.when)}  "
+                      f"[{reason_txt}]{garble}")
+
+    # --- Source parent clones --------------------------------------------------
+    n = len(clones)
+    if n > cfg.parent_keep:
+        tree_state = f"over target (prunes to {cfg.parent_keep} after next good send)"
+    elif n == cfg.parent_keep:
+        tree_state = "at target"
+    else:
+        tree_state = "under target (building up)"
+    print(f"  Source parent clones  ({n} clone(s), parent_keep={cfg.parent_keep} — "
+          f"{tree_state}):")
+    if not clones:
+        print("    (none — next run will full-send)")
+    for c in clones:
+        is_parent = parent is not None and c.path == parent.path
+        if is_parent:
+            mark = "* parent (presumed)" if parent_presumed else "* parent"
+        else:
+            mark = ""
+        if dest_unreachable:
+            corr = "correlation unknown (dest unreachable)"
+        else:
+            corr = ("correlates with dest"
+                    if any(is_correlated(c, t) for t in target_snaps)
+                    else "NOT correlated (orphan)")
+        num = c.snapper_num if c.snapper_num is not None else "?"
+        print(f"    #{num:<4} {_fmt_when(c.when)}  {corr}  {mark}".rstrip())
+
+    # --- Per-subvol health lines ----------------------------------------------
+    if dest_unreachable:
+        print("  Chain: unknown — destination unreachable")
+        print("  Lag:   unknown — destination unreachable")
+        return
+
+    if parent is None:
+        print("  Chain: WARN — next run will full-send "
+              "(no parent clone correlates with any destination snapshot)")
+    else:
+        newest_dest = max(target_snaps, key=lambda t: (t.when or datetime.min),
+                          default=None)
+        newest_clone = clones[0] if clones else None
+        intact = (newest_clone is not None and newest_dest is not None
+                  and is_correlated(newest_clone, newest_dest))
+        if intact:
+            print(f"  Chain: intact — next incremental parents off #{parent.snapper_num}")
+        else:
+            print(f"  Chain: intact but behind — next incremental parents off "
+                  f"#{parent.snapper_num} (newest clone not yet on destination)")
+
+    src_newest = newest_snapshot(source_snaps)
+    dst_newest = max(target_snaps, key=lambda t: (t.when or datetime.min),
+                     default=None) if target_snaps else None
+    if src_newest is None:
+        print("  Lag:   no source snapshots")
+    elif dst_newest is None:
+        print(f"  Lag:   WARN — source at #{src_newest.snapper_num}, "
+              "destination has NOTHING (never replicated / stalled)")
+    else:
+        gap = src_newest.snapper_num - dst_newest.snapper_num
+        when_txt = ""
+        if src_newest.when and dst_newest.when:
+            secs = int((src_newest.when - dst_newest.when).total_seconds())
+            if secs > 0:
+                d, rem = divmod(secs, 86400)
+                h, rem = divmod(rem, 3600)
+                m = rem // 60
+                parts = ([f"{d}d"] if d else []) + ([f"{h}h"] if h else []) \
+                    + ([f"{m}m"] if (m and not d) else [])
+                when_txt = f", {' '.join(parts)} of wall-clock" if parts else ""
+        flag = "" if gap <= 0 else "  (destination is behind)"
+        print(f"  Lag:   source newest #{src_newest.snapper_num} vs destination "
+              f"newest #{dst_newest.snapper_num} — {max(gap, 0)} snapshot(s) behind"
+              f"{when_txt}{flag}")
+
+
+def _report(cfg: Config, args: argparse.Namespace) -> int:
+    """Read-only report across the configured subvols. Takes NO run lock and writes NO
+    success stamp — it mutates nothing, so it never blocks or interferes with a
+    concurrent real run. Returns 0."""
+    hostname = socket.gethostname()
+    print(f"snappersend report — {hostname} -> {cfg.server_user}@{cfg.server_host}")
+    print("(read-only; tiers computed live from current retention policy — a "
+          "snapshot's tier changes as newer ones age out)")
+    for name, sv in cfg.subvols.items():
+        if args.subvol and name != args.subvol:
+            continue
+        recv_dir = cfg.recv_dir_for(hostname, name)
+        try:
+            _report_subvol(cfg, name, sv["mountpoint"], recv_dir)
+        except Exception as e:   # a broken subvol must not abort the whole report
+            print(f"\n=== {name} ===\n  ERROR building report: {e}")
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -1326,6 +1556,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="replicate only this subvolume (name from config)")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", default=None,
                    help="log what would happen; change nothing ($SNAPPERSEND_DRY_RUN)")
+    p.add_argument("--report", action="store_true",
+                   help="read-only: show each subvol's current dest tiers + next-prune "
+                        "KEEP/PRUNE, source clones + incremental parent, and chain/lag "
+                        "health. Mutates nothing; mutually exclusive with a real run.")
     p.add_argument("--skip-boot", action="store_true",
                    help="skip the non-Btrfs /boot + /boot/efi rsync tier")
     p.add_argument("--no-mbuffer", action="store_true",
@@ -1371,6 +1605,11 @@ def main(argv: list[str]) -> int:
     if args.subvol and args.subvol not in cfg.subvols:
         log_error(f"--subvol {args.subvol!r} not in config subvols {list(cfg.subvols)}")
         return 2
+
+    # --report is read-only and mutually exclusive with a real run: report, then exit
+    # WITHOUT taking the run lock or entering replicate_subvol (it mutates nothing).
+    if args.report:
+        return _report(cfg, args)
 
     try:
         with run_lock():

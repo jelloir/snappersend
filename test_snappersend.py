@@ -559,6 +559,199 @@ def test_clone_label_unique_per_snapshot_not_per_number():
     assert ss._clone_label(s1) != ss._clone_label(s2)
 
 
+# ============================================================================
+# (8) --report: read-only tier/verdict view derived from the SAME bucketing logic
+# ============================================================================
+
+def _parse_verdicts(text):
+    """Pull {snapper_num: 'KEEP'|'PRUNE'} out of the report's Destination section."""
+    out = {}
+    for line in text.splitlines():
+        s = line.strip()
+        for v in ("KEEP", "PRUNE"):
+            if s.startswith(v) and "#" in s:
+                out[int(s.split("#", 1)[1].split()[0])] = v
+    return out
+
+
+def _drive_report(monkeypatch, cfg, name, source, clones, dest, reachable=True):
+    """Monkeypatch the read boundary and run the REAL _report_subvol."""
+    from datetime import datetime
+    monkeypatch.setattr(ss, "list_snapper_snapshots", lambda mp: list(source))
+    monkeypatch.setattr(ss, "list_parent_clones", lambda c, n: sorted(
+        clones, key=lambda x: (x.info_time or datetime.min, x.snapper_num or 0),
+        reverse=True))
+
+    def _lt(c, rd):
+        if not reachable:
+            raise ss.RemoteUnreachable("ssh: Could not resolve hostname dest")
+        return list(dest)
+    monkeypatch.setattr(ss, "list_target_snapshots", _lt)
+    ss._report_subvol(cfg, name, "/m", "/recv/" + name)
+
+
+def test_bucket_attribute_matches_keep_set_both_directions():
+    # THE anti-drift guard: the paths _bucket_attribute tiers as kept are EXACTLY the
+    # paths _bucket_keep keeps — subset each way, over several policies.
+    from datetime import datetime
+    tgts = [target_of(clone_snap(n, w, uuid=f"u{n}")) for n, w in enumerate([
+        datetime(2026, 6, 10, 12), datetime(2026, 6, 10, 11), datetime(2026, 6, 10, 10),
+        datetime(2026, 6, 9, 12),  datetime(2026, 6, 8, 12),  datetime(2026, 6, 1, 12),
+        datetime(2025, 12, 1, 12), datetime(2024, 3, 1, 12)])]
+    tgts.sort(key=lambda t: t.when, reverse=True)
+    for pol in [(2, 3, 1, 1, 1), (0, 0, 0, 0, 2), (24, 14, 8, 6, 2), (0, 0, 0, 0, 0)]:
+        attrib = ss._bucket_attribute(tgts, *pol)
+        keep = ss._bucket_keep(tgts, *pol)
+        assert set(attrib) == keep                       # both directions at once
+        assert set(attrib) <= keep and keep <= set(attrib)
+        # every recorded code is a real tier, coarsest-last, no dupes within a path
+        for codes in attrib.values():
+            assert codes and all(c in ss._TIER_ORDER for c in codes)
+            assert [c for c in ss._TIER_ORDER if c in codes] == codes
+
+
+def test_bucket_attribute_undatable_kept_as_undatable():
+    u = target_of(clone_snap(1, None, uuid="u1"))        # when is None -> undatable
+    assert u.when is None
+    attrib = ss._bucket_attribute([u], 5, 5, 5, 5, 5)
+    assert attrib[u.path] == [ss._UNDATABLE]
+    assert u.path in ss._bucket_keep([u], 5, 5, 5, 5, 5)  # always kept
+
+
+def test_report_prune_verdict_marks_exactly_paths_outside_keep_set(monkeypatch, capsys):
+    # Report's KEEP/PRUNE must equal what apply_retention actually prunes, snapshot
+    # for snapshot — the report is a faithful preview of the next run's plan.
+    from datetime import datetime
+    clones, dest, source = [], [], []
+    for n in range(6):
+        c = clone_snap(n, datetime(2026, 6, 1 + n, 12), uuid=f"c{n}")
+        clones.append(c)
+        dest.append(target_of(c))
+        source.append(src_snap(n, datetime(2026, 6, 1 + n, 12), uuid=f"src-{n:04d}"))
+    cfg2 = ss.Config(server_host="d", parent_keep=2, retention={"default": {
+        "keep_hourly": 0, "keep_daily": 2, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+
+    # Ground truth: what apply_retention deletes.
+    deleted = []
+
+    def fake_rr(c, cmd, check=True):
+        if "subvolume delete" in cmd:
+            deleted.append(cmd)
+        class R: returncode = 0; stderr = ""
+        return R()
+    saved = ss.run_remote
+    ss.run_remote = fake_rr
+    try:
+        ss.apply_retention(cfg2, "home", source, dest, clones, "/recv/home")
+    finally:
+        ss.run_remote = saved
+    pruned_nums = {int(cmd.split("/recv/")[1].split("/")[0]) for cmd in deleted}
+
+    _drive_report(monkeypatch, cfg2, "home", source, clones, dest)
+    verdicts = _parse_verdicts(capsys.readouterr().out)
+    assert {n for n, v in verdicts.items() if v == "PRUNE"} == pruned_nums
+    assert {n for n, v in verdicts.items() if v == "KEEP"} == set(range(6)) - pruned_nums
+
+
+def test_report_pinned_parent_shows_as_reason_not_tier(monkeypatch, capsys):
+    from datetime import datetime
+    older = clone_snap(1, datetime(2026, 1, 1, 12), uuid="c-old")
+    t_old = target_of(older)
+    t_new = target_of(clone_snap(9, datetime(2026, 6, 9, 12), uuid="c-new"))
+    cfg2 = ss.Config(server_host="d", parent_keep=2, retention={"default": {
+        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+    _drive_report(monkeypatch, cfg2, "home", [], [older], [t_old, t_new])
+    out = capsys.readouterr().out
+    pin_line = next(l for l in out.splitlines() if "pinned parent" in l)
+    assert "KEEP" in pin_line and "#1 " in pin_line
+    # It is kept by the pin ALONE — no GFS tier word may appear on that line.
+    assert not any(w in pin_line for w in ("hourly", "daily", "weekly",
+                                           "monthly", "yearly"))
+
+
+def test_report_prepost_partner_shows_as_reason_not_tier(monkeypatch, capsys):
+    from datetime import datetime
+    d1, d2 = datetime(2026, 6, 1, 12), datetime(2026, 6, 2, 12)
+    s_pre = src_snap(5, d1, uuid="u5", typ="pre")
+    s_post = src_snap(6, d2, uuid="u6", typ="post", pre=5)
+    c5 = clone_snap(5, d1, uuid="u5")
+    c6 = clone_snap(6, d2, uuid="u6")
+    dest = [target_of(c5), target_of(c6)]                # received_uuid == u5 / u6
+    cfg2 = ss.Config(server_host="d", parent_keep=2, retention={"default": {
+        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+    # subvol 'root' enables the pre/post partner keep.
+    _drive_report(monkeypatch, cfg2, "root", [s_pre, s_post], [c6], dest)
+    out = capsys.readouterr().out
+    partner_line = next(l for l in out.splitlines() if "prepost partner" in l)
+    assert "KEEP" in partner_line and "#5 " in partner_line
+    assert not any(w in partner_line for w in ("hourly", "daily", "weekly",
+                                               "monthly", "yearly"))
+
+
+def test_report_chain_intact_and_lag_zero(monkeypatch, capsys):
+    c7 = clone_snap(7, dt(2026, 6, 2), uuid="clone-7")
+    cfg2 = ss.Config(server_host="d")
+    _drive_report(monkeypatch, cfg2, "home", [src_snap(7, dt(2026, 6, 2))],
+                  [c7], [target_of(c7)])
+    out = capsys.readouterr().out
+    assert "Chain: intact" in out
+    assert "0 snapshot(s) behind" in out
+
+
+def test_report_chain_warns_full_send_on_divergence(monkeypatch, capsys):
+    stale = clone_snap(4, dt(2026, 5, 31), uuid="clone-stale")
+    foreign = ss.Subvol(path="/recv/zzz/snapshot", uuid="dst-x", parent_uuid="-",
+                        received_uuid="totally-unrelated", readonly=True)
+    foreign.snapper_num = 99
+    cfg2 = ss.Config(server_host="d")
+    _drive_report(monkeypatch, cfg2, "home", [src_snap(8, dt(2026, 6, 3))],
+                  [stale], [foreign])
+    out = capsys.readouterr().out
+    assert "next run will full-send" in out
+
+
+def test_report_unreachable_prints_source_and_mutates_nothing(monkeypatch, cfg, capsys):
+    # Dest down: source section (clones + presumed parent) still prints, dest marked
+    # unreachable, and NOTHING is sent/cloned/pruned/retained.
+    c7 = clone_snap(7, dt(2026, 6, 2), uuid="clone-7")
+    w = FakeWorld(monkeypatch, [src_snap(7, dt(2026, 6, 2))],
+                  tree=[c7], dest=[target_of(c7)], reachable=False)
+    tree_before = {c.path for c in w.tree}
+    dest_before = {t.received_uuid for t in w.dest}
+
+    class _Args:
+        subvol = None
+    rc = ss._report(cfg, _Args())
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "unreachable — cannot report dest tiers" in out
+    assert "#7 " in out and "correlation unknown" in out   # source clone still shown
+    assert "parent (presumed)" in out
+    assert w.sends == []                                    # nothing sent
+    assert w.retention_calls == []                         # no retention
+    assert {c.path for c in w.tree} == tree_before         # parent tree intact
+    assert {t.received_uuid for t in w.dest} == dest_before
+
+
+def test_report_garble_flag(monkeypatch, capsys):
+    # A received subvol that fails the rule-1 valid-received check is flagged GARBLE.
+    c = clone_snap(3, dt(2026, 6, 3), uuid="c3")
+    good = target_of(c)
+    garbled = ss.Subvol(path="/recv/4/snapshot", uuid="dst-4", parent_uuid="-",
+                        received_uuid="-", readonly=False)   # writable, no recv uuid
+    garbled.snapper_num = 4
+    garbled.info_time = dt(2026, 6, 4)
+    cfg2 = ss.Config(server_host="d")
+    _drive_report(monkeypatch, cfg2, "home", [], [c], [good, garbled])
+    out = capsys.readouterr().out
+    garble_line = next(l for l in out.splitlines() if "#4 " in l and "GARBLE" in l)
+    assert "GARBLE" in garble_line
+
+
 def test_run_lock_collision(tmp_path, monkeypatch):
     import fcntl
     lock = tmp_path / "snappersend.lock"

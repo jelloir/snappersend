@@ -160,12 +160,41 @@ See `config.example` for an annotated starting point.
 snappersend                 # replicate every configured subvolume
 snappersend --dry-run       # read both sides; log intended clones/sends/promotions/
                             #   prunes; change nothing
+snappersend --report        # read-only status view (see below); change nothing
 snappersend --subvol home   # just one subvolume
 snappersend --config PATH   # alternate config (default /etc/snappersend/config)
 snappersend --no-mbuffer    # don't pipe through mbuffer
 snappersend --skip-boot     # skip the /boot + /boot/efi rsync tier
 snappersend -v              # verbose: log every shell command
 ```
+
+### `--report` — read-only status & health view
+
+`--report` prints, per subvolume, how the destination snapshots and source parent clones
+stand **right now** — it **changes nothing** (no sends, clones, deletes, renames, property
+writes, or success stamp) and takes no run lock, so it is safe to run alongside a real
+replication. It honours `--subvol` and `--server`, and each subvol's own
+`retention_for()` policy. For each subvol it shows:
+
+- **Destination snapshots** (newest first): num + date, current **tier(s)**
+  (`hourly|daily|weekly|monthly|yearly`, or `pinned parent` / `prepost partner` /
+  `kept (undatable)` for the keeps that live outside GFS), the next-prune verdict
+  **`KEEP`/`PRUNE`**, and a `GARBLE!` flag on any received subvol that fails the
+  valid-received check.
+- **Source parent clones**: num + date, which one is the current incremental parent
+  (`*`), whether each still correlates with a destination snapshot, and whether the tree
+  is at/over/under `parent_keep`.
+- **Health lines**: *Chain* — intact, or `WARN: next run will full-send` when no clone
+  correlates with any destination snapshot; and *Lag* — how far (snapshots + wall-clock)
+  the destination trails the source's newest.
+
+Tiers are **computed live** from the current policy, not stored: a snapshot that is
+today's `daily` survivor becomes a `weekly` one as newer snapshots age out, so the report
+is a **point-in-time view**, not a persisted label. The verdicts are derived from the
+exact same `_bucket_attribute` loop retention uses, so `--report` and a real prune can
+never disagree — a `PRUNE` here is precisely what the next run would delete. (Folder names
+are deliberately **not** renamed to reflect tier: the `date-offset-num-uuid` name is
+load-bearing for date/num parsing and UUID correlation.)
 
 Logging is `[STEP]/[INFO]/[OK]/[WARN]/[ERROR]` to the terminal (coloured on a tty) and
 to `/var/log/snappersend.log` (override `$SNAPPERSEND_LOG`). The full-send fallback is

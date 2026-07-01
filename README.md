@@ -340,22 +340,102 @@ Why this shape:
 Installs the units to fire snappersend once per timeline snapshot; drive it by hand any
 time with `sudo systemctl start snappersend.service` or `sudo snappersend`.
 
-> **Desktop notification (optional — not part of snappersend).** snappersend deliberately
-> ships **no** notification code: failure *detection* is already systemd-native
-> (`snappersend.service` exits non-zero on failure and lands in the journal /
-> `systemctl --failed`). If you want a desktop toast, wire a **standalone** `OnFailure=`
-> unit — kept entirely separate from snappersend — that calls a small dispatcher. The one
-> real gotcha: an `OnFailure=` unit runs as **root with no graphical session**, so a bare
-> `notify-send` no-ops; it must cross into the logged-in user's session bus:
-> ```sh
-> # in the dispatcher, after discovering the active user + uid:
-> sudo -u "$user" \
->     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
->     notify-send -u critical "snappersend failed" "See: journalctl -u snappersend.service"
-> ```
-> When no graphical session is logged in the toast simply doesn't show — nothing is lost,
-> since the failure is already in the journal and surfaces next time you're at the
-> machine. This is a starting point you adapt, not something snappersend depends on.
+### Desktop notification on failure (optional)
+
+snappersend ships **no** notification code — failure *detection* is already
+systemd-native (`snappersend.service` exits non-zero on failure, lands in the journal, and
+shows in `systemctl --failed`). This section adds a **desktop toast** on top, wired
+entirely separately from snappersend via a standard systemd `OnFailure=` unit, so you can
+add or remove it without touching snappersend itself.
+
+The one real subtlety: an `OnFailure=` unit runs as **root with no graphical session**, so
+a bare `notify-send` does nothing. The dispatcher below crosses into each logged-in user's
+D-Bus session so the toast actually appears. If you're on a headless box (or logged out),
+it simply no-ops — the failure is still in the journal.
+
+**1. Install `notify-send`** (from libnotify) — you also need a notification daemon
+running in your desktop session; GNOME/KDE have one built in, otherwise run `dunst` or
+`mako`:
+
+```sh
+sudo apt-get install -y libnotify-bin
+```
+
+**2. Install the dispatcher** — it finds every active login and shows the toast in that
+user's session:
+
+```sh
+sudo tee /usr/local/bin/snappersend-notify >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# snappersend-notify — pop a desktop toast into every logged-in graphical session.
+# Called by an OnFailure= unit (root, no session of its own), so it must reach into
+# each user's D-Bus. $1 = the systemd unit that failed (e.g. snappersend.service).
+set -u
+unit="${1:-snappersend.service}"
+title="Backup failed: ${unit}"
+body="snappersend reported a failure. Check:  journalctl -u ${unit} -e"
+
+for uid in $(loginctl list-users --no-legend | awk '{print $1}'); do
+    user=$(id -un "$uid" 2>/dev/null) || continue
+    bus="/run/user/${uid}/bus"
+    [ -S "$bus" ] || continue          # no session bus for this user -> skip (headless)
+    sudo -u "$user" \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
+        notify-send -u critical -a snappersend -i dialog-error "$title" "$body" \
+        2>/dev/null || true
+done
+exit 0
+EOF
+sudo chmod 0755 /usr/local/bin/snappersend-notify
+```
+
+**3. Add the notifier unit** — a small template unit whose instance name (`%i`) is the
+unit that failed, so the same notifier is reusable for anything:
+
+```sh
+sudo tee /etc/systemd/system/snappersend-notify@.service >/dev/null <<'EOF'
+[Unit]
+Description=Desktop notification that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snappersend-notify %i
+EOF
+```
+
+**4. Wire it into snappersend via a drop-in** (an admin drop-in in `/etc` applies whether
+snappersend was installed manually or from the `.deb`, without editing the shipped unit):
+
+```sh
+sudo install -d /etc/systemd/system/snappersend.service.d
+sudo tee /etc/systemd/system/snappersend.service.d/50-notify.conf >/dev/null <<'EOF'
+[Unit]
+OnFailure=snappersend-notify@%n.service
+EOF
+sudo systemctl daemon-reload
+```
+
+**5. Test it** — call the dispatcher directly while sitting at your desktop; a toast should
+appear immediately:
+
+```sh
+sudo /usr/local/bin/snappersend-notify snappersend.service
+```
+
+To exercise the *whole* `OnFailure=` chain end to end, force a real failure (point
+snappersend at an unreachable destination so the run exits non-zero, then check the toast
+fired):
+
+```sh
+sudo SNAPPERSEND_SERVER=10.255.255.1 systemctl start snappersend.service   # will fail
+systemctl --failed | grep snappersend        # confirms it failed
+journalctl -u snappersend-notify@* -n 20      # confirms the notifier ran
+```
+
+Adapt freely: change the wording/urgency, add a second `OnFailure=` for e-mail, or drop
+`-i dialog-error` if your daemon doesn't theme icons. Nothing here is a snappersend
+dependency — remove `50-notify.conf` (and `daemon-reload`) to turn it all off.
 
 > **Not yet included (a later pass):** the **missed-run watchdog** (for a source that was
 > powered off across several timeline ticks). snappersend writes a success stamp

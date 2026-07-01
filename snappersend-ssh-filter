@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# snappersend-ssh-filter — forced command for the snappersend transport key (destination).
+#
+# Installed on the DESTINATION as /usr/local/bin/snappersend-ssh-filter and wired into the
+# transport user's authorized_keys:
+#
+#   command="/usr/local/bin/snappersend-ssh-filter",no-pty,no-agent-forwarding,\
+#   no-port-forwarding,no-X11-forwarding ssh-ed25519 AAAA... snappersend@source
+#
+# It restricts what the source's key can run to exactly the command set snappersend
+# issues over ssh — so even if the key leaks it cannot get a shell or run arbitrary
+# commands. Defense-in-depth ON TOP of the scoped sudoers rule (/etc/sudoers.d/snappersend);
+# neither alone is the whole story.
+set -euo pipefail
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+
+case "$cmd" in
+    "sudo btrfs receive "*          | \
+    "sudo btrfs subvolume show "*   | \
+    "sudo btrfs subvolume delete "* | \
+    "sudo btrfs property get "*     | \
+    "sudo mkdir -p "*               | \
+    "sudo rmdir "*                  | \
+    "sudo ls "*                     | \
+    "sudo ln -sfn "*                | \
+    "sudo rsync "*)
+        exec bash -c "$cmd"
+        ;;
+    *)
+        echo "snappersend-ssh-filter: rejected command: ${cmd:-<none>}" >&2
+        exit 1
+        ;;
+esac

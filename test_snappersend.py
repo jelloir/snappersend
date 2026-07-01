@@ -86,19 +86,19 @@ class FakeWorld:
     against in-memory `tree` (parent clones) and `dest` (received snapshots)."""
 
     def __init__(self, monkeypatch, source, tree=None, dest=None,
-                 send_succeeds=True, crash_after_send=False):
+                 send_succeeds=True, crash_after_send=False, reachable=True):
         self.source = source
         self.tree = list(tree or [])
         self.dest = list(dest or [])
         self.send_succeeds = send_succeeds
         self.crash_after_send = crash_after_send
+        self.reachable = reachable
         self.sends = []           # (clone_uuid, parent_uuid_or_None)
         self.retention_calls = []
         self._uuid_seq = 1000
 
         monkeypatch.setattr(ss, "list_snapper_snapshots", lambda mp: list(self.source))
-        monkeypatch.setattr(ss, "list_target_snapshots",
-                            lambda cfg, rd: list(self.dest))
+        monkeypatch.setattr(ss, "list_target_snapshots", self._list_target)
         monkeypatch.setattr(ss, "list_parent_clones", lambda cfg, n: self._clones())
         monkeypatch.setattr(ss, "make_clone", self._make_clone)
         monkeypatch.setattr(ss, "delete_clone", self._delete_clone)
@@ -106,6 +106,13 @@ class FakeWorld:
         monkeypatch.setattr(ss, "run_remote", lambda *a, **k: None)
         monkeypatch.setattr(ss, "apply_retention", self._apply_retention)
         # prune_parent_clones is the REAL function (exercises list/delete via fakes).
+
+    def _list_target(self, cfg, rd):
+        # A transport failure raises RemoteUnreachable (as the real ssh-backed
+        # lister does on rc 255) — distinct from a reachable-but-empty destination.
+        if not self.reachable:
+            raise ss.RemoteUnreachable("ssh: Could not resolve hostname dest")
+        return list(self.dest)
 
     def _clones(self):
         from datetime import datetime
@@ -238,6 +245,42 @@ def test_first_run_empty_everything_full_send(monkeypatch, cfg):
     assert ok is True
     assert w.sends and w.sends[-1][1] is None           # full send
     assert [c.snapper_num for c in w.tree] == [1]       # seeded
+
+
+# ============================================================================
+# (3b) Unreachable destination != divergence — a transient transport failure
+#      must NOT force a full send on the next run (regression for the real-VM
+#      failure-decoupling bug: an empty target list from a down link looked like
+#      divergence, so the newest was re-staged, its deterministic-label clone was
+#      deleted, and correlation with the destination was lost).
+# ============================================================================
+
+def test_unreachable_destination_preserves_parent_and_recovers_incrementally(monkeypatch, cfg):
+    # Steady state: newest #7 already confirmed-sent (its clone correlates on dest).
+    c7 = clone_snap(7, dt(2026, 6, 2), uuid="clone-7")
+    w = FakeWorld(monkeypatch, [src_snap(7, dt(2026, 6, 2))],
+                  tree=[c7], dest=[target_of(c7)], reachable=False)
+    tree_before = {c.path for c in w.tree}
+    dest_before = {t.received_uuid for t in w.dest}
+
+    # A run while the link is down must fail the subvol but touch NOTHING.
+    assert run(cfg, w) is False
+    assert w.sends == []                                # never even attempted a send
+    assert {c.path for c in w.tree} == tree_before      # parent tree intact
+    assert {t.received_uuid for t in w.dest} == dest_before
+    assert w.retention_calls == []                      # no retention on abort
+    assert any(c.uuid == "clone-7" for c in w.tree)     # confirmed parent survives
+
+    # Link restored, newest still #7: must recognise it's already on the destination
+    # and send nothing — NOT a forced full send.
+    w.reachable = True
+    assert run(cfg, w) is True
+    assert w.sends == []                                # still nothing sent (idempotent)
+
+    # And a genuinely new snapshot after recovery goes incrementally off #7.
+    w.source = [src_snap(7, dt(2026, 6, 2)), src_snap(8, dt(2026, 6, 3))]
+    assert run(cfg, w) is True
+    assert w.sends[-1][1] == "clone-7"                  # incremental parent, not full
 
 
 # ============================================================================

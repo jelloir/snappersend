@@ -469,6 +469,29 @@ def run_remote(cfg: Config, remote_cmd: str, *, check: bool = True):
     return run_local(ssh_argv(cfg, remote_cmd), check=check)
 
 
+class RemoteUnreachable(Exception):
+    """The destination could not be contacted at all (ssh transport failure —
+    name resolution, connection refused/timeout, auth). This is DISTINCT from a
+    reachable-but-empty destination: on a transport failure we must NOT conclude
+    'divergence' and must NOT touch the parent tree (staging/re-cloning the newest
+    snapshot would delete a still-correlating confirmed clone via its deterministic
+    label, so a transient network blip would force a full send next run — the exact
+    thing snappersend exists to avoid). The caller aborts the subvol and retries."""
+
+
+def _is_ssh_transport_failure(cp: subprocess.CompletedProcess) -> bool:
+    """True when a run_remote result reflects ssh's own failure to establish the
+    session rather than the remote command's exit status. ssh reserves rc 255 for
+    connection/resolution/auth errors; the remote `ls` we run otherwise returns
+    0 (ok, possibly empty) or a small code like 2 (missing dir) which we treat as
+    'no snapshots yet'. rc 127 is our own 'ssh binary missing' sentinel."""
+    if cp.returncode in (255, 127):
+        return True
+    # Belt-and-suspenders: ssh prefixes its transport diagnostics with "ssh:".
+    return any(ln.strip().lower().startswith("ssh:")
+               for ln in (cp.stderr or "").splitlines())
+
+
 # ============================================================================
 # PARSING  `btrfs subvolume show`
 # ============================================================================
@@ -660,6 +683,13 @@ def list_target_snapshots(cfg: Config, recv_dir: str) -> list[Subvol]:
     cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(recv_dir)}", check=False)
     out: list[Subvol] = []
     if cp.returncode != 0:
+        if _is_ssh_transport_failure(cp):
+            summary = next((ln.strip() for ln in (cp.stderr or "").splitlines()
+                            if ln.strip().lower().startswith("ssh:")),
+                           f"ssh exited {cp.returncode}")
+            raise RemoteUnreachable(summary)
+        # Reachable, but the listing failed for a benign reason (e.g. the recv dir
+        # doesn't exist yet on a genuine first run) — treat as 'no snapshots'.
         return out
     for name in cp.stdout.split():
         if name.endswith(".latest"):
@@ -1175,7 +1205,16 @@ def replicate_subvol(cfg: Config, name: str, mountpoint: str, recv_dir: str) -> 
         return True
 
     run_remote(cfg, f"sudo mkdir -p {shlex.quote(recv_dir)}", check=False)
-    target_snaps = list_target_snapshots(cfg, recv_dir)
+    try:
+        target_snaps = list_target_snapshots(cfg, recv_dir)
+    except RemoteUnreachable as e:
+        # Transport down — NOT divergence. Abort this subvol WITHOUT staging or
+        # pruning anything: the parent tree (and its correlation with whatever the
+        # destination already holds) is left byte-for-byte intact, so the next run
+        # resumes with a normal incremental instead of being forced into a full send.
+        log_error(f"[{name}] destination unreachable ({e}) — skipping this subvol; "
+                  "parent tree left intact, will retry next run.")
+        return False
     clones = list_parent_clones(cfg, name)
 
     parent = choose_parent_clone(clones, target_snaps)

@@ -1,0 +1,27 @@
+[Unit]
+Description=Replicate latest Snapper snapshot via btrfs send/receive
+Documentation=file:/usr/local/share/doc/snappersend/README.md
+# Ordering only — deliberately NOT Requires=. After= sequences us behind the
+# timeline snapshot without making us try to *start* it, so a manual
+# `systemctl start snappersend.service` (or the CLI) never drags the snapshot
+# machinery along. The trigger relationship lives in the timeline service's
+# drop-in (Wants=/Before= snappersend.service), keeping snapper's health and
+# snappersend's health independent.
+After=snapper-timeline.service
+# A run may coincide with resume-from-suspend or a boot-time trigger; ensure the
+# network is up first. A near-no-op for the steady hourly case (network long up).
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snappersend
+# Runs as root: needs btrfs, ssh, and write access to the parent tree,
+# /var/log/snappersend.log, /var/lock/snappersend.lock, and /var/lib/snappersend/.
+# No PrivateNetwork sandbox (unlike snapper's own unit) — we need the network.
+#
+# No [Install] section by design: snappersend.service is triggered ONLY by the
+# timeline service's Wants= drop-in, never enabled on its own timer. snappersend
+# is newest-only, once per snapshot cadence — a second timer would be redundant.
+# snappersend flock()s /var/lock/snappersend.lock for the whole run, so an
+# overrun into the next trigger exits cleanly; no systemd overlap guard needed.

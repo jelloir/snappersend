@@ -90,6 +90,15 @@ What this buys you:
   at `INFO` (`no shared parent with destination — full send`), and reseeds the parent
   tree on success. Full send is the rare genuine-divergence / first-run path, never the
   routine gap path.
+- **Unreachable destination ≠ divergence.** A transport failure (the destination is
+  offline, DNS fails, the link is down) is detected as such and **never** mistaken for
+  divergence: snappersend aborts that subvolume *before* touching the parent tree
+  (`destination unreachable … parent tree left intact, will retry next run`) and exits
+  non-zero. Because it doesn't re-stage the newest snapshot, it can't delete a
+  still-correlating clone — so when the link returns, the next run resumes with a normal
+  incremental instead of being forced into a full send. This is what makes the "holiday /
+  long gap" guarantee hold even when the gap is caused by the *network* rather than the
+  source being offline.
 - **Crash between “send OK” and “prune”** is safe: the staged clone is already in the
   tree and the destination already has it, so the next run just continues off it. The
   invariant guarantees the parent is never *ahead* of the destination — stale-behind is
@@ -192,10 +201,84 @@ The first run logs `no shared parent with destination — full send` for each su
 (expected — there's no parent clone yet). After it, `/.snappersend/<subvol>/` holds the
 seed clone, and every later run is a small incremental off the preserved parent.
 
-> **Not yet included (a later pass):** the systemd timer, the missed-run watchdog, and
-> Snapper-hook triggering. snappersend writes a success stamp
-> (`/var/lib/snappersend/last-success`) the future watchdog will read, but ships now as
-> a clean CLI that does one full replication pass per invocation.
+### systemd wiring — run right after each Snapper timeline snapshot
+
+Snapper (on Debian) has no native "run a script after a snapshot" hook, so snappersend
+attaches to what *creates* the snapshots: the **`snapper-timeline.service`**. The wiring
+is deliberately **decoupled** — a separate `snappersend.service` ordered strictly *after*
+the timeline snapshot, pulled in by a drop-in on the timeline service:
+
+`/etc/systemd/system/snappersend.service` — the run itself:
+
+```ini
+[Unit]
+Description=Replicate latest Snapper snapshot via btrfs send/receive
+After=snapper-timeline.service          # order after the snapshot; NOT Requires=
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snappersend
+```
+
+`/etc/systemd/system/snapper-timeline.service.d/10-snappersend.conf` — the trigger:
+
+```ini
+[Unit]
+Wants=snappersend.service               # pull us in each timeline run…
+Before=snappersend.service              # …ordered after the snapshot completes
+```
+
+```sh
+sudo install -m0644 systemd/snappersend.service /etc/systemd/system/
+sudo install -Dm0644 systemd/snapper-timeline.service.d/10-snappersend.conf \
+     /etc/systemd/system/snapper-timeline.service.d/10-snappersend.conf
+sudo systemctl daemon-reload
+# verify the ordering graph:
+systemctl show snapper-timeline.service -p Wants -p Before | grep snappersend
+systemctl show snappersend.service -p After | grep snapper-timeline
+```
+
+Why this shape:
+
+- **`Wants=`, not `Requires=`** — snappersend still runs on the hours Snapper's
+  `--timeline` no-ops (it just finds nothing new and exits 0), and a snappersend failure
+  (e.g. a transient network blip to the destination, a legitimate non-zero exit) **never
+  propagates back** to mark `snapper-timeline.service` itself as failed. Snapper's health
+  reflects snapshots; snappersend's health reflects the send. They stay independent.
+- **A separate unit ordered `After=`, not `ExecStartPost=`** on the timeline unit — the
+  packaged timeline unit is `Type=simple`, so an `ExecStartPost=` would race the
+  snapshot's completion and couple snappersend's exit status into Snapper's service
+  health. The separate-unit design avoids both.
+- **No `[Install]`/own timer** — `snappersend.service` is triggered *only* by the
+  timeline service's `Wants=`; a second timer would be redundant (snappersend is
+  newest-only, once per snapshot cadence). Don't `enable` it. The `flock` guards against
+  a run overrunning into the next trigger.
+
+Installs the units to fire snappersend once per timeline snapshot; drive it by hand any
+time with `sudo systemctl start snappersend.service` or `sudo snappersend`.
+
+> **Desktop notification (optional — not part of snappersend).** snappersend deliberately
+> ships **no** notification code: failure *detection* is already systemd-native
+> (`snappersend.service` exits non-zero on failure and lands in the journal /
+> `systemctl --failed`). If you want a desktop toast, wire a **standalone** `OnFailure=`
+> unit — kept entirely separate from snappersend — that calls a small dispatcher. The one
+> real gotcha: an `OnFailure=` unit runs as **root with no graphical session**, so a bare
+> `notify-send` no-ops; it must cross into the logged-in user's session bus:
+> ```sh
+> # in the dispatcher, after discovering the active user + uid:
+> sudo -u "$user" \
+>     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+>     notify-send -u critical "snappersend failed" "See: journalctl -u snappersend.service"
+> ```
+> When no graphical session is logged in the toast simply doesn't show — nothing is lost,
+> since the failure is already in the journal and surfaces next time you're at the
+> machine. This is a starting point you adapt, not something snappersend depends on.
+
+> **Not yet included (a later pass):** the **missed-run watchdog** (for a source that was
+> powered off across several timeline ticks). snappersend writes a success stamp
+> (`/var/lib/snappersend/last-success`) the future watchdog will read. The timeline-driven
+> systemd trigger above **is** now shipped.
 
 ## Tests
 
@@ -204,8 +287,9 @@ SNAPPERSEND_QUIET=1 python3 -m pytest test_snappersend.py -q
 ```
 
 The suite covers the parent-tree invariant (failed send leaves the parent unchanged;
-success promotes and prunes; diverged destination → full send + reseed; crash-after-
-send-before-promote is safe), WYSIWYG GFS retention including the yearly tier (and that
-no source-backed snapshot survives beyond GFS), Snapper-schema config parsing, and the
-carried-over correctness logic (valid-received detection, UUID correlation,
-receive-in-place, run-lock collision).
+success promotes and prunes; diverged destination → full send + reseed; an **unreachable
+destination is not treated as divergence** — the parent tree is left intact and the next
+run recovers incrementally; crash-after-send-before-promote is safe), WYSIWYG GFS
+retention including the yearly tier (and that no source-backed snapshot survives beyond
+GFS), Snapper-schema config parsing, and the carried-over correctness logic
+(valid-received detection, UUID correlation, receive-in-place, run-lock collision).

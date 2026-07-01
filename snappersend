@@ -10,21 +10,20 @@ host over SSH via:
 
 It does NOT reimplement the Btrfs stream format or the network — btrfs does the
 filesystem + stream work, ssh does the (encrypted) network, snappersend does the
-bookkeeping. It is a ground-up rewrite of di-snapsend that fixes two problems:
+bookkeeping. It does NOT create snapshots either: it assumes Snapper is installed
+and taking timeline snapshots on the source (a `.snapshots` dir under each
+configured subvolume). Two design choices are the heart of it:
 
-WHAT CHANGED FROM di-snapsend (and why)
----------------------------------------
-1. WYSIWYG retention. di-snapsend kept a destination snapshot if EITHER its GFS
-   policy kept it OR its source still held it (a "superset"), so the destination
-   silently held more than its config implied. snappersend's destination retention
-   is PURE GFS — what you configure is what you get — with exactly ONE documented
-   exception: the pinned incremental parent (the most recent snapshot is always
-   kept as the next incremental's base).
+TWO DESIGN CHOICES (and why)
+----------------------------
+1. WYSIWYG retention. The destination's retention is PURE GFS — what you configure
+   is what you get, no "source-backed superset" that silently holds more than the
+   config implies — with exactly ONE documented exception: the pinned incremental
+   parent (the most recent snapshot is always kept as the next incremental's base).
 
-2. Gaps no longer force full sends. di-snapsend's `-p` parent had to still exist
-   as a *Snapper* snapshot; if Snapper pruned it during a long offline gap the next
-   run fell back to a full send. snappersend keeps its OWN parent clones in a
-   private tree, immune to Snapper retention, so incrementals survive arbitrary gaps.
+2. Gaps do not force full sends. snappersend keeps its OWN parent clones in a
+   private tree, immune to Snapper retention, so incrementals survive arbitrary gaps
+   even when Snapper has pruned the original snapshot the send was based on.
 
 THE PARENT-PRESERVATION TREE (the central mechanism)
 ----------------------------------------------------
@@ -81,8 +80,8 @@ destination is a SAMPLE at snappersend's run cadence, not a faithful copy of eve
 Snapper snapshot — by design, and what lets retention be WYSIWYG with no tombstones
 (the send path never looks backward, so there is no re-send-of-pruned problem).
 
-BTRFS CORRECTNESS RULES (carried over from di-snapsend — proven, distilled from btrbk)
--------------------------------------------------------------------------------------
+BTRFS CORRECTNESS RULES (proven on real btrfs; distilled from btrbk)
+--------------------------------------------------------------------
 (1) VALID RECEIVED SUBVOLUME: a clean receive is `readonly == true` AND
     `received_uuid` is set; a garbled one is writable with `received_uuid == '-'`.
     Every receive is verified; a garble is deleted and the run treated as failed.

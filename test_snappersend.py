@@ -329,7 +329,7 @@ def test_bucket_keep_yearly_tier(monkeypatch):
 def test_wysiwyg_no_source_backed_survivors(cfg):
     # 10 daily destination snapshots; keep_daily=3, everything else 0. Pure GFS must
     # keep EXACTLY 3 + the pinned parent — NOT extra ones just because a source
-    # snapshot still exists (the old di-snapsend superset behaviour must be gone).
+    # snapshot still exists (there is no "source-backed superset").
     from datetime import datetime
     clones = []
     dest = []

@@ -1,5 +1,8 @@
 # snappersend config — /etc/snappersend/config
 # =============================================================================
+# REQUIRES: Snapper installed and taking timeline snapshots on this (source) host.
+# snappersend replicates Snapper's snapshots; it does not create them.
+#
 # Flat KEY="value" file, the SAME format as Snapper's own config files
 # (/etc/snapper/configs/<name>), parsed by python-dotenv. The retention block uses
 # Snapper's exact TIMELINE_LIMIT_* names so if you run Snapper you already know it.

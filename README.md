@@ -15,8 +15,7 @@ or the network. It shells out to the tools that already solve those:
 btrfs send [-p PARENT] CLONE | [mbuffer |] ssh DEST "sudo btrfs receive DST"
 ```
 
-snappersend is a ground-up rewrite of `di-snapsend`. It exists to fix two things, and
-both fixes are the heart of its design:
+Two design choices are the heart of it:
 
 1. **Retention is WYSIWYG.** The destination keeps **exactly** the GFS policy you
    configure — no hidden "superset", no silently-kept extras. (One documented
@@ -25,6 +24,13 @@ both fixes are the heart of its design:
    clones, immune to Snapper's retention, so an incremental survives an arbitrary
    offline gap (a holiday, a powered-off laptop) instead of falling back to a full
    re-send.
+
+> **Prerequisite: Snapper.** snappersend does **not** create snapshots — it replicates
+> the ones [Snapper](http://snapper.io/) already makes. It assumes Snapper is installed
+> and actively taking timeline snapshots on the source, with a `.snapshots` directory
+> under each configured subvolume's mountpoint (e.g. `/.snapshots`, `/home/.snapshots`).
+> If a subvolume has no readable snapshots, snappersend logs a warning and skips it —
+> there is nothing to send.
 
 ## How it works
 
@@ -118,9 +124,9 @@ snapshots are always kept.
 > incremental base (so the next incremental's `-p` parent still exists). That's the only
 > snapshot kept beyond what the GFS numbers say.
 
-There is **no** "source-backed" union and **no** override logging — unlike di-snapsend,
-the destination never silently holds more than its policy implies. Source snapshots are
-never touched; Snapper owns local retention entirely.
+There is **no** "source-backed" union and **no** override logging: the destination never
+silently holds more than its policy implies. Source snapshots are never touched; Snapper
+owns local retention entirely.
 
 `RETENTION_TIMEZONE` (`local` default, or `utc`) chooses the calendar used for bucket
 boundaries; folder names are always local-time + UTC offset regardless. For the `root`

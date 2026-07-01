@@ -416,21 +416,43 @@ EOF
 sudo systemctl daemon-reload
 ```
 
-**5. Test it** — call the dispatcher directly while sitting at your desktop; a toast should
-appear immediately:
+**5. Test it.** Three checks, cheapest first.
+
+*a) The dispatcher itself* — while sitting at your desktop, a toast should appear
+immediately:
 
 ```sh
 sudo /usr/local/bin/snappersend-notify snappersend.service
 ```
 
-To exercise the *whole* `OnFailure=` chain end to end, force a real failure (point
-snappersend at an unreachable destination so the run exits non-zero, then check the toast
-fired):
+*b) The notifier under systemd* — start the notifier unit the way `OnFailure=` will (as
+root, with no session of its own): this is the real test that the toast still reaches your
+session bus.
 
 ```sh
-sudo SNAPPERSEND_SERVER=10.255.255.1 systemctl start snappersend.service   # will fail
-systemctl --failed | grep snappersend        # confirms it failed
-journalctl -u snappersend-notify@* -n 20      # confirms the notifier ran
+sudo systemctl start snappersend-notify@snappersend.service.service
+sudo journalctl -u 'snappersend-notify@*' -n 20 --no-pager   # shows the notify-send it ran
+```
+
+*c) The full `OnFailure=` link* — make `snappersend.service` actually fail so systemd fires
+the notifier. **Note:** `SNAPPERSEND_SERVER=… systemctl start snappersend.service` does
+**not** work — `systemctl start` runs the unit with the *unit's* environment, not your
+shell's, so the variable never reaches it (it only takes effect when you run the
+`snappersend` binary directly). Instead, drop in a one-off failing override:
+
+```sh
+# temporary: force the service to exit non-zero
+printf '[Service]\nExecStart=\nExecStart=/bin/false\n' | \
+  sudo tee /etc/systemd/system/snappersend.service.d/99-test-fail.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl start snappersend.service                       # fails on purpose
+systemctl is-failed snappersend.service                        # -> failed
+sudo journalctl -u 'snappersend-notify@*' -n 20 --no-pager     # -> the notifier fired
+
+# undo the test override
+sudo rm -f /etc/systemd/system/snappersend.service.d/99-test-fail.conf
+sudo systemctl daemon-reload
+sudo systemctl reset-failed snappersend.service
 ```
 
 Adapt freely: change the wording/urgency, add a second `OnFailure=` for e-mail, or drop

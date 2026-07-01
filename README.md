@@ -166,6 +166,10 @@ snappersend --config PATH   # alternate config (default /etc/snappersend/config)
 snappersend --no-mbuffer    # don't pipe through mbuffer
 snappersend --skip-boot     # skip the /boot + /boot/efi rsync tier
 snappersend -v              # verbose: log every shell command
+
+snappersend setup-dest admin@host   # provision the destination over your admin login
+                                     #   (transport user + scoped sudoers; ships no files)
+snappersend decom-dest  admin@host   # remove that transport config (keeps received data)
 ```
 
 ### `--report` — read-only status & health view
@@ -204,113 +208,74 @@ prevents overlapping runs.
 
 ## Install / first run
 
-snappersend is a single Python script plus its config. The destination gets a
-least-privilege transport: a dedicated `snappersend` user, a scoped sudoers rule, and a
-forced-command SSH filter, so the source key can only ever run the exact
-send/receive/rsync commands snappersend issues — nothing else, even if the key leaks.
+snappersend installs on the **source only** — the destination runs no snappersend code.
+Every remote action is a stock command (`btrfs receive`, `rsync`, `mkdir`, …) invoked as
+`ssh <transport-user> "sudo <command>"`, so the destination needs just a little config,
+which `snappersend setup-dest` writes for you over your own admin login.
 
-There's a small chicken-and-egg: the **destination** needs the **source's** public key,
-but that key doesn't exist until you set up the source. So the order is: prep the
-destination → set up the source (which generates the key) → authorize that key on the
-destination → verify and seed. Each block below is copy-paste; run it from a checkout of
-this repo on the machine named in the heading.
-
-### 1. Destination (the receiver) — as root
+### 1. Source (the sender) — as root
 
 ```sh
-SNAP_USER=snappersend                    # transport user; match SERVER_USER in the config
-RECV_BASE=/srv/snapshots-recv            # MUST be on a Btrfs filesystem; match RECV_BASE
-
-# a) least-privilege transport user + receive area
-sudo useradd --system --create-home --shell /bin/bash "$SNAP_USER" 2>/dev/null || true
-sudo mkdir -p "$RECV_BASE"
-sudo chown "$SNAP_USER:$SNAP_USER" "$RECV_BASE"
-
-# b) scoped sudoers — exactly the commands snappersend runs remotely, nothing more
-#    (if you changed SNAP_USER above, edit the username on the grant line to match)
-sudo tee /etc/sudoers.d/snappersend >/dev/null <<'EOF'
-Cmnd_Alias SNAPPERSEND_CMDS = \
-    /usr/bin/btrfs receive *, \
-    /usr/bin/btrfs subvolume show *, \
-    /usr/bin/btrfs subvolume delete *, \
-    /usr/bin/btrfs property get *, \
-    /usr/bin/mkdir -p *, \
-    /usr/bin/rmdir *, \
-    /usr/bin/ls *, \
-    /usr/bin/ln -sfn *, \
-    /usr/bin/rsync *
-snappersend ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
-Defaults!SNAPPERSEND_CMDS !requiretty
-EOF
-sudo visudo -cf /etc/sudoers.d/snappersend           # must print "parsed OK"
-
-# c) forced-command filter (defense in depth on top of sudoers)
-sudo install -m 0755 snappersend-ssh-filter /usr/local/bin/snappersend-ssh-filter
-
-# d) create the transport user's .ssh (its key is authorized in step 3)
-sudo install -d -m 0700 -o "$SNAP_USER" -g "$SNAP_USER" "/home/$SNAP_USER/.ssh"
-```
-
-### 2. Source (the sender) — as root
-
-```sh
-# a) install snappersend, its one dependency, and the config
 sudo install -m 0755 snappersend /usr/local/bin/snappersend
 sudo apt-get install -y python3-dotenv btrfs-progs openssh-client mbuffer rsync
 sudo install -d -m 0755 /etc/snappersend
 sudo cp -n config.example /etc/snappersend/config
-sudoedit /etc/snappersend/config          # set SERVER_HOST + SUBVOLUMES (+ SERVER_USER/RECV_BASE if you changed them)
-
-# b) load your config values, generate the transport key (root owns it — snappersend runs as root)
-eval "$(sudo grep -E '^(SERVER_HOST|SSH_PORT|SERVER_USER|SSH_KEY|RECV_BASE)=' \
-        /etc/snappersend/config | sed 's/[[:space:]]*#.*//')"
-: "${SSH_PORT:=22}"
-sudo install -d -m 0700 "$(dirname "$SSH_KEY")"
-sudo test -f "$SSH_KEY" || sudo ssh-keygen -t ed25519 -N '' -C "snappersend@$(hostname)" -f "$SSH_KEY"
-
-# c) pin the destination's host key in ROOT's known_hosts (snappersend connects with
-#    BatchMode=yes and never answers prompts, so trust must be pre-recorded, as root)
-sudo install -d -m 0700 /root/.ssh
-sudo sh -c "ssh-keyscan -p '$SSH_PORT' -t ed25519 '$SERVER_HOST' >> /root/.ssh/known_hosts"
-
-# d) print the PUBLIC key — copy this line; you'll authorize it on the destination next
-sudo cat "$SSH_KEY.pub"
+sudoedit /etc/snappersend/config     # set SERVER_HOST + SUBVOLUMES (setup-dest can also
+                                      # create the config for you if it's absent)
 ```
 
-### 3. Destination — authorize the source's key (as root)
+### 2. Provision the destination — one command
 
-Paste the public key printed by step 2d into `PUBKEY` below, then run it on the destination:
+From the source, point `setup-dest` at **your own** sudo-capable login on the destination
+(`admin@host` — not the transport user). It runs as root locally but reaches the
+destination as *you*, like a privileged `ssh-copy-id`:
 
 ```sh
-PUBKEY='ssh-ed25519 AAAA...snappersend@source'          # <-- the line from step 2d
-OPTS='command="/usr/local/bin/snappersend-ssh-filter",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding'
-echo "$OPTS $PUBKEY" | sudo tee -a /home/snappersend/.ssh/authorized_keys >/dev/null
-sudo chown snappersend:snappersend /home/snappersend/.ssh/authorized_keys
-sudo chmod 0600 /home/snappersend/.ssh/authorized_keys
+sudo snappersend setup-dest admin@backup-host
 ```
 
-### 4. Source — verify, then seed (as root)
+That single command: generates the transport key on the source (if absent) and pins the
+destination's host key; then, over your admin SSH session, creates the dedicated transport
+user, installs its `restrict`-hardened `authorized_keys` line and **one** scoped
+`/etc/sudoers.d/snappersend` (with the destination's own binary paths, `visudo`-validated),
+and ensures the receive directory; then verifies the whole transport end-to-end and prints
+`verify: OK`. It ships **no files** to the destination — the entire remote footprint is one
+system user, one sudoers file, and one key line. (The admin account needs passwordless
+sudo, or an active `sudo` session, on the destination.)
+
+### 3. Seed
 
 ```sh
-# prove the whole path in one shot: host key + key auth + forced command + remote sudo.
-# `ls` is in the allowlist, so a clean exit 0 printing the recv path means you're set.
-sudo ssh -i "$SSH_KEY" -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
-     "$SERVER_USER@$SERVER_HOST" "sudo ls -1d $RECV_BASE"
-
 sudo snappersend --dry-run     # read both sides, change nothing — check the plan
 sudo snappersend               # seed (full send per subvol; do it over a wired link)
 ```
 
-If step 4's `ssh` test doesn't print the path:
-- `Host key verification failed` → step 2c didn't run, or the destination's key changed — re-pin.
-- `Permission denied (publickey)` → the key isn't authorized on the destination — recheck step 3.
-- `snappersend-ssh-filter: rejected command` → auth and host key are fine; you just ran a
-  command outside the allowlist (expected for anything but the `sudo ls` test).
-- hangs then `Connection timed out` → wrong `SERVER_HOST`/`SSH_PORT`, or a firewall.
-
 The seed run logs `no shared parent with destination — full send` for each subvolume
 (expected — there's no parent clone yet). After it, `/.snappersend/<subvol>/` holds the
 seed clone, and every later run is a small incremental off the preserved parent.
+
+### Security model & uninstalling the destination
+
+The transport is least-privilege: the scoped `/etc/sudoers.d/snappersend` is the security
+boundary (the key can only run the exact send/receive/rsync commands snappersend issues,
+as root), and `restrict` on the `authorized_keys` line denies the key a pty and any
+forwarding. There is deliberately **no forced-command wrapper script** on the destination —
+one fewer file to install, rot, or forget on removal.
+
+To cleanly remove the destination transport config (transport user + its
+`authorized_keys`, and the sudoers file), run from the source:
+
+```sh
+sudo snappersend decom-dest admin@backup-host        # received data is PRESERVED
+sudo snappersend decom-dest admin@backup-host --purge-data   # also delete THIS host's
+                                                             # received snapshots (asks first)
+```
+
+`decom-dest` never touches the received backups unless you pass `--purge-data`. If the
+`setup-dest`/`verify` transport check fails: `Permission denied (publickey)` means the key
+wasn't authorized (re-run `setup-dest`); `Host key verification failed` means the pinned
+host key changed; a hang then `Connection timed out` means a wrong `SERVER_HOST`/`SSH_PORT`
+or a firewall.
 
 ### systemd wiring — run right after each Snapper timeline snapshot
 

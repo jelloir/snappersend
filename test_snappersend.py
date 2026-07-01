@@ -752,6 +752,117 @@ def test_report_garble_flag(monkeypatch, capsys):
     assert "GARBLE" in garble_line
 
 
+# ============================================================================
+# (9) setup-dest / decom-dest — provisioning builders + CLI wiring (no real SSH)
+# ============================================================================
+
+def test_provision_script_shape():
+    s = ss._provision_script("snappersend", "ssh-ed25519 AAAAKEY comment",
+                             "/srv/snapshots-recv")
+    # restrict-hardened key line — the security posture, no forced-command wrapper.
+    assert "restrict ssh-ed25519 AAAAKEY comment" in s
+    assert "ssh-filter" not in s and "snappersend-ssh-filter" not in s
+    # scoped sudoers, validated, with destination-detected binary paths.
+    assert 'command -v btrfs' in s
+    assert "/etc/sudoers.d/snappersend" in s and "visudo -cf" in s
+    assert "chmod 0440 /etc/sudoers.d/snappersend" in s
+    # dedicated user + receive area; success sentinel.
+    assert "useradd --system --create-home --shell /bin/bash" in s
+    assert "passwd -l" in s
+    assert "/srv/snapshots-recv" in s
+    assert "PROVISION_OK" in s
+
+
+def test_deprovision_script_preserves_data_by_default():
+    s = ss._deprovision_script("snappersend", "/srv/snapshots-recv", "laptop",
+                               purge_data=False)
+    assert "rm -f /etc/sudoers.d/snappersend" in s
+    assert "userdel --remove" in s
+    assert "DECOM_OK" in s
+    # No data destruction without --purge-data.
+    assert "subvolume delete" not in s
+    assert "/srv/snapshots-recv/laptop" not in s
+
+
+def test_deprovision_script_purge_deletes_this_hosts_data_only():
+    s = ss._deprovision_script("snappersend", "/srv/snapshots-recv", "laptop",
+                               purge_data=True)
+    assert "subvolume delete" in s
+    assert "/srv/snapshots-recv/laptop" in s      # scoped to THIS host's subdir
+
+
+def test_admin_ssh_argv_uses_invoking_user_when_root(monkeypatch):
+    monkeypatch.setattr(ss.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "james")
+    argv = ss._admin_ssh_argv("admin", "dest", 22)
+    assert argv[:4] == ["sudo", "-H", "-u", "james"]
+    assert "admin@dest" in argv and "accept-new" in " ".join(argv)
+
+
+def test_admin_ssh_argv_plain_when_not_root(monkeypatch):
+    monkeypatch.setattr(ss.os, "geteuid", lambda: 1000)
+    monkeypatch.setenv("SUDO_USER", "james")
+    argv = ss._admin_ssh_argv("admin", "dest", 2222)
+    assert argv[0] == "ssh" and "sudo" not in argv
+    assert "admin@dest" in argv and "2222" in argv
+
+
+class _CP:
+    def __init__(self, rc, out="", err=""):
+        self.returncode = rc; self.stdout = out; self.stderr = err
+
+
+def test_verify_transport_ok_and_failure(monkeypatch, cfg):
+    cfg2 = ss.Config(server_host="dest", server_user="snappersend",
+                     recv_base="/srv/snapshots-recv")
+    monkeypatch.setattr(ss, "run_remote",
+                        lambda c, cmd, check=True: _CP(0, "/srv/snapshots-recv\n"))
+    ok, msg = ss._verify_transport(cfg2)
+    assert ok and "remote sudo OK" in msg
+    # ssh rc 255 -> transport failure, not "unexpected".
+    monkeypatch.setattr(ss, "run_remote",
+                        lambda c, cmd, check=True: _CP(255, "", "ssh: connect: refused"))
+    ok, msg = ss._verify_transport(cfg2)
+    assert not ok and "transport failure" in msg
+
+
+def test_resolve_admin_parses_user_at_host_and_bare_user():
+    cfg2 = ss.Config(server_host="backup", server_ssh_port=2200)
+
+    class A:
+        admin = "adm@other"
+    assert ss._resolve_admin(A(), cfg2) == ("adm", "other", 2200)
+
+    class B:
+        admin = "adm"                     # bare user -> host from config
+    assert ss._resolve_admin(B(), cfg2) == ("adm", "backup", 2200)
+
+
+def test_ensure_config_writes_when_missing(tmp_path, monkeypatch):
+    p = tmp_path / "cfg"
+    answers = iter(["backup-host", "22", "snappersend",
+                    str(tmp_path / "key"), "/srv/recv", "root:/ home:/home"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    monkeypatch.setattr(ss.sys.stdin, "isatty", lambda: True)
+    assert ss._ensure_config(str(p)) is True
+    cfg = ss.Config(**ss.load_config(str(p)))
+    assert cfg.server_host == "backup-host"
+    assert set(cfg.subvols) == {"root", "home"}
+    # An existing config is never clobbered.
+    before = p.read_text()
+    assert ss._ensure_config(str(p)) is True and p.read_text() == before
+
+
+def test_cli_subcommands_parse():
+    a = ss.build_parser().parse_args(["setup-dest", "james@dest"])
+    assert a.command == "setup-dest" and a.admin == "james@dest"
+    a = ss.build_parser().parse_args(["decom-dest", "--purge-data"])
+    assert a.command == "decom-dest" and a.purge_data is True and a.admin is None
+    # Bare invocation and --report still route to the run/report path (no subcommand).
+    assert getattr(ss.build_parser().parse_args([]), "command", None) is None
+    assert ss.build_parser().parse_args(["--report"]).command is None
+
+
 def test_run_lock_collision(tmp_path, monkeypatch):
     import fcntl
     lock = tmp_path / "snappersend.lock"

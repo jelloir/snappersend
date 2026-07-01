@@ -1535,6 +1535,354 @@ def _report(cfg: Config, args: argparse.Namespace) -> int:
 
 
 # ============================================================================
+# DESTINATION PROVISIONING  (setup-dest / decom-dest — no files shipped to dest)
+# ============================================================================
+# The destination runs no snappersend code: every remote command is a stock tool
+# (`btrfs receive`, `rsync`, `mkdir`, ...) invoked as `ssh <user> "sudo <cmd>"`. So
+# onboarding is pure config: a dedicated transport user, a `restrict`-hardened
+# authorized_keys line, and ONE scoped /etc/sudoers.d/snappersend. There is NO
+# forced-command wrapper script on the destination — the scoped sudoers grant is the
+# security boundary, and `restrict` denies the transport key a pty/forwarding. That
+# keeps the destination footprint to a user + one sudoers file + one key line, all
+# trivially removable by decom-dest (which never touches the received data).
+#
+# setup-dest bootstraps that config over the OPERATOR'S OWN admin login to the
+# destination (like a privileged ssh-copy-id): it must run as root locally (it writes
+# /etc/snappersend and /root/.ssh), but the OUTBOUND admin ssh is executed as the
+# invoking user ($SUDO_USER) so it uses their credentials, not root's.
+
+
+def _admin_ssh_argv(admin_user: str, host: str, port: int) -> list[str]:
+    """ssh argv for the one-time admin bootstrap connection. Runs as the invoking
+    user ($SUDO_USER) when we are root under sudo, so it uses the operator's keys/
+    known_hosts rather than root's. accept-new pins the host on first contact."""
+    base = ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=15", "-p", str(port), f"{admin_user}@{host}"]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        return ["sudo", "-H", "-u", sudo_user, "--"] + base
+    return base
+
+
+def _run_admin_script(admin_user: str, host: str, port: int, script: str):
+    """Pipe `script` to `sudo -n bash -s` on the destination over the admin login.
+    Returns (rc, stdout, stderr). `sudo -n` fails fast (rather than hanging on a
+    password prompt) if the admin account lacks passwordless sudo."""
+    argv = _admin_ssh_argv(admin_user, host, port) + ["sudo -n bash -s"]
+    log_debug("admin: " + " ".join(shlex.quote(a) for a in argv))
+    try:
+        cp = subprocess.run(argv, input=script, text=True, capture_output=True)
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    return cp.returncode, cp.stdout, cp.stderr
+
+
+def _provision_script(user: str, pubkey: str, recv_base: str) -> str:
+    """The bash executed as root on the destination to (idempotently) create the
+    transport user, install its restrict-hardened authorized_keys, write a scoped
+    sudoers with the destination's OWN binary paths (auto-detected), and ensure the
+    receive dir. Emits a final PROVISION_OK line the caller checks for."""
+    authline = "restrict " + pubkey.strip()
+    return f"""set -euo pipefail
+U={shlex.quote(user)}
+RECV_BASE={shlex.quote(recv_base)}
+AUTHLINE={shlex.quote(authline)}
+if ! id "$U" >/dev/null 2>&1; then
+  useradd --system --create-home --shell /bin/bash "$U"
+fi
+passwd -l "$U" >/dev/null 2>&1 || true
+install -d -m 700 -o "$U" -g "$U" "/home/$U/.ssh"
+printf '%s\\n' "$AUTHLINE" > "/home/$U/.ssh/authorized_keys"
+chown "$U:$U" "/home/$U/.ssh/authorized_keys"
+chmod 600 "/home/$U/.ssh/authorized_keys"
+BTRFS="$(command -v btrfs || true)"
+RSYNC="$(command -v rsync || echo /usr/bin/rsync)"
+MKDIR="$(command -v mkdir)"; RMDIR="$(command -v rmdir)"
+LS="$(command -v ls)"; LN="$(command -v ln)"
+if [ -z "$BTRFS" ]; then echo "btrfs not found on destination" >&2; exit 3; fi
+umask 077
+cat > /etc/sudoers.d/snappersend <<SUDOERS
+Cmnd_Alias SNAPPERSEND_CMDS = \\
+    $BTRFS receive *, \\
+    $BTRFS subvolume show *, \\
+    $BTRFS subvolume delete *, \\
+    $BTRFS property get *, \\
+    $MKDIR -p *, \\
+    $RMDIR *, \\
+    $LS *, \\
+    $LN -sfn *, \\
+    $RSYNC *
+$U ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
+Defaults!SNAPPERSEND_CMDS !requiretty
+SUDOERS
+chmod 0440 /etc/sudoers.d/snappersend
+if ! visudo -cf /etc/sudoers.d/snappersend; then
+  rm -f /etc/sudoers.d/snappersend
+  echo "sudoers validation failed" >&2; exit 4
+fi
+mkdir -p "$RECV_BASE"
+chown "$U:$U" "$RECV_BASE"
+echo "PROVISION_OK user=$U btrfs=$BTRFS rsync=$RSYNC"
+"""
+
+
+def _deprovision_script(user: str, recv_base: str, host_subdir: str,
+                        purge_data: bool) -> str:
+    """The bash executed as root on the destination to remove the transport config:
+    the sudoers file and the transport user (with its home, hence its authorized_keys).
+    Received data under RECV_BASE is PRESERVED unless purge_data, which additionally
+    deletes THIS host's received subvolumes. Emits a final DECOM_OK line."""
+    purge = ""
+    if purge_data:
+        hostdir = os.path.join(recv_base, host_subdir)
+        purge = f"""
+HOSTDIR={shlex.quote(hostdir)}
+if [ -d "$HOSTDIR" ]; then
+  for d in "$HOSTDIR"/*/; do
+    [ -d "${{d}}snapshot" ] && btrfs subvolume delete "${{d}}snapshot" 2>/dev/null || true
+    rm -rf "$d" 2>/dev/null || true
+  done
+  rmdir "$HOSTDIR" 2>/dev/null || true
+  echo "purged received data under $HOSTDIR"
+fi
+"""
+    return f"""set -euo pipefail
+U={shlex.quote(user)}
+rm -f /etc/sudoers.d/snappersend
+if id "$U" >/dev/null 2>&1; then
+  userdel --remove "$U" 2>/dev/null || userdel "$U" 2>/dev/null || true
+fi
+{purge}echo "DECOM_OK user=$U"
+"""
+
+
+def _ensure_transport_key(cfg: Config) -> bool:
+    """Generate the passwordless ed25519 transport key at cfg.ssh_key if absent
+    (root-owned tree). Returns True on success/already-present."""
+    if os.path.isfile(cfg.ssh_key):
+        return True
+    keydir = os.path.dirname(cfg.ssh_key)
+    try:
+        os.makedirs(keydir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create key dir {keydir}: {e}", file=sys.stderr)
+        return False
+    cp = run_local(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                    "-C", f"snappersend@{socket.gethostname()}", "-f", cfg.ssh_key],
+                   check=False)
+    if cp.returncode != 0:
+        print(f"ssh-keygen failed: {cp.stderr.strip()}", file=sys.stderr)
+        return False
+    print(f"  generated transport key {cfg.ssh_key}")
+    return True
+
+
+def _pin_host_key(host: str, port: int) -> bool:
+    """Pin the destination's host key into ROOT's known_hosts so the transport
+    (which runs as root with BatchMode) trusts it deterministically. Idempotent:
+    stale entries for the host are removed first."""
+    kh = "/root/.ssh/known_hosts"
+    try:
+        os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    run_local(["ssh-keygen", "-R", host, "-f", kh], check=False)
+    scan = run_local(["ssh-keyscan", "-p", str(port), host], check=False)
+    if scan.returncode == 0 and scan.stdout.strip():
+        with open(kh, "a", encoding="utf-8") as f:
+            f.write(scan.stdout)
+        os.chmod(kh, 0o600)
+        return True
+    print(f"  WARN: ssh-keyscan of {host} returned nothing; transport may prompt on "
+          "host key", file=sys.stderr)
+    return False
+
+
+def _verify_transport(cfg: Config):
+    """Prove the transport end-to-end (host key + key auth + remote sudo) with an
+    allowlisted `sudo ls` of RECV_BASE. Returns (ok, message)."""
+    cp = run_remote(cfg, f"sudo ls -1d {shlex.quote(cfg.recv_base)}", check=False)
+    if cp.returncode == 0 and cfg.recv_base in (cp.stdout or ""):
+        return True, (f"{cfg.server_user}@{cfg.server_host} reachable, remote sudo OK, "
+                      f"{cfg.recv_base} present")
+    if _is_ssh_transport_failure(cp):
+        detail = (cp.stderr or "").strip().splitlines()
+        return False, "ssh transport failure: " + (detail[-1] if detail else
+                                                    f"exit {cp.returncode}")
+    return False, f"unexpected (rc={cp.returncode}): {(cp.stderr or '').strip()}"
+
+
+def _resolve_admin(args: argparse.Namespace, cfg: Config):
+    """Work out (admin_user, host, port) for the bootstrap login from the optional
+    `admin` positional (user@host or bare user) or an interactive prompt. The host
+    defaults to cfg.server_host; the transport still targets cfg.server_host."""
+    admin = getattr(args, "admin", None)
+    if not admin:
+        if not sys.stdin.isatty():
+            print("no admin login given and not a tty; pass e.g. "
+                  f"'setup-dest admin@{cfg.server_host}'", file=sys.stderr)
+            return None
+        admin = input(f"Admin login on {cfg.server_host} (user@host, or just user): ").strip()
+    if not admin:
+        return None
+    if "@" in admin:
+        user, host = admin.split("@", 1)
+    else:
+        user, host = admin, cfg.server_host
+    return user, host or cfg.server_host, cfg.server_ssh_port
+
+
+_CONFIG_TEMPLATE = """\
+# snappersend config — written by `snappersend setup-dest`
+SERVER_HOST="{server_host}"
+SSH_PORT="{ssh_port}"
+SERVER_USER="{server_user}"
+SSH_KEY="{ssh_key}"
+RECV_BASE="{recv_base}"
+USE_MBUFFER="yes"
+BOOT_ENABLED="yes"
+BOOT_PATHS="/boot /boot/efi"
+SUBVOLUMES="{subvolumes}"
+PARENT_TREE_BASE="/.snappersend"
+PARENT_KEEP="2"
+RETENTION_TIMEZONE="local"
+TIMELINE_LIMIT_HOURLY="24"
+TIMELINE_LIMIT_DAILY="14"
+TIMELINE_LIMIT_WEEKLY="8"
+TIMELINE_LIMIT_MONTHLY="6"
+TIMELINE_LIMIT_YEARLY="2"
+"""
+
+
+def _ensure_config(path: str) -> bool:
+    """If the config is absent, interactively gather the essentials and write it, so
+    setup-dest doubles as first-run onboarding. Returns True if a usable config exists
+    afterwards. Never clobbers an existing config."""
+    if os.path.isfile(path):
+        return True
+    if not sys.stdin.isatty():
+        print(f"config {path} not found and not a tty to create it", file=sys.stderr)
+        return False
+    print(f"No config at {path} — let's create one.")
+
+    def ask(prompt, default):
+        v = input(f"  {prompt} [{default}]: ").strip()
+        return v or default
+
+    server_host = ask("Destination host (SERVER_HOST)", "")
+    if not server_host:
+        print("SERVER_HOST is required", file=sys.stderr)
+        return False
+    text = _CONFIG_TEMPLATE.format(
+        server_host=server_host,
+        ssh_port=ask("SSH port", "22"),
+        server_user=ask("Transport user (SERVER_USER)", "snappersend"),
+        ssh_key=ask("Transport SSH key path", "/etc/snappersend/ssh/id_ed25519"),
+        recv_base=ask("Receive base on destination (btrfs)", "/srv/snapshots-recv"),
+        subvolumes=ask("Subvolumes (name:mountpoint ...)", "root:/ home:/home"),
+    )
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"could not write {path}: {e}", file=sys.stderr)
+        return False
+    print(f"  wrote {path}")
+    return True
+
+
+def cmd_setup_dest(args: argparse.Namespace) -> int:
+    """Onboard/repair the destination: ensure config + transport key, pin the host
+    key, provision the destination over the admin login, then verify end-to-end."""
+    if os.geteuid() != 0:
+        print("setup-dest must run as root (writes /etc/snappersend + /root/.ssh). "
+              "Try: sudo snappersend setup-dest <admin@host>", file=sys.stderr)
+        return 2
+    if not _ensure_config(args.config):
+        return 2
+    try:
+        cfg = Config(**load_config(args.config))
+    except Exception as e:
+        print(f"invalid config {args.config}: {e}", file=sys.stderr)
+        return 2
+
+    resolved = _resolve_admin(args, cfg)
+    if not resolved:
+        return 2
+    admin_user, host, port = resolved
+
+    if not _ensure_transport_key(cfg):
+        return 2
+    try:
+        pub = open(cfg.ssh_key + ".pub", encoding="utf-8").read().strip()
+    except OSError as e:
+        print(f"cannot read public key {cfg.ssh_key}.pub: {e}", file=sys.stderr)
+        return 2
+
+    _pin_host_key(cfg.server_host, cfg.server_ssh_port)
+
+    print(f"Provisioning {cfg.server_user}@{cfg.server_host} (recv {cfg.recv_base}) "
+          f"via admin login {admin_user}@{host} ...")
+    rc, out, err = _run_admin_script(admin_user, host, port,
+                                     _provision_script(cfg.server_user, pub, cfg.recv_base))
+    if rc != 0 or "PROVISION_OK" not in out:
+        print(f"  provisioning FAILED (rc={rc}): {(err or out).strip()}", file=sys.stderr)
+        return 1
+    print("  " + out.strip().splitlines()[-1])
+
+    ok, msg = _verify_transport(cfg)
+    print(("  verify: OK — " + msg) if ok else ("  verify: FAILED — " + msg))
+    if ok:
+        print(f"Done. Seed with:  sudo snappersend --dry-run   (then)  sudo snappersend")
+    return 0 if ok else 1
+
+
+def cmd_decom_dest(args: argparse.Namespace) -> int:
+    """Remove the destination transport config (user + sudoers + key line) over the
+    admin login. Received data is preserved unless --purge-data."""
+    if os.geteuid() != 0:
+        print("decom-dest must run as root. Try: sudo snappersend decom-dest <admin@host>",
+              file=sys.stderr)
+        return 2
+    try:
+        cfg = Config(**load_config(args.config))
+    except FileNotFoundError:
+        print(f"config not found: {args.config}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"invalid config {args.config}: {e}", file=sys.stderr)
+        return 2
+
+    resolved = _resolve_admin(args, cfg)
+    if not resolved:
+        return 2
+    admin_user, host, port = resolved
+
+    if args.purge_data:
+        print(f"WARNING: --purge-data will DELETE this host's received snapshots under "
+              f"{cfg.recv_base}/{socket.gethostname()} on {cfg.server_host}.")
+        if sys.stdin.isatty():
+            if input("Type 'purge' to confirm: ").strip() != "purge":
+                print("aborted."); return 1
+
+    script = _deprovision_script(cfg.server_user, cfg.recv_base,
+                                 socket.gethostname(), args.purge_data)
+    print(f"Decommissioning {cfg.server_user}@{cfg.server_host} via admin login "
+          f"{admin_user}@{host} ...")
+    rc, out, err = _run_admin_script(admin_user, host, port, script)
+    if rc != 0 or "DECOM_OK" not in out:
+        print(f"  decom FAILED (rc={rc}): {(err or out).strip()}", file=sys.stderr)
+        return 1
+    for line in out.strip().splitlines():
+        if line != "DECOM_OK user=" + cfg.server_user:
+            print("  " + line)
+    print(f"  removed transport user + sudoers on {cfg.server_host}"
+          + ("" if args.purge_data else "; received data preserved"))
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -1542,14 +1890,22 @@ def _truthy(v: Optional[str]) -> bool:
     return v not in (None, "", "0", "false", "False", "no", "off")
 
 
+def _add_config_flag(parser, suppress: bool = False) -> None:
+    """--config, shared by the top level and each subcommand. Subcommand copies use
+    SUPPRESS so putting --config before the subcommand isn't overwritten by a default."""
+    parser.add_argument(
+        "--config",
+        default=(argparse.SUPPRESS if suppress
+                 else os.environ.get("SNAPPERSEND_CONFIG", "/etc/snappersend/config")),
+        help="config file (default /etc/snappersend/config, $SNAPPERSEND_CONFIG)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="snappersend",
         description="Snapper-native Btrfs snapshot replication with a parent tree.",
     )
-    p.add_argument("--config",
-                   default=os.environ.get("SNAPPERSEND_CONFIG", "/etc/snappersend/config"),
-                   help="config file (default /etc/snappersend/config, $SNAPPERSEND_CONFIG)")
+    _add_config_flag(p)
     p.add_argument("--server", "--dest", "--destination", default=None,
                    help="override the destination host from config ($SNAPPERSEND_SERVER)")
     p.add_argument("--subvol", default=None,
@@ -1564,8 +1920,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the non-Btrfs /boot + /boot/efi rsync tier")
     p.add_argument("--no-mbuffer", action="store_true",
                    help="do not pipe through mbuffer even if configured")
-    p.add_argument("-v", "--verbose", action="store_true",
+    p.add_argument("-v", "--verbose", action="store_true", default=False,
                    help="log every shell command and extra detail")
+
+    sub = p.add_subparsers(dest="command")
+
+    sd = sub.add_parser("setup-dest",
+                        help="provision the destination over an admin SSH login "
+                             "(creates transport user + scoped sudoers; ships no files)")
+    sd.add_argument("admin", nargs="?",
+                    help="admin login on the destination, user@host (or bare user; "
+                         "prompted if omitted). Your OWN sudo-capable account there.")
+    _add_config_flag(sd, suppress=True)
+    sd.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+                    help="verbose")
+
+    dd = sub.add_parser("decom-dest",
+                        help="remove the destination transport config (preserves "
+                             "received data unless --purge-data)")
+    dd.add_argument("admin", nargs="?",
+                    help="admin login on the destination, user@host (prompted if omitted)")
+    dd.add_argument("--purge-data", action="store_true",
+                    help="ALSO delete THIS host's received snapshots on the destination "
+                         "(irreversible; asks for confirmation)")
+    _add_config_flag(dd, suppress=True)
+    dd.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+                    help="verbose")
+
     return p
 
 
@@ -1573,7 +1954,15 @@ def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
 
     global _VERBOSE
-    _VERBOSE = args.verbose
+    _VERBOSE = getattr(args, "verbose", False)
+    if not hasattr(args, "config"):
+        args.config = os.environ.get("SNAPPERSEND_CONFIG", "/etc/snappersend/config")
+
+    command = getattr(args, "command", None)
+    if command == "setup-dest":
+        return cmd_setup_dest(args)
+    if command == "decom-dest":
+        return cmd_decom_dest(args)
 
     try:
         kwargs = load_config(args.config)

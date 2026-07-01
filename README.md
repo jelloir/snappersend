@@ -188,8 +188,43 @@ identical.
    ```
 2. Write `/etc/snappersend/config` from `config.example`; set `SERVER_HOST` and your
    `SUBVOLUMES`.
-3. Make sure the source can reach the destination over the transport key (host key
-   pinned in root's `known_hosts`).
+3. **Make the source reach the destination over the transport key.** snappersend runs as
+   **root** and connects with `BatchMode=yes` (see `ssh_argv`), so it never answers
+   prompts: the destination's **host key must already be pinned in root's
+   `known_hosts`**, and the private key must authenticate non-interactively. Do it once:
+
+   ```sh
+   # Load the values you just configured (root's shell — that's who snappersend runs as).
+   eval "$(sudo grep -E '^(SERVER_HOST|SSH_PORT|SERVER_USER|SSH_KEY|RECV_BASE)=' \
+           /etc/snappersend/config | sed 's/[[:space:]]*#.*//')"
+   : "${SSH_PORT:=22}" "${RECV_BASE:=/srv/snapshots-recv}"
+
+   # 3a. Pin the destination's host key in ROOT's known_hosts (fetch it, then VERIFY the
+   #     fingerprint out-of-band against the destination before you trust it).
+   sudo install -d -m 0700 /root/.ssh
+   ssh-keyscan -p "$SSH_PORT" "$SERVER_HOST" 2>/dev/null | sudo tee -a /root/.ssh/known_hosts >/dev/null
+   sudo ssh-keygen -F "$SERVER_HOST" -l          # prints the fingerprint you just pinned
+
+   # 3b. Transport key. Reuse di-snapsend's key if it's already there; only generate one
+   #     if you're setting up fresh. The destination's authorized_keys forced-command +
+   #     scoped sudoers are part of the di-snapsend destination provisioning (reused as-is
+   #     — a plain `ssh-copy-id` would drop the forced command, so add the PUBLIC half to
+   #     the transport user's authorized_keys WITH the command="…" prefix, not bare).
+   sudo test -f "$SSH_KEY" && echo "reusing $SSH_KEY" || \
+     sudo ssh-keygen -t ed25519 -N '' -C snappersend -f "$SSH_KEY"
+
+   # 3c. Prove the whole path — host key + key auth + forced command + remote sudo.
+   #     `ls` is inside the forced-command allowlist, so a clean exit 0 means you're set:
+   sudo ssh -i "$SSH_KEY" -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+        "$SERVER_USER@$SERVER_HOST" "sudo ls -1d $RECV_BASE"
+   ```
+
+   Reading the result of 3c:
+   - **exit 0, prints the path** → good, snappersend can transport.
+   - `Host key verification failed` → 3a didn't run (or the key changed); re-pin.
+   - `Permission denied (publickey)` → the public half isn't in the transport user's
+     `authorized_keys` on the destination (see 3b).
+   - hangs then `Connection timed out` → wrong `SERVER_HOST`/`SSH_PORT` or a firewall.
 4. **First run** does a **full send** per subvolume, which **seeds the parent tree**.
    Do the seed over a wired link if you can; subsequent incrementals are small.
    ```sh

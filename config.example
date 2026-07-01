@@ -12,7 +12,7 @@
 # ---- Destination transport ---------------------------------------------------
 SERVER_HOST="dest-host"                       # REQUIRED — the receive end (edit this)
 SSH_PORT="22"
-SERVER_USER="snapsend"                        # dedicated least-privilege transport user
+SERVER_USER="snappersend"                     # dedicated least-privilege transport user
 SSH_KEY="/etc/snappersend/ssh/id_ed25519"
 RECV_BASE="/srv/snapshots-recv"               # -> <RECV_BASE>/<this-hostname>/<subvol>/...
 USE_MBUFFER="yes"                             # smooth throughput + a live rate readout

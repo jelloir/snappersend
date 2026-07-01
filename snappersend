@@ -280,7 +280,7 @@ class Config:
     (--dry-run, --subvol, --no-mbuffer, --server) override at the CLI/env layer."""
     server_host: str
     server_ssh_port: int = 22
-    server_user: str = "snapsend"       # dedicated least-priv transport user
+    server_user: str = "snappersend"    # dedicated least-priv transport user
     ssh_key: str = "/etc/snappersend/ssh/id_ed25519"
     recv_base: str = "/srv/snapshots-recv"
     # subvol-name -> {"mountpoint": str}. recv_dir is composed at runtime as

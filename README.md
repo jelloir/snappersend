@@ -176,7 +176,7 @@ prevents overlapping runs.
 ## Install / first run
 
 snappersend is a single Python script plus its config. The destination gets a
-least-privilege transport: a dedicated `snapsend` user, a scoped sudoers rule, and a
+least-privilege transport: a dedicated `snappersend` user, a scoped sudoers rule, and a
 forced-command SSH filter, so the source key can only ever run the exact
 send/receive/rsync commands snappersend issues — nothing else, even if the key leaks.
 
@@ -189,7 +189,7 @@ this repo on the machine named in the heading.
 ### 1. Destination (the receiver) — as root
 
 ```sh
-SNAP_USER=snapsend                       # transport user; match SERVER_USER in the config
+SNAP_USER=snappersend                    # transport user; match SERVER_USER in the config
 RECV_BASE=/srv/snapshots-recv            # MUST be on a Btrfs filesystem; match RECV_BASE
 
 # a) least-privilege transport user + receive area
@@ -210,7 +210,7 @@ Cmnd_Alias SNAPPERSEND_CMDS = \
     /usr/bin/ls *, \
     /usr/bin/ln -sfn *, \
     /usr/bin/rsync *
-snapsend ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
+snappersend ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
 Defaults!SNAPPERSEND_CMDS !requiretty
 EOF
 sudo visudo -cf /etc/sudoers.d/snappersend           # must print "parsed OK"
@@ -255,9 +255,9 @@ Paste the public key printed by step 2d into `PUBKEY` below, then run it on the 
 ```sh
 PUBKEY='ssh-ed25519 AAAA...snappersend@source'          # <-- the line from step 2d
 OPTS='command="/usr/local/bin/snappersend-ssh-filter",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding'
-echo "$OPTS $PUBKEY" | sudo tee -a /home/snapsend/.ssh/authorized_keys >/dev/null
-sudo chown snapsend:snapsend /home/snapsend/.ssh/authorized_keys
-sudo chmod 0600 /home/snapsend/.ssh/authorized_keys
+echo "$OPTS $PUBKEY" | sudo tee -a /home/snappersend/.ssh/authorized_keys >/dev/null
+sudo chown snappersend:snappersend /home/snappersend/.ssh/authorized_keys
+sudo chmod 0600 /home/snappersend/.ssh/authorized_keys
 ```
 
 ### 4. Source — verify, then seed (as root)

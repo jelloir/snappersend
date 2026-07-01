@@ -240,8 +240,8 @@ user, installs its `restrict`-hardened `authorized_keys` line and **one** scoped
 `/etc/sudoers.d/snappersend` (with the destination's own binary paths, `visudo`-validated),
 and ensures the receive directory; then verifies the whole transport end-to-end and prints
 `verify: OK`. It ships **no files** to the destination — the entire remote footprint is one
-system user, one sudoers file, and one key line. (The admin account needs passwordless
-sudo, or an active `sudo` session, on the destination.)
+system user, one sudoers file, and one key line. If your admin account's `sudo` on the
+destination needs a password, it is prompted for on your terminal (run it interactively).
 
 ### 3. Seed
 

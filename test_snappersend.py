@@ -812,6 +812,45 @@ class _CP:
         self.returncode = rc; self.stdout = out; self.stderr = err
 
 
+def test_run_admin_script_interactive_allows_sudo_password(monkeypatch):
+    # A tty run must NOT use `sudo -n` (which fails when a password is required); it
+    # forces a remote pty (-tt) and lets sudo prompt. Script goes base64 in the ARG,
+    # keeping stdin free for the password.
+    monkeypatch.setattr(ss.sys.stdin, "isatty", lambda: True)
+    captured = {}
+
+    def fake_run(argv, *a, **k):
+        captured["argv"] = argv
+        captured["kwargs"] = k
+        return _CP(0)
+    monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    rc, out, err = ss._run_admin_script("adm", "dest", 22, "echo hi")
+    remote = captured["argv"][-1]
+    assert "-tt" in captured["argv"]
+    assert "sudo -n" not in remote and "| sudo bash" in remote
+    assert "base64 -d" in remote                       # script passed as data, not stdin
+    assert "capture_output" not in captured["kwargs"]  # terminal inherited
+    assert rc == 0
+
+
+def test_run_admin_script_noninteractive_uses_sudo_n(monkeypatch):
+    # No tty (cron/CI): capture output and require passwordless sudo (`sudo -n`).
+    monkeypatch.setattr(ss.sys.stdin, "isatty", lambda: False)
+    captured = {}
+
+    def fake_run(argv, *a, **k):
+        captured["argv"] = argv
+        captured["kwargs"] = k
+        return _CP(0, "PROVISION_OK\n")
+    monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    rc, out, err = ss._run_admin_script("adm", "dest", 22, "echo hi")
+    remote = captured["argv"][-1]
+    assert "-tt" not in captured["argv"]
+    assert "sudo -n bash" in remote
+    assert captured["kwargs"].get("capture_output") is True
+    assert out == "PROVISION_OK\n"
+
+
 def test_verify_transport_ok_and_failure(monkeypatch, cfg):
     cfg2 = ss.Config(server_host="dest", server_user="snappersend",
                      recv_base="/srv/snapshots-recv")

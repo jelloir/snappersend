@@ -98,6 +98,7 @@ BTRFS CORRECTNESS RULES (carried over from di-snapsend — proven, distilled fro
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import os
@@ -1552,12 +1553,18 @@ def _report(cfg: Config, args: argparse.Namespace) -> int:
 # invoking user ($SUDO_USER) so it uses their credentials, not root's.
 
 
-def _admin_ssh_argv(admin_user: str, host: str, port: int) -> list[str]:
+def _admin_ssh_argv(admin_user: str, host: str, port: int,
+                    tty: bool = False) -> list[str]:
     """ssh argv for the one-time admin bootstrap connection. Runs as the invoking
     user ($SUDO_USER) when we are root under sudo, so it uses the operator's keys/
-    known_hosts rather than root's. accept-new pins the host on first contact."""
-    base = ["ssh", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=15", "-p", str(port), f"{admin_user}@{host}"]
+    known_hosts rather than root's. accept-new pins the host on first contact. `tty`
+    forces a remote pseudo-terminal (-tt) so a destination `sudo` can prompt for a
+    password — the common case; passwordless sudo is only our test setup."""
+    base = ["ssh"]
+    if tty:
+        base.append("-tt")
+    base += ["-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=15", "-p", str(port), f"{admin_user}@{host}"]
     sudo_user = os.environ.get("SUDO_USER")
     if os.geteuid() == 0 and sudo_user and sudo_user != "root":
         return ["sudo", "-H", "-u", sudo_user, "--"] + base
@@ -1565,16 +1572,31 @@ def _admin_ssh_argv(admin_user: str, host: str, port: int) -> list[str]:
 
 
 def _run_admin_script(admin_user: str, host: str, port: int, script: str):
-    """Pipe `script` to `sudo -n bash -s` on the destination over the admin login.
-    Returns (rc, stdout, stderr). `sudo -n` fails fast (rather than hanging on a
-    password prompt) if the admin account lacks passwordless sudo."""
-    argv = _admin_ssh_argv(admin_user, host, port) + ["sudo -n bash -s"]
+    """Run `script` as root on the destination over the admin login. Returns
+    (rc, stdout, stderr).
+
+    The script is passed base64-encoded as a command ARGUMENT (not on stdin) so the
+    destination's `sudo` can read a password from the terminal while bash reads the
+    script from the pipe. Interactively (a tty) we allocate a remote pty and INHERIT
+    the terminal so the sudo prompt is shown and answerable — success is then judged by
+    exit code. Non-interactively (cron/CI, no tty) we use `sudo -n` and CAPTURE output;
+    that path requires passwordless sudo."""
+    b64 = base64.b64encode(script.encode()).decode()
+    interactive = sys.stdin.isatty()
+    sudo = "sudo" if interactive else "sudo -n"
+    remote = f"printf %s {shlex.quote(b64)} | base64 -d | {sudo} bash"
+    argv = _admin_ssh_argv(admin_user, host, port, tty=interactive) + [remote]
     log_debug("admin: " + " ".join(shlex.quote(a) for a in argv))
     try:
-        cp = subprocess.run(argv, input=script, text=True, capture_output=True)
+        if interactive:
+            # Inherit the terminal so `sudo` can prompt; we can't also capture stdout,
+            # so success is the exit code (the remote script is `set -euo pipefail`).
+            cp = subprocess.run(argv)
+            return cp.returncode, "", ""
+        cp = subprocess.run(argv, text=True, capture_output=True)
+        return cp.returncode, cp.stdout, cp.stderr
     except FileNotFoundError as e:
         return 127, "", str(e)
-    return cp.returncode, cp.stdout, cp.stderr
 
 
 def _provision_script(user: str, pubkey: str, recv_base: str) -> str:
@@ -1826,10 +1848,15 @@ def cmd_setup_dest(args: argparse.Namespace) -> int:
           f"via admin login {admin_user}@{host} ...")
     rc, out, err = _run_admin_script(admin_user, host, port,
                                      _provision_script(cfg.server_user, pub, cfg.recv_base))
-    if rc != 0 or "PROVISION_OK" not in out:
-        print(f"  provisioning FAILED (rc={rc}): {(err or out).strip()}", file=sys.stderr)
+    # Interactive runs return no captured output (terminal inherited so sudo can
+    # prompt); success is the exit code. When captured (non-interactive), also confirm
+    # the sentinel and echo the detail line.
+    if rc != 0 or (out and "PROVISION_OK" not in out):
+        print(f"  provisioning FAILED (rc={rc}): {(err or out).strip() or 'see above'}",
+              file=sys.stderr)
         return 1
-    print("  " + out.strip().splitlines()[-1])
+    if out:
+        print("  " + out.strip().splitlines()[-1])
 
     ok, msg = _verify_transport(cfg)
     print(("  verify: OK — " + msg) if ok else ("  verify: FAILED — " + msg))
@@ -1871,11 +1898,12 @@ def cmd_decom_dest(args: argparse.Namespace) -> int:
     print(f"Decommissioning {cfg.server_user}@{cfg.server_host} via admin login "
           f"{admin_user}@{host} ...")
     rc, out, err = _run_admin_script(admin_user, host, port, script)
-    if rc != 0 or "DECOM_OK" not in out:
-        print(f"  decom FAILED (rc={rc}): {(err or out).strip()}", file=sys.stderr)
+    if rc != 0 or (out and "DECOM_OK" not in out):
+        print(f"  decom FAILED (rc={rc}): {(err or out).strip() or 'see above'}",
+              file=sys.stderr)
         return 1
     for line in out.strip().splitlines():
-        if line != "DECOM_OK user=" + cfg.server_user:
+        if line and line != "DECOM_OK user=" + cfg.server_user:
             print("  " + line)
     print(f"  removed transport user + sudoers on {cfg.server_host}"
           + ("" if args.purge_data else "; received data preserved"))

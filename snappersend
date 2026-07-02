@@ -80,6 +80,18 @@ destination is a SAMPLE at snappersend's run cadence, not a faithful copy of eve
 Snapper snapshot — by design, and what lets retention be WYSIWYG with no tombstones
 (the send path never looks backward, so there is no re-send-of-pruned problem).
 
+THE BOOT TIER (non-Btrfs sources: /boot ext4, /boot/efi FAT32)
+--------------------------------------------------------------
+`btrfs send` can't carry non-Btrfs sources, so rsync is the transport and the
+DESTINATION (which is Btrfs) does the versioning: each boot path syncs into a live
+`mirror` subvolume inside a per-path parent dir, and a read-only snapshot of the
+mirror is taken as a sibling <UTC-STAMP> version — the same parent/backups/.latest
+layout, GFS retention (through the same bucketing loop), and idempotence as the
+snapshot tiers: a version is created only when the sync actually CHANGED the mirror
+(rsync --itemize-changes is the detector), so an unchanged re-run creates nothing.
+The tier is independent and fail-safe: every failure warns and continues, never
+aborting the snapshot tiers. See the BOOT TIER section for the layout diagram.
+
 BTRFS CORRECTNESS RULES (proven on real btrfs; distilled from btrbk)
 --------------------------------------------------------------------
 (1) VALID RECEIVED SUBVOLUME: a clean receive is `readonly == true` AND
@@ -305,15 +317,18 @@ class Config:
     parent_tree_base: str = "/.snappersend"
     parent_keep: int = 2                # live parent + one slot of redundancy
 
-    # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd into a live-mirror
-    # Btrfs SUBVOLUME on the destination, which is then snapshotted into
-    # <name>.versions/<STAMP> after each clean sync — same GFS-versioned model
-    # as the snapshot tiers, with rsync as the transport.
+    # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd into the live
+    # `mirror` subvolume inside <recv_base>/<host>/<name>/, which is snapshotted
+    # to a sibling <STAMP> version when a clean sync CHANGED it — same layout
+    # shape, GFS retention, and idempotence as the snapshot tiers, with rsync
+    # as the transport. See the BOOT TIER section.
     boot_backup_enabled: bool = True
     boot_paths: tuple = ("/boot", "/boot/efi")
 
-    def retention_for(self, subvol_name: str) -> dict:
-        return self.retention.get(subvol_name, self.retention["default"])
+    def retention_for(self, name: str) -> dict:
+        """Effective GFS policy for a subvol OR a boot-path name (load_config
+        stores boot-path overrides in the same dict under _boot_name keys)."""
+        return self.retention.get(name, self.retention["default"])
 
     def recv_dir_for(self, host: str, subvol_name: str) -> str:
         return os.path.join(self.recv_base, host, subvol_name)
@@ -441,7 +456,7 @@ def load_config(path: str = "/etc/snappersend/config") -> dict:
     retention = {"default": default_keep}
     names = list(kwargs.get("subvols", {"root": 0, "home": 0}).keys())
     # Boot-path versions use the same override scheme, named by the path's derived
-    # mirror name with '-' -> '_' (BOOT_TIMELINE_LIMIT_*, BOOT_EFI_TIMELINE_LIMIT_*).
+    # parent-dir name with '-' -> '_' (BOOT_TIMELINE_LIMIT_*, BOOT_EFI_TIMELINE_LIMIT_*).
     names += [_boot_name(p) for p in kwargs.get("boot_paths", ("/boot", "/boot/efi"))]
     for name in names:
         merged = _tier_override(d, f"{name.upper().replace('-', '_')}_", default_keep)
@@ -2376,7 +2391,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "health, and each boot path's mirror + versions. Mutates "
                         "nothing; mutually exclusive with a real run.")
     p.add_argument("--skip-boot", action="store_true",
-                   help="skip the non-Btrfs /boot + /boot/efi rsync tier")
+                   help="skip the non-Btrfs boot tier (BOOT_PATHS rsync mirrors "
+                        "+ their destination-side versions)")
     p.add_argument("--no-mbuffer", action="store_true",
                    help="do not pipe through mbuffer even if configured")
     p.add_argument("-v", "--verbose", action="store_true", default=False,

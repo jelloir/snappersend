@@ -79,7 +79,7 @@ TIMELINE_LIMIT_YEARLY="2"
 ROOT_TIMELINE_LIMIT_DAILY="30"
 ROOT_TIMELINE_LIMIT_MONTHLY="12"
 
-# Boot-path versions take the same scheme, named by the path's mirror name
+# Boot-path versions take the same scheme, named by the path's parent-dir name
 # uppercased with '-' -> '_' (so /boot -> BOOT_..., /boot/efi -> BOOT_EFI_...).
 # Note: a Btrfs subvol literally named "boot" would share the BOOT_ prefix.
 #BOOT_TIMELINE_LIMIT_HOURLY="0"

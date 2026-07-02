@@ -8,8 +8,11 @@ the bulk of this file drives the real `replicate_subvol` orchestration against a
 in-memory fake of the two stateful worlds it touches — the destination's received
 snapshots and the source's parent-clone tree — by monkeypatching the btrfs/ssh IO
 boundary. The pure logic (correlation, WYSIWYG GFS incl. yearly, config parsing) is
-unit-tested directly. Real end-to-end btrfs send/receive is covered separately by the
-VM validation (see the build report), not here.
+unit-tested directly. The boot tier (sections 10-11) is driven the same way: the real
+boot_backup/migration/prune/report code against a scripted destination (_BootRemote),
+covering layout migration, change-gated versioning, and retention through the shared
+bucketing loop. Real end-to-end btrfs send/receive and rsync are covered separately by
+the VM validation (see the build report), not here.
 """
 
 import importlib.machinery

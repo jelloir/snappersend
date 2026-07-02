@@ -131,7 +131,40 @@ owns local retention entirely.
 `RETENTION_TIMEZONE` (`local` default, or `utc`) chooses the calendar used for bucket
 boundaries; folder names are always local-time + UTC offset regardless. For the `root`
 subvolume, snappersend also avoids orphaning half of an apt pre/post snapshot pair (a
-small nicety that composes fine with pure GFS).
+small nicety that composes fine with pure GFS). The boot tier's versions (below) go
+through the **same** GFS bucketing loop and policy, so the two tiers can never drift.
+
+## The boot tier — versioned rsync mirrors
+
+`/boot` (ext4) and `/boot/efi` (FAT32) aren't Btrfs, so `btrfs send` can't carry them.
+Instead **rsync is the transport and the destination does the versioning**: each
+`BOOT_PATHS` entry syncs into a live `mirror` subvolume inside a per-path parent
+directory, and after a clean sync that **actually changed the mirror** the destination
+takes a read-only snapshot of it as a sibling version. The layout deliberately matches
+the snapshot tiers — parent folder, dated backups below, a `.latest` symlink — just
+without the uuid/num that only the send chain needs:
+
+```
+<RECV_BASE>/<hostname>/boot/            (and boot-efi/, and any future BOOT_PATHS entry)
+    mirror                              live rsync target (subvolume)
+    20260702T092948Z                    read-only versions (UTC stamps)
+    boot.latest -> …/20260702T092948Z   newest version
+```
+
+- **Same idempotence as the snapshot tiers.** rsync runs with `--itemize-changes`; a
+  version is created only when the sync transferred/deleted something (or no version
+  exists yet). Re-running snappersend when nothing changed creates nothing anywhere.
+- **Versions only of fully-synced mirrors.** A failed rsync (any rc other than 0/24)
+  never gets a version, so the newest version always represents a complete sync.
+- **Retention** uses the default `TIMELINE_LIMIT_*` block, overridable per path with
+  the parent-dir name uppercased (`-` → `_`): `BOOT_TIMELINE_LIMIT_*`,
+  `BOOT_EFI_TIMELINE_LIMIT_*`. Undatable version names are never deleted, and the live
+  mirror is never a prune candidate.
+- **FAT32 mtimes** (2-second granularity on the ESP) are handled automatically:
+  vfat/msdos sources get rsync `--modify-window=1`; ext4 stays exact.
+- **Fail-safe and independent**: any boot-tier failure warns and continues — it never
+  aborts the snapshot tiers. Pre-versioning plain-dir mirrors from older snappersend
+  are migrated to this layout automatically (one-time, in place, content preserved).
 
 ## Configuration
 
@@ -144,7 +177,8 @@ main). The retention block uses Snapper's exact `TIMELINE_LIMIT_*` names — inc
 - **Honoured keys:** `SERVER_HOST` (required), `SSH_PORT`, `SERVER_USER`, `SSH_KEY`,
   `RECV_BASE`, `USE_MBUFFER`, `SUBVOLUMES`, `PARENT_TREE_BASE`, `PARENT_KEEP`,
   `BOOT_ENABLED`, `BOOT_PATHS`, `RETENTION_TIMEZONE`, `TIMELINE_LIMIT_{HOURLY,DAILY,
-  WEEKLY,MONTHLY,YEARLY}`, and per-subvol overrides `<SUBVOL>_TIMELINE_LIMIT_*`.
+  WEEKLY,MONTHLY,YEARLY}`, per-subvol overrides `<SUBVOL>_TIMELINE_LIMIT_*`, and
+  per-boot-path overrides `BOOT_TIMELINE_LIMIT_*` / `BOOT_EFI_TIMELINE_LIMIT_*`.
 - **Ignored gracefully** (so you can keep Snapper-style keys around, or point
   snappersend at a Snapper-shaped file without it choking): `SUBVOLUME`, `FSTYPE`,
   `QGROUP`, `SPACE_LIMIT`, `FREE_LIMIT`, `ALLOW_USERS`, `ALLOW_GROUPS`, `SYNC_ACL`,
@@ -170,7 +204,7 @@ snappersend --report        # read-only status view (see below); change nothing
 snappersend --subvol home   # just one subvolume
 snappersend --config PATH   # alternate config (default /etc/snappersend/config)
 snappersend --no-mbuffer    # don't pipe through mbuffer
-snappersend --skip-boot     # skip the /boot + /boot/efi rsync tier
+snappersend --skip-boot     # skip the boot tier (rsync mirrors + their versions)
 snappersend -v              # verbose: log every shell command
 
 snappersend setup-dest admin@host   # provision the destination over your admin login
@@ -180,11 +214,11 @@ snappersend decom-dest  admin@host   # remove that transport config (keeps recei
 
 ### `--report` — read-only status & health view
 
-`--report` prints, per subvolume, how the destination snapshots and source parent clones
-stand **right now** — it **changes nothing** (no sends, clones, deletes, renames, property
-writes, or success stamp) and takes no run lock, so it is safe to run alongside a real
-replication. It honours `--subvol` and `--server`, and each subvol's own
-`retention_for()` policy. For each subvol it shows:
+`--report` prints, per source (every subvolume **and** every boot path), how the
+destination stands **right now** — it **changes nothing** (no sends, clones, deletes,
+renames, property writes, or success stamp) and takes no run lock, so it is safe to run
+alongside a real replication. It honours `--subvol`, `--skip-boot` and `--server`, and
+each source's own `retention_for()` policy. For each subvol it shows:
 
 - **Destination snapshots** (newest first): num + date, current **tier(s)**
   (`hourly|daily|weekly|monthly|yearly`, or `pinned parent` / `prepost partner` /
@@ -197,6 +231,10 @@ replication. It honours `--subvol` and `--server`, and each subvol's own
 - **Health lines**: *Chain* — intact, or `WARN: next run will full-send` when no clone
   correlates with any destination snapshot; and *Lag* — how far (snapshots + wall-clock)
   the destination trails the source's newest.
+
+And for each boot path: the **mirror state** (subvolume / old layout pending migration /
+absent / unreachable) and every **version** with its tier(s) and `KEEP`/`PRUNE` verdict,
+derived from the same bucketing loop the boot prune uses.
 
 Tiers are **computed live** from the current policy, not stored: a snapshot that is
 today's `daily` survivor becomes a `weekly` one as newer snapshots age out, so the report

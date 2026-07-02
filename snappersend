@@ -97,6 +97,7 @@ BTRFS CORRECTNESS RULES (proven on real btrfs; distilled from btrbk)
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import contextlib
 import fcntl
@@ -108,6 +109,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -422,12 +424,13 @@ def load_config(path: str = "/etc/snappersend/config") -> dict:
     names = list(kwargs.get("subvols", {"root": 0, "home": 0}).keys())
     for name in names:
         override = _parse_tiers(d, prefix=f"{name.upper()}_")
-        if any(v != 0 for v in override.values()):
+        # A tier counts as overridden if the key is PRESENT (even "0" — an explicit
+        # 0 disables that tier for this subvol); a tier the user didn't mention
+        # keeps the default value.
+        raw = {gk: d.get(f"{name.upper()}_{sk}")
+               for sk, gk in _TIER_KEYS}
+        if any(v not in (None, "") for v in raw.values()):
             merged = dict(default_keep)
-            # Only non-zero override tiers replace the default; a tier the user
-            # didn't mention for this subvol keeps the default value.
-            raw = {gk: d.get(f"{name.upper()}_{sk}")
-                   for sk, gk in _TIER_KEYS}
             for gk, val in override.items():
                 if raw[gk] not in (None, ""):
                     merged[gk] = val
@@ -456,10 +459,50 @@ def run_local(argv: list[str], *, check: bool = True) -> subprocess.CompletedPro
     return cp
 
 
+# --- SSH connection multiplexing (the transport-latency fix) ----------------
+# A run issues MANY small remote commands (one per destination `subvolume show`,
+# mkdir, delete, symlink, ...). A fresh ssh connection costs a full TCP + key
+# handshake (~0.3-0.4s each on a LAN), which dominated wall-clock: ~5s of a
+# ~5s --report was handshakes. ControlMaster multiplexing pays that cost ONCE:
+# the first command starts a master, every later command rides it as a channel
+# (~10-25ms). ControlPersist keeps the master alive briefly between commands and
+# it exits on its own; _cleanup_ssh_masters also closes it explicitly at exit.
+# Works with the destination's `restrict` authorized_keys line (multiplexed exec
+# channels are plain sessions; restrict only denies pty/forwarding).
+_SSH_CONTROL_DIR: Optional[str] = None
+
+
+def _ssh_control_opts() -> list[str]:
+    global _SSH_CONTROL_DIR
+    if _SSH_CONTROL_DIR is None:
+        _SSH_CONTROL_DIR = tempfile.mkdtemp(prefix="snappersend-ssh-")
+        atexit.register(_cleanup_ssh_masters)
+    return ["-o", "ControlMaster=auto",
+            "-o", f"ControlPath={_SSH_CONTROL_DIR}/%C",
+            "-o", "ControlPersist=60"]
+
+
+def _cleanup_ssh_masters() -> None:
+    """Ask any live control master to exit, then remove the socket dir. Best
+    effort — an already-gone master (or an unwritable dir) is not an error."""
+    if _SSH_CONTROL_DIR is None:
+        return
+    with contextlib.suppress(OSError):
+        for sock in os.listdir(_SSH_CONTROL_DIR):
+            path = os.path.join(_SSH_CONTROL_DIR, sock)
+            # -O exit talks straight to the socket; the host arg is unused then.
+            with contextlib.suppress(Exception):
+                subprocess.run(["ssh", "-o", f"ControlPath={path}", "-O", "exit",
+                                "unused-host"], capture_output=True)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(_SSH_CONTROL_DIR)
+
+
 def ssh_argv(cfg: Config, remote_cmd: str) -> list[str]:
     return [
         "ssh", "-i", cfg.ssh_key, "-p", str(cfg.server_ssh_port),
         "-o", "BatchMode=yes",
+        *_ssh_control_opts(),
         f"{cfg.server_user}@{cfg.server_host}",
         remote_cmd,
     ]
@@ -876,7 +919,9 @@ def send_receive(cfg: Config, clone: Subvol, recv_dir: str,
     _cleanup_final(cfg, final_dir)
     run_remote(cfg, f"sudo mkdir -p {shlex.quote(final_dir)}", check=False)
 
+    t0 = time.monotonic()
     pipe_ok = _run_pipe(send_cmd, ssh_argv(cfg, recv_remote), cfg.use_mbuffer)
+    elapsed = time.monotonic() - t0
 
     received_sv = show_remote(cfg, final_path)
     if received_sv is None or received_sv.is_garbled or not received_sv.is_valid_received:
@@ -890,7 +935,8 @@ def send_receive(cfg: Config, clone: Subvol, recv_dir: str,
         return False
 
     _update_latest_symlink(cfg, recv_dir, received_name)
-    log_ok(f"received #{num} -> {received_name}/snapshot")
+    kind = "incremental" if parent is not None else "full"
+    log_ok(f"received #{num} -> {received_name}/snapshot ({kind}, {elapsed:.1f}s)")
     return True
 
 
@@ -902,6 +948,17 @@ def _cleanup_final(cfg: Config, final_dir: str) -> None:
     run_remote(cfg, f"sudo rmdir {shlex.quote(final_dir)}", check=False)
 
 
+def _parse_mbuffer_summary(text: str) -> Optional[str]:
+    """Extract mbuffer's end-of-run summary from its `-l` logfile text — e.g.
+    `summary: 5120 kiByte in  0.4sec - average of  12 MiB/s` — normalised to single
+    spaces. The byte count is the stream size (for an incremental send: the changed
+    data actually shipped). None if no summary line is present."""
+    for line in reversed(text.splitlines()):
+        if "summary:" in line:
+            return " ".join(line[line.index("summary:") + len("summary:"):].split())
+    return None
+
+
 def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
     """
     Connect `btrfs send` -> [mbuffer ->] ssh receive and return True iff EVERY stage
@@ -909,16 +966,26 @@ def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
     stage's stderr is captured to a temp file (never a pipe, so a chatty stage can't
     deadlock the data flow) — except interactive mbuffer, which inherits the terminal
     for its live throughput readout.
+
+    When mbuffer is in the pipe it also writes its stats to a logfile (`-l`), and
+    the end-of-run summary — stream size (= changed data for an incremental),
+    duration, average rate — is logged at INFO in every mode, including `-q`
+    (which would otherwise suppress the summary entirely).
     """
     stages: list[tuple[str, list[str], bool]] = [("btrfs send", list(send_argv), True)]
     mb = bool(use_mbuffer) and shutil.which("mbuffer") is not None
     if use_mbuffer and not mb:
         log_warn("use_mbuffer set but mbuffer not on PATH; continuing without it")
+    mb_stats_path = None
     if mb:
+        fd, mb_stats_path = tempfile.mkstemp(prefix="snappersend-mbstats-")
+        os.close(fd)
         if sys.stderr.isatty():
-            stages.append(("mbuffer", ["mbuffer", "-m", "256M"], False))
+            stages.append(("mbuffer",
+                           ["mbuffer", "-m", "256M", "-l", mb_stats_path], False))
         else:
-            stages.append(("mbuffer", ["mbuffer", "-q", "-m", "256M"], True))
+            stages.append(("mbuffer",
+                           ["mbuffer", "-q", "-m", "256M", "-l", mb_stats_path], True))
     stages.append(("ssh receive", list(ssh_argv_list), True))
 
     procs: list[tuple[str, subprocess.Popen, object]] = []
@@ -948,6 +1015,9 @@ def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
         for ef in errfiles:
             with contextlib.suppress(Exception):
                 ef.close()
+        if mb_stats_path:
+            with contextlib.suppress(OSError):
+                os.unlink(mb_stats_path)
         return False
 
     all_ok = True
@@ -965,6 +1035,18 @@ def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
             log_error(f"  pipe stage '{name}' exited {rc}" + (f": {err}" if err else ""))
         elif err:
             log_debug(f"  pipe stage '{name}': {err}")
+
+    if mb_stats_path:
+        try:
+            with open(mb_stats_path, encoding="utf-8", errors="replace") as f:
+                summary = _parse_mbuffer_summary(f.read())
+            if summary:
+                log_info(f"  transfer stats: {summary}")
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(mb_stats_path)
     return all_ok
 
 
@@ -990,7 +1072,8 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
         return True
 
     log_step(f"Boot mirror ({', '.join(cfg.boot_paths)} -> {cfg.recv_base}/{hostname}/)")
-    rsh = f"ssh -i {cfg.ssh_key} -p {cfg.server_ssh_port} -o BatchMode=yes"
+    rsh = (f"ssh -i {cfg.ssh_key} -p {cfg.server_ssh_port} -o BatchMode=yes "
+           + " ".join(_ssh_control_opts()))
     all_ok = True
 
     for src in cfg.boot_paths:
@@ -1013,8 +1096,9 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
             continue
 
         cp = run_local(rsync_argv, check=False)
-        # EFI (FAT32) has no perms/ACLs/xattrs, so -aAX emits benign warnings (rc 24
-        # = vanished files). Treat rc 0 and 24 as success; warn (don't fail) otherwise.
+        # rc 24 = "source files vanished during transfer" — benign for a live /boot
+        # (e.g. a concurrent kernel update). Treat rc 0 and 24 as success; warn
+        # (don't fail) otherwise.
         if cp.returncode in (0, 24):
             log_ok(f"  {src} mirrored to {dest}")
         else:
@@ -1235,7 +1319,10 @@ def replicate_subvol(cfg: Config, name: str, mountpoint: str, recv_dir: str) -> 
         log_info(f"No snapper snapshots under {mountpoint}/.snapshots — nothing to do.")
         return True
 
-    run_remote(cfg, f"sudo mkdir -p {shlex.quote(recv_dir)}", check=False)
+    # Ensure the receive dir exists (skipped in dry-run — "change nothing" includes
+    # the destination; list_target_snapshots treats a missing dir as empty anyway).
+    if not cfg.dry_run:
+        run_remote(cfg, f"sudo mkdir -p {shlex.quote(recv_dir)}", check=False)
     try:
         target_snaps = list_target_snapshots(cfg, recv_dir)
     except RemoteUnreachable as e:

@@ -208,9 +208,21 @@ load-bearing for date/num parsing and UUID correlation.)
 
 Logging is `[STEP]/[INFO]/[OK]/[WARN]/[ERROR]` to the terminal (coloured on a tty) and
 to `/var/log/snappersend.log` (override `$SNAPPERSEND_LOG`). The full-send fallback is
-always logged at `INFO` with its reason. snappersend exits non-zero if any subvolume
-fails, leaving the chains intact for retry. A `flock` (`/var/lock/snappersend.lock`)
-prevents overlapping runs.
+always logged at `INFO` with its reason. Each successful transfer logs its kind and
+duration (`received #N -> …/snapshot (incremental, 1.2s)`), and when mbuffer is in the
+pipe its end-of-run summary is logged too (`transfer stats: 5120 kiByte in 0.4sec -
+average of 12 MiB/s`) — the byte count is the stream size, i.e. the **changed data**
+actually shipped for an incremental. snappersend exits non-zero if any subvolume fails,
+leaving the chains intact for retry. A `flock` (`/var/lock/snappersend.lock`) prevents
+overlapping runs.
+
+All remote commands share one **multiplexed SSH connection** (OpenSSH
+`ControlMaster`/`ControlPersist`): the first command pays the TCP + key handshake, every
+later command rides the same master as a ~10ms channel. A run or `--report` issues
+dozens of small remote commands, so without this the handshakes dominated wall-clock
+(~0.4s each). The master exits on its own (60s idle) and is also closed explicitly when
+snappersend exits; it works with the `restrict`-hardened transport key, which denies
+pty/forwarding but not exec sessions.
 
 ## Install / first run
 

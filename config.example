@@ -18,7 +18,9 @@ SSH_PORT="22"
 SERVER_USER="snappersend"                     # dedicated least-privilege transport user
 SSH_KEY="/etc/snappersend/ssh/id_ed25519"
 RECV_BASE="/srv/snapshots-recv"               # -> <RECV_BASE>/<this-hostname>/<subvol>/...
-USE_MBUFFER="yes"                             # smooth throughput + a live rate readout
+USE_MBUFFER="yes"                             # smooth throughput, a live rate readout on a
+                                              # tty, and per-transfer stats in the log
+                                              # (stream size = changed data, time, avg rate)
 
 # ---- Subvolumes to replicate -------------------------------------------------
 # Space-separated  name:mountpoint  pairs. The mountpoint is where that subvol's
@@ -59,7 +61,7 @@ TIMELINE_LIMIT_MONTHLY="6"
 TIMELINE_LIMIT_YEARLY="2"
 
 # Optional per-subvol overrides: prefix a tier with <SUBVOL>_ (uppercased). Only the
-# tiers you list are overridden; the rest inherit the default above. Example — keep a
-# deeper archive of the OS root:
+# tiers you list are overridden; the rest inherit the default above (an explicit "0"
+# disables that tier for that subvol). Example — keep a deeper archive of the OS root:
 ROOT_TIMELINE_LIMIT_DAILY="30"
 ROOT_TIMELINE_LIMIT_MONTHLY="12"

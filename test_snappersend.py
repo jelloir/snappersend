@@ -15,6 +15,7 @@ VM validation (see the build report), not here.
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import sys
 
 import pytest
@@ -453,6 +454,26 @@ def test_config_non_numeric_tier_degrades(tmp_path):
     d = cfg.retention_for("home")
     assert d["keep_daily"] == 0       # non-numeric -> disabled, no crash
     assert d["keep_yearly"] == 3
+
+
+def test_config_subvol_override_zero_only_disables_tier(tmp_path):
+    # An override whose ONLY change is an explicit "0" must still apply (it
+    # disables that tier for that subvol) — a present-but-zero key is an
+    # override, not an absent one.
+    p = tmp_path / "config"
+    p.write_text(
+        'SERVER_HOST="d"\n'
+        'SUBVOLUMES="root:/ home:/home"\n'
+        'TIMELINE_LIMIT_HOURLY="24"\n'
+        'TIMELINE_LIMIT_DAILY="14"\n'
+        'HOME_TIMELINE_LIMIT_HOURLY="0"\n'
+    )
+    cfg = ss.Config(**ss.load_config(str(p)))
+    home = cfg.retention_for("home")
+    assert home["keep_hourly"] == 0          # explicitly disabled
+    assert home["keep_daily"] == 14          # unmentioned tier inherits default
+    root = cfg.retention_for("root")
+    assert root["keep_hourly"] == 24         # other subvols untouched
 
 
 # ============================================================================
@@ -900,6 +921,42 @@ def test_cli_subcommands_parse():
     # Bare invocation and --report still route to the run/report path (no subcommand).
     assert getattr(ss.build_parser().parse_args([]), "command", None) is None
     assert ss.build_parser().parse_args(["--report"]).command is None
+
+
+def test_ssh_argv_uses_connection_multiplexing(cfg):
+    # Every transport command must carry ControlMaster/ControlPath/ControlPersist:
+    # per-command fresh handshakes (~0.4s each, dozens per run) were the dominant
+    # source of run/report latency.
+    argv = ss.ssh_argv(cfg, "sudo ls /")
+    joined = " ".join(argv)
+    assert "ControlMaster=auto" in joined
+    assert "ControlPath=" in joined
+    assert "ControlPersist=" in joined
+    # BatchMode and the key/port/user are still present.
+    assert "-i" in argv and "BatchMode=yes" in joined
+    assert argv[-2].endswith(f"@{cfg.server_host}")
+
+
+def test_parse_mbuffer_summary():
+    text = ("mbuffer: in @  200 MiB/s, out @  200 MiB/s\n"
+            "summary: 5120 kiByte in  0.4sec - average of   12 MiB/s\n")
+    assert (ss._parse_mbuffer_summary(text)
+            == "5120 kiByte in 0.4sec - average of 12 MiB/s")
+    assert ss._parse_mbuffer_summary("no stats here\n") is None
+    assert ss._parse_mbuffer_summary("") is None
+
+
+@pytest.mark.skipif(shutil.which("mbuffer") is None, reason="mbuffer not installed")
+def test_run_pipe_logs_mbuffer_stats(monkeypatch):
+    # Real 3-stage pipe with mbuffer in the middle (non-tty -> -q -l <stats>):
+    # the summary must be parsed from the stats file and logged at INFO.
+    logged = []
+    monkeypatch.setattr(ss, "log_info", lambda m: logged.append(m))
+    ok = ss._run_pipe(["head", "-c", "1048576", "/dev/zero"],
+                      ["wc", "-c"], use_mbuffer=True)
+    assert ok is True
+    stats = [m for m in logged if "transfer stats:" in m]
+    assert stats and "average of" in stats[0]
 
 
 def test_run_lock_collision(tmp_path, monkeypatch):

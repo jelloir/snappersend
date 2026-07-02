@@ -85,7 +85,7 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: snappersend
 
 Files: *
-Copyright: Your Name <you@example.com>
+Copyright: Your Name <debian.88@luck888.win>
 License: MIT
 EOF
 

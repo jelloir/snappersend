@@ -148,8 +148,10 @@ without the uuid/num that only the send chain needs:
 <RECV_BASE>/<hostname>/boot/            (and boot-efi/, and any future BOOT_PATHS entry)
     .mirror                             live rsync target (subvolume; hidden like
                                         .snapshots — machinery, not a backup)
-    20260702T092948Z                    read-only versions (UTC stamps)
-    boot.latest -> …/20260702T092948Z   newest version
+    20260702-210001+1000                read-only versions — the same date+offset
+                                        label as the subvol dir names, minus the
+                                        num/uuid only the send chain needs
+    boot.latest -> …/20260702-210001+1000   newest version
 ```
 
 The mirror is dotted for the same reason Snapper's `.snapshots` is: a plain `ls` of the
@@ -169,8 +171,13 @@ sight.
 - **FAT32 mtimes** (2-second granularity on the ESP) are handled automatically:
   vfat/msdos sources get rsync `--modify-window=1`; ext4 stays exact.
 - **Fail-safe and independent**: any boot-tier failure warns and continues — it never
-  aborts the snapshot tiers. Pre-versioning plain-dir mirrors from older snappersend
-  are migrated to this layout automatically (one-time, in place, content preserved).
+  aborts the snapshot tiers.
+
+> **Upgrading from the pre-versioning mirror layout** (where
+> `<RECV_BASE>/<host>/{boot,boot-efi}` was itself the rsync'd copy): delete those old
+> mirror directories on the destination first — the next run creates the new layout
+> and rsync repopulates the mirror. snappersend deliberately carries no migration
+> code for this one-time step.
 
 ## Configuration
 
@@ -238,8 +245,8 @@ each source's own `retention_for()` policy. For each subvol it shows:
   correlates with any destination snapshot; and *Lag* — how far (snapshots + wall-clock)
   the destination trails the source's newest.
 
-And for each boot path: the **mirror state** (subvolume / old layout pending migration /
-absent / unreachable) and every **version** with its tier(s) and `KEEP`/`PRUNE` verdict,
+And for each boot path: the **mirror state** (subvolume / not initialized /
+unreachable) and every **version** with its tier(s) and `KEEP`/`PRUNE` verdict,
 derived from the same bucketing loop the boot prune uses.
 
 Tiers are **computed live** from the current policy, not stored: a snapshot that is

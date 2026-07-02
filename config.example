@@ -43,8 +43,10 @@ PARENT_KEEP="2"                               # live parent + 1 redundancy slot
 #   <RECV_BASE>/<hostname>/boot/          (and boot-efi/)
 #       .mirror                           live rsync target (subvolume; hidden
 #                                         like .snapshots — machinery, not a backup)
-#       <UTC-stamp>                       read-only versions of the mirror
-#       boot.latest -> <UTC-stamp>        newest version
+#       <date-stamp>                      read-only versions of the mirror, named
+#                                         with the same YYYYMMDD-HHMMSS±ZZZZ label
+#                                         as the subvol dir names (no num/uuid)
+#       boot.latest -> <date-stamp>       newest version
 #
 # A new version is created only when a clean sync actually CHANGED the mirror —
 # an unchanged re-run creates nothing, the same idempotence as the snapshot

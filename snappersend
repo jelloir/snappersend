@@ -86,7 +86,8 @@ THE BOOT TIER (non-Btrfs sources: /boot ext4, /boot/efi FAT32)
 DESTINATION (which is Btrfs) does the versioning: each boot path syncs into a live
 `.mirror` subvolume inside a per-path parent dir (hidden like Snapper's .snapshots —
 machinery, not a backup), and a read-only snapshot of the
-mirror is taken as a sibling <UTC-STAMP> version — the same parent/backups/.latest
+mirror is taken as a sibling dated version (named with the same local-time+offset
+label as the subvol dir names, minus num/uuid) — the same parent/backups/.latest
 layout, GFS retention (through the same bucketing loop), and idempotence as the
 snapshot tiers: a version is created only when the sync actually CHANGED the mirror
 (rsync --itemize-changes is the detector), so an unchanged re-run creates nothing.
@@ -1088,7 +1089,10 @@ def _update_latest_symlink(cfg: Config, recv_dir: str, name: str,
     link = os.path.join(recv_dir, f"{base}.latest")
     target = os.path.join(recv_dir, name, subdir) if subdir \
         else os.path.join(recv_dir, name)
-    run_remote(cfg, f"sudo ln -sfn {shlex.quote(target)} {shlex.quote(link)}", check=False)
+    cp = run_remote(cfg, f"sudo ln -sfn {shlex.quote(target)} {shlex.quote(link)}",
+                    check=False)
+    if getattr(cp, "returncode", 0) != 0:
+        log_warn(f"  could not update {base}.latest: {(cp.stderr or '').strip()}")
 
 
 # ============================================================================
@@ -1125,23 +1129,15 @@ def _boot_name(src: str) -> str:
     return src.strip("/").replace("/", "-")
 
 
-# UTC, filesystem-safe, second precision. The stamp IS the version's identity —
-# it round-trips to the naive-UTC instant retention buckets on.
-_BOOT_STAMP_FMT = "%Y%m%dT%H%M%SZ"
-
-
 def _boot_stamp(now: Optional[datetime] = None) -> str:
+    """Version-dir name for a boot version: the SAME local-time+offset date
+    label the subvol tiers use in their dir names (`YYYYMMDD-HHMMSS±ZZZZ`,
+    second precision, via _name_date_part), just without the `-num-uuid` suffix
+    that only the send chain needs. Parsed back with _parse_dt_name, so the name
+    round-trips to the naive-UTC instant retention buckets on; an unparseable
+    name is undatable and always KEPT — never delete what can't be dated."""
     dt = now or datetime.now(timezone.utc).replace(tzinfo=None)
-    return dt.strftime(_BOOT_STAMP_FMT)
-
-
-def _parse_boot_stamp(name: str) -> Optional[datetime]:
-    """Naive-UTC instant from a version dir name; None if it isn't a stamp (an
-    undatable version is always KEPT — never delete what can't be dated)."""
-    try:
-        return datetime.strptime(name, _BOOT_STAMP_FMT)
-    except ValueError:
-        return None
+    return _name_date_part(dt)
 
 
 @dataclass
@@ -1161,129 +1157,29 @@ def _rsync_mtime_opts(src: str) -> list[str]:
     return ["--modify-window=1"] if fstype in ("vfat", "msdos") else []
 
 
-def _absorb_legacy_versions(cfg: Config, parent: str) -> None:
-    """One-time sweep: an early layout kept versions in a sibling
-    `<parent>.versions/` dir — absorb them into the parent so history survives
-    the layout change. A read-only subvolume cannot be mv'd across directories
-    (rename hits EROFS on its own RO tree), so each version is re-snapshotted at
-    the new location and the original deleted — same content, same stamp
-    identity (a boot version's uuid carries no meaning). Best-effort; anything
-    unabsorbable stays put (and is therefore never deleted)."""
-    legacy = parent.rstrip("/") + ".versions"
-    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(legacy)}", check=False)
-    if cp.returncode != 0:
-        return
-    for n in cp.stdout.split():
-        src = shlex.quote(os.path.join(legacy, n))
-        dst = os.path.join(parent, n)
-        # `snapshot -r a b` with an EXISTING b creates b/<basename> instead of
-        # failing, so probe first (also skips work a crashed prior sweep did).
-        if run_remote(cfg, f"sudo ls -d {shlex.quote(dst)}",
-                      check=False).returncode != 0:
-            snap = run_remote(cfg, f"sudo btrfs subvolume snapshot -r {src} "
-                                   f"{shlex.quote(dst)}", check=False)
-            if snap.returncode != 0:
-                log_warn(f"  could not absorb legacy version {n} into {parent}/ "
-                         f"({snap.stderr.strip()}) — leaving it in place")
-                continue
-        if run_remote(cfg, f"sudo btrfs subvolume delete {src}",
-                      check=False).returncode == 0:
-            log_info(f"  absorbed legacy version {n} into {parent}/")
-    run_remote(cfg, f"sudo rmdir {shlex.quote(legacy)}", check=False)
-
-
 def _ensure_boot_mirror_subvol(cfg: Config, parent: str) -> bool:
     """Ensure the boot layout at `parent`: a plain parent dir holding the live
-    `.mirror` SUBVOLUME (the rsync target, snapshot-able in place). Idempotent,
-    and migrates every prior layout without losing mirror content or version
-    history:
-      * <parent>/.mirror already a subvolume           -> no-op
-      * <parent>/mirror (interim layout, un-hidden)     -> renamed to .mirror
-      * <parent> is itself the mirror (a plain dir from the pre-versioning
-        code, or a subvolume from the early versioned layout)  -> moved to
-        <parent>/.mirror, content preserved
-      * absent                                          -> created fresh
-    Versions from the early sibling `<parent>.versions/` dir are absorbed into
-    the parent. False on failure (the caller warns and continues — fail-safe)."""
+    `.mirror` SUBVOLUME (the rsync target, snapshot-able in place). Idempotent:
+    present -> single-probe no-op; absent -> created. False on failure (the
+    caller warns and continues — the boot tier is fail-safe)."""
     mirror = os.path.join(parent, _BOOT_MIRROR)
-    qp, qm = shlex.quote(parent), shlex.quote(mirror)
-    if run_remote(cfg, f"sudo btrfs subvolume show {qm}", check=False).returncode == 0:
-        if not cfg.dry_run:
-            _absorb_legacy_versions(cfg, parent)     # crash-safe: sweep leftovers
-        return True                                  # current layout already
-    # Interim layout: the mirror existed un-hidden as <parent>/mirror. A plain
-    # same-dir rename (the mirror is writable, so no read-only rename trap).
-    visible = os.path.join(parent, "mirror")
-    if run_remote(cfg, f"sudo btrfs subvolume show {shlex.quote(visible)}",
-                  check=False).returncode == 0:
-        if cfg.dry_run:
-            log_info(f"[dry-run] would rename {visible} -> {mirror}")
-            return True
-        if run_remote(cfg, f"sudo mv {shlex.quote(visible)} {qm}",
-                      check=False).returncode == 0:
-            log_info(f"  renamed {visible} -> {mirror} (hidden, one-time)")
-            _absorb_legacy_versions(cfg, parent)
-            return True
-        log_warn(f"  could not rename {visible} -> {mirror} — leaving as-is")
-        return False
-    ls = run_remote(cfg, f"sudo ls -d {qp}", check=False)
-    if _is_ssh_transport_failure(ls):
-        log_warn(f"  cannot inspect {parent} (destination unreachable) — "
+    qm = shlex.quote(mirror)
+    cp = run_remote(cfg, f"sudo btrfs subvolume show {qm}", check=False)
+    if cp.returncode == 0:
+        return True
+    if _is_ssh_transport_failure(cp):
+        log_warn(f"  cannot inspect {mirror} (destination unreachable) — "
                  "skipping versioning setup")
         return False
-    exists = ls.returncode == 0
-    was_subvol = exists and run_remote(
-        cfg, f"sudo btrfs subvolume show {qp}", check=False).returncode == 0
-
     if cfg.dry_run:
-        log_info(f"[dry-run] would {'migrate old mirror into' if exists else 'create'}"
-                 f" {mirror}")
+        log_info(f"[dry-run] would create mirror subvolume {mirror}")
         return True
-
-    if exists:
-        # <parent> IS the old mirror: move it aside, rebuild as parent/.mirror.
-        old = parent.rstrip("/") + ".premigrate"
-        qold = shlex.quote(old)
-        # Stale scratch from a crashed prior attempt: a subvol needs `subvolume
-        # delete`; a plain dir needs `rm -rf` (each is a no-op for the other).
-        run_remote(cfg, f"sudo btrfs subvolume delete {qold}", check=False)
-        run_remote(cfg, f"sudo rm -rf {qold}", check=False)
-        if run_remote(cfg, f"sudo mv {qp} {qold}", check=False).returncode != 0:
-            log_warn(f"  migration: could not move {parent} aside — leaving as-is")
-            return False
-        run_remote(cfg, f"sudo mkdir -p {qp}", check=False)
-        if was_subvol:
-            # Early versioned layout: the mirror subvol just moves into place.
-            cp = run_remote(cfg, f"sudo mv {qold} {qm}", check=False)
-            if cp.returncode != 0:
-                log_warn(f"  migration: could not move mirror subvolume into "
-                         f"{mirror}: {cp.stderr.strip()}")
-                return False
-        else:
-            # Pre-versioning plain-dir mirror: new subvol + preserved content
-            # (reflinked where possible; a copy failure only costs a re-rsync).
-            cp = run_remote(cfg, f"sudo btrfs subvolume create {qm}", check=False)
-            if cp.returncode != 0:
-                log_warn(f"  migration: subvolume create failed "
-                         f"({cp.stderr.strip()}); restoring plain-dir mirror")
-                run_remote(cfg, f"sudo rmdir {qp}", check=False)
-                run_remote(cfg, f"sudo mv {qold} {qp}", check=False)
-                return False
-            if run_remote(cfg, f"sudo cp -a --reflink=auto {qold}/. {qm}/",
-                          check=False).returncode != 0:
-                log_warn(f"  migration: content copy into {mirror} failed — "
-                         "next rsync repopulates the mirror")
-            run_remote(cfg, f"sudo rm -rf {qold}", check=False)
-        log_info(f"  migrated old mirror layout to {mirror} (one-time)")
-    else:
-        run_remote(cfg, f"sudo mkdir -p {qp}", check=False)
-        cp = run_remote(cfg, f"sudo btrfs subvolume create {qm}", check=False)
-        if cp.returncode != 0:
-            log_warn(f"  could not create mirror subvolume {mirror}: "
-                     f"{cp.stderr.strip()}")
-            return False
-
-    _absorb_legacy_versions(cfg, parent)
+    run_remote(cfg, f"sudo mkdir -p {shlex.quote(parent)}", check=False)
+    cp = run_remote(cfg, f"sudo btrfs subvolume create {qm}", check=False)
+    if cp.returncode != 0:
+        log_warn(f"  could not create mirror subvolume {mirror}: "
+                 f"{cp.stderr.strip()}")
+        return False
     return True
 
 
@@ -1298,7 +1194,7 @@ def _list_boot_versions(cfg: Config, parent: str) -> Optional[list]:
             log_warn(f"  cannot list {parent} (destination unreachable)")
             return None
         return []
-    return [BootVersion(path=os.path.join(parent, n), when=_parse_boot_stamp(n))
+    return [BootVersion(path=os.path.join(parent, n), when=_parse_dt_name(n))
             for n in cp.stdout.split()
             if n != _BOOT_MIRROR and not n.endswith(".latest")]
 
@@ -1332,8 +1228,8 @@ def _prune_boot_versions(cfg: Config, name: str, parent: str) -> bool:
     only the version entries under the parent — the live mirror and the .latest
     link are never candidates; an unparseable name has when=None and is always
     kept (the _UNDATABLE sentinel); a failed destination listing prunes nothing.
-    After pruning, .latest is repointed at the newest survivor (as the snapshot
-    tiers do)."""
+    .latest is (re)pointed at the newest surviving version EVERY run — one
+    idempotent ln -sfn — so the link self-heals if it's ever missing or stale."""
     versions = _list_boot_versions(cfg, parent)
     if versions is None:
         log_warn("  skipping boot retention (listing failed)")
@@ -1353,8 +1249,6 @@ def _prune_boot_versions(cfg: Config, name: str, parent: str) -> bool:
     to_delete = [v for v in versions if v.path not in keep]
     log_info(f"  [{name}] versions: {len(versions) - len(to_delete)} kept, "
              f"{len(to_delete)} pruned")
-    if not to_delete:
-        return True
     ok = True
     for v in to_delete:
         if cfg.dry_run:
@@ -1957,10 +1851,7 @@ def _report_boot_path(cfg: Config, hostname: str, src: str) -> None:
         print("  Mirror: unreachable — cannot report mirror/versions")
         return
     else:
-        ls = run_remote(cfg, f"sudo ls -d {shlex.quote(parent)}", check=False)
-        print("  Mirror: " + ("old layout (next run migrates it in place)"
-                              if ls.returncode == 0 else
-                              "absent (next run creates it)"))
+        print("  Mirror: not initialized (next run creates it)")
 
     policy = cfg.retention_for(name)
     kh = int(policy.get("keep_hourly", 0))
@@ -2101,7 +1992,6 @@ BTRFS="$(command -v btrfs || true)"
 RSYNC="$(command -v rsync || echo /usr/bin/rsync)"
 MKDIR="$(command -v mkdir)"; RMDIR="$(command -v rmdir)"
 LS="$(command -v ls)"; LN="$(command -v ln)"
-MV="$(command -v mv)"; CP="$(command -v cp)"; RM="$(command -v rm)"
 if [ -z "$BTRFS" ]; then echo "btrfs not found on destination" >&2; exit 3; fi
 umask 077
 cat > /etc/sudoers.d/snappersend <<SUDOERS
@@ -2116,9 +2006,6 @@ Cmnd_Alias SNAPPERSEND_CMDS = \\
     $RMDIR *, \\
     $LS *, \\
     $LN -sfn *, \\
-    $MV *, \\
-    $CP *, \\
-    $RM -rf *, \\
     $RSYNC *
 $U ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
 Defaults!SNAPPERSEND_CMDS !requiretty

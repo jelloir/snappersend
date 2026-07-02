@@ -985,49 +985,23 @@ class _BootRemote:
     """Scripted run_remote for the boot tier: dispatches on the command text and
     records every command, maintaining a tiny model of the destination.
 
-    `layout` is the parent path's state:
-      "new"        parent dir holding a `.mirror` subvolume (current layout)
-      "interim"    parent dir holding an un-hidden `mirror` subvolume
-      "old-dir"    parent IS the mirror, a plain dir (pre-versioning layout)
-      "old-subvol" parent IS the mirror, a subvolume (early versioned layout)
-      "absent"     nothing there yet
-    `versions` are the dated entries under the parent; `legacy_versions` (or
-    None for no dir) models the early sibling `<parent>.versions/` dir."""
+    `layout` is the parent path's state: "new" (parent dir holding a `.mirror`
+    subvolume) or "absent" (nothing there yet). `versions` are the dated
+    entries under the parent."""
 
-    def __init__(self, monkeypatch, *, layout="new", versions=(),
-                 legacy_versions=None):
+    def __init__(self, monkeypatch, *, layout="new", versions=()):
         self.commands = []
         self.layout = layout
         self.versions = list(versions)
-        self.legacy_versions = (None if legacy_versions is None
-                                else list(legacy_versions))
         monkeypatch.setattr(ss, "run_remote", self)
 
     def __call__(self, cfg, cmd, check=True):
         self.commands.append(cmd)
         tail = cmd.rsplit("/", 1)[-1]
         if "subvolume show" in cmd:
-            if cmd.endswith("/" + ss._BOOT_MIRROR):
-                return _CP(0 if self.layout == "new" else 1, "",
-                           "Not a Btrfs subvolume")
-            if cmd.endswith("/mirror"):           # interim un-hidden name
-                return _CP(0 if self.layout == "interim" else 1, "",
-                           "Not a Btrfs subvolume")
-            return _CP(0 if self.layout == "old-subvol" else 1, "",
+            return _CP(0 if self.layout == "new" else 1, "",
                        "Not a Btrfs subvolume")
-        if cmd.startswith("sudo ls -d"):
-            # A dated child path exists iff it's among the parent's versions;
-            # any other path answers for the parent itself.
-            if tail in self.versions:
-                return _CP(0)
-            if ss._parse_boot_stamp(tail) or tail == "not-a-stamp":
-                return _CP(2, "", "No such file or directory")
-            return _CP(0 if self.layout != "absent" else 2)
         if cmd.startswith("sudo ls -1"):
-            if cmd.rstrip().endswith(".versions"):
-                if self.legacy_versions is None:
-                    return _CP(2, "", "No such file or directory")
-                return _CP(0, "".join(v + "\n" for v in self.legacy_versions))
             if self.layout == "absent":
                 return _CP(2, "", "No such file or directory")
             # Real `ls -1` hides dotfiles, so `.mirror` never appears here.
@@ -1039,24 +1013,13 @@ class _BootRemote:
             self.versions.append(tail)       # dst is always under the parent
             return _CP(0)
         if "subvolume delete" in cmd:
-            if ".versions/" in cmd:
-                if self.legacy_versions is not None:
-                    self.legacy_versions = [v for v in self.legacy_versions
-                                            if v != tail]
-                return _CP(0)
             self.versions = [v for v in self.versions if v != tail]
-            return _CP(0)
-        if cmd.startswith("sudo mv") and cmd.endswith("/" + ss._BOOT_MIRROR):
-            self.layout = "new"          # old-subvol mirror moved into place
             return _CP(0)
         return _CP(0)
 
     def deleted(self):
-        """Version deletions under the parent only (migration scratch cleanup
-        and legacy-dir absorption excluded)."""
         return [c.rsplit(" ", 1)[-1] for c in self.commands
-                if "subvolume delete" in c and not c.endswith(".premigrate")
-                and ".versions/" not in c]
+                if "subvolume delete" in c]
 
 
 def _boot_cfg(**kw):
@@ -1088,29 +1051,34 @@ def _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="", fstype="ext4",
 
 
 def test_boot_stamp_round_trip():
+    import re
     from datetime import datetime
     dt0 = datetime(2026, 7, 2, 6, 0, 0)                 # naive UTC
     s = ss._boot_stamp(dt0)
-    assert s == "20260702T060000Z"                      # filesystem-safe, UTC
-    assert ss._parse_boot_stamp(s) == dt0               # round-trips to the instant
-    assert ss._parse_boot_stamp("garbage") is None
-    assert ss._parse_boot_stamp("20260702T060000") is None   # missing Z != stamp
+    # The SAME label family as the subvol dir names (local date + UTC offset,
+    # second precision), minus the -num-uuid suffix.
+    assert re.fullmatch(r"\d{8}-\d{6}[+-]\d{4}", s)
+    assert ss._parse_dt_name(s) == dt0                  # round-trips to the instant
+    assert ss._parse_dt_name("garbage") is None
+    # A full subvol-style name (with -num-uuid) is NOT a bare stamp.
+    assert ss._parse_dt_name(s + "-88-1f17a813") is None
 
 
 def test_boot_unparseable_version_never_deleted(monkeypatch):
     # Three dated versions on distinct days + one junk name; keep_daily=1 keeps
     # only the newest dated one — the undatable version must survive regardless.
     r = _BootRemote(monkeypatch, layout="new", versions=[
-        "20260630T060000Z", "20260701T060000Z", "20260702T060000Z", "not-a-stamp"])
+        "20260630-060000+0000", "20260701-060000+0000", "20260702-060000+0000",
+        "not-a-stamp"])
     cfg2 = _boot_cfg(retention={"default": {
         "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
         "keep_monthly": 0, "keep_yearly": 0}})
     assert ss._prune_boot_versions(cfg2, "boot", "/v/boot") is True
     deleted = r.deleted()
-    assert "/v/boot/20260702T060000Z" not in deleted   # newest kept
-    assert "/v/boot/not-a-stamp" not in deleted        # undatable kept
-    assert set(deleted) == {"/v/boot/20260630T060000Z",
-                            "/v/boot/20260701T060000Z"}
+    assert "/v/boot/20260702-060000+0000" not in deleted   # newest kept
+    assert "/v/boot/not-a-stamp" not in deleted            # undatable kept
+    assert set(deleted) == {"/v/boot/20260630-060000+0000",
+                            "/v/boot/20260701-060000+0000"}
 
 
 def test_boot_prune_routes_through_bucket_keep(monkeypatch):
@@ -1118,8 +1086,8 @@ def test_boot_prune_routes_through_bucket_keep(monkeypatch):
     # GFS loop), and the delete-set must be exactly all − keep − undatable.
     # The live mirror and the .latest link must never even be candidates.
     r = _BootRemote(monkeypatch, layout="new", versions=[
-        "20260629T060000Z", "20260630T060000Z", "20260701T060000Z",
-        "20260702T060000Z", "junk-version", "boot.latest"])
+        "20260629-060000+0000", "20260630-060000+0000", "20260701-060000+0000",
+        "20260702-060000+0000", "junk-version", "boot.latest"])
     calls = {}
     real = ss._bucket_keep
 
@@ -1194,11 +1162,12 @@ def test_boot_unchanged_mirror_creates_no_version(monkeypatch, tmp_path):
     # that CHANGED NOTHING (empty itemized output) creates no new version when
     # one already exists — re-running snappersend mints nothing anywhere.
     ok, remote, cap = _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="",
-                                  layout="new", versions=["20260702T060000Z"])
+                                  layout="new",
+                                  versions=["20260702-060000+0000"])
     assert ok is True
     assert "-aAXi" in cap["rsync"]              # itemize-changes is the detector
     assert not any("subvolume snapshot" in c for c in remote.commands)
-    assert remote.versions == ["20260702T060000Z"]   # untouched
+    assert remote.versions == ["20260702-060000+0000"]   # untouched
 
     # ...but the FIRST version is still created even from an unchanged sync.
     ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="",
@@ -1209,7 +1178,8 @@ def test_boot_unchanged_mirror_creates_no_version(monkeypatch, tmp_path):
     # And a changed sync versions as usual.
     ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=0,
                                 rsync_out=">f.st...... grub/grub.cfg\n",
-                                layout="new", versions=["20260702T060000Z"])
+                                layout="new",
+                                versions=["20260702-060000+0000"])
     assert ok is True
     assert any("subvolume snapshot -r" in c for c in remote.commands)
 
@@ -1222,10 +1192,22 @@ def test_boot_version_updates_latest_symlink(monkeypatch, tmp_path):
     ln = next(c for c in remote.commands if c.startswith("sudo ln -sfn"))
     target, link = ln.split()[3], ln.split()[4]
     assert link.endswith(".latest")
-    assert ss._parse_boot_stamp(os.path.basename(target)) is not None
+    assert ss._parse_dt_name(os.path.basename(target)) is not None
     assert not target.endswith("/snapshot")
     # link lives in the same parent dir the version does
     assert os.path.dirname(target) == os.path.dirname(link)
+
+
+def test_boot_prune_repoints_latest_even_without_deletions(monkeypatch):
+    # Self-healing: .latest is (re)pointed at the newest version EVERY run, so a
+    # version that arrived without a link (or a hand-deleted link) gets one.
+    r = _BootRemote(monkeypatch, layout="new",
+                    versions=["20260701-060000+0000", "20260702-060000+0000"])
+    assert ss._prune_boot_versions(_boot_cfg(), "boot", "/v/boot") is True
+    assert r.deleted() == []                     # nothing pruned...
+    ln = next(c for c in r.commands if c.startswith("sudo ln -sfn"))
+    assert ln.endswith("/v/boot/boot.latest")    # ...link still (re)pointed
+    assert "/v/boot/20260702-060000+0000" in ln  # at the newest version
 
 
 def test_boot_modify_window_vfat_only(monkeypatch, tmp_path):
@@ -1242,67 +1224,18 @@ def test_boot_rsync_targets_mirror_subvol(monkeypatch, tmp_path):
     assert cap["rsync"][-1].endswith(f"/{ss._BOOT_MIRROR}/")
 
 
-def test_boot_migration_plain_dir_migrates(monkeypatch):
-    # Pre-versioning layout (prod): parent IS the mirror, a plain dir -> becomes
-    # <parent>/.mirror with content preserved.
-    r = _BootRemote(monkeypatch, layout="old-dir")
-    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    joined = " || ".join(r.commands)
-    assert "sudo mv /recv/h/boot /recv/h/boot.premigrate" in joined  # moved aside
-    assert "subvolume create /recv/h/boot/.mirror" in joined
-    assert "cp -a" in joined                     # content preserved
-    assert r.layout == "new"
-
-
-def test_boot_migration_early_subvol_layout_moves_mirror_and_history(monkeypatch):
-    # Early versioned layout: parent IS the mirror (a subvolume) with versions in
-    # a sibling <parent>.versions/ dir -> mirror moves inside, history absorbed.
-    r = _BootRemote(monkeypatch, layout="old-subvol",
-                    legacy_versions=["20260702T060000Z", "20260702T070000Z"])
-    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    joined = " || ".join(r.commands)
-    # The mirror subvol is MOVED (no copy needed), not recreated.
-    assert "sudo mv /recv/h/boot.premigrate /recv/h/boot/.mirror" in joined
-    assert "cp -a" not in joined
-    # Version history preserved. A read-only subvol can't be mv'd across dirs
-    # (EROFS), so each legacy version is re-snapshotted into the parent and the
-    # original deleted; the emptied legacy dir goes away.
-    assert ("sudo btrfs subvolume snapshot -r "
-            "/recv/h/boot.versions/20260702T060000Z "
-            "/recv/h/boot/20260702T060000Z") in joined
-    assert ("sudo btrfs subvolume delete "
-            "/recv/h/boot.versions/20260702T060000Z") in joined
-    assert "sudo rmdir /recv/h/boot.versions" in joined
-    assert r.layout == "new"
-    assert sorted(r.versions) == ["20260702T060000Z", "20260702T070000Z"]
-    assert r.legacy_versions == []
-
-
-def test_boot_migration_current_layout_is_readonly_noop(monkeypatch):
+def test_boot_mirror_present_is_single_probe_noop(monkeypatch):
     r = _BootRemote(monkeypatch, layout="new")
     assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    # Nothing but reads: the mirror probe + the legacy-versions sweep probe.
-    assert all(c.startswith(("sudo btrfs subvolume show", "sudo ls"))
-               for c in r.commands)
+    assert len(r.commands) == 1 and "subvolume show" in r.commands[0]
 
 
-def test_boot_migration_interim_visible_mirror_renamed(monkeypatch):
-    # Interim layout (un-hidden `mirror`): a plain same-dir rename to `.mirror`
-    # — the mirror is writable, so no read-only rename trap — and nothing else.
-    r = _BootRemote(monkeypatch, layout="interim")
-    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    assert "sudo mv /recv/h/boot/mirror /recv/h/boot/.mirror" in r.commands
-    assert r.layout == "new"
-    assert not any("subvolume create" in c or "cp -a" in c for c in r.commands)
-
-
-def test_boot_migration_absent_creates_fresh(monkeypatch):
+def test_boot_mirror_absent_creates_fresh(monkeypatch):
     r = _BootRemote(monkeypatch, layout="absent")
     assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
+    assert any("mkdir -p /recv/h/boot" in c for c in r.commands)
     assert any("subvolume create" in c and c.endswith("/.mirror")
                for c in r.commands)
-    assert not any(c.startswith("sudo mv /recv/h/boot ")
-                   for c in r.commands)          # nothing to migrate
 
 
 # ============================================================================
@@ -1313,8 +1246,8 @@ def test_report_boot_verdicts_match_prune_and_flag_undatable(monkeypatch, tmp_pa
                                                              capsys):
     # The boot report's KEEP/PRUNE must equal what _prune_boot_versions actually
     # deletes, version for version — and the undatable one shows its reason.
-    versions = ["20260630T060000Z", "20260701T060000Z", "20260702T060000Z",
-                "not-a-stamp"]
+    versions = ["20260630-060000+0000", "20260701-060000+0000",
+                "20260702-060000+0000", "not-a-stamp"]
     src = tmp_path / "boot"
     src.mkdir()
     cfg2 = _boot_cfg(boot_paths=(str(src),), retention={"default": {
@@ -1326,7 +1259,7 @@ def test_report_boot_verdicts_match_prune_and_flag_undatable(monkeypatch, tmp_pa
     r = _BootRemote(monkeypatch, layout="new", versions=list(versions))
     ss._prune_boot_versions(cfg2, name, "/v/boot")
     pruned = {p.rsplit("/", 1)[-1] for p in r.deleted()}
-    assert pruned == {"20260630T060000Z", "20260701T060000Z"}
+    assert pruned == {"20260630-060000+0000", "20260701-060000+0000"}
 
     _BootRemote(monkeypatch, layout="new", versions=list(versions))
     ss._report_boot_path(cfg2, "h", str(src))
@@ -1345,22 +1278,17 @@ def test_report_boot_verdicts_match_prune_and_flag_undatable(monkeypatch, tmp_pa
 
 
 def test_report_boot_states_and_mutation_freedom(monkeypatch, tmp_path, capsys):
-    # Old-layout / absent mirrors are reported as pre-migration states, and the
-    # report issues ONLY reads (show/ls) — never create/snapshot/delete/mv.
+    # An uninitialized mirror is reported as such, and the report issues ONLY
+    # reads (show/ls) — never create/snapshot/delete/ln.
     src = tmp_path / "boot"
     src.mkdir()
     cfg2 = _boot_cfg(boot_paths=(str(src),))
 
-    r = _BootRemote(monkeypatch, layout="old-dir")
-    ss._report_boot_path(cfg2, "h", str(src))
-    assert "old layout (next run migrates" in capsys.readouterr().out
-
     r = _BootRemote(monkeypatch, layout="absent")
     ss._report_boot_path(cfg2, "h", str(src))
-    assert "absent (next run creates" in capsys.readouterr().out
-    for cmds in (r.commands,):
-        assert all(c.startswith(("sudo btrfs subvolume show", "sudo ls"))
-                   for c in cmds)
+    assert "not initialized (next run creates it)" in capsys.readouterr().out
+    assert all(c.startswith(("sudo btrfs subvolume show", "sudo ls"))
+               for c in r.commands)
 
 
 def test_report_includes_boot_sections_and_respects_filters(monkeypatch, tmp_path,
@@ -1377,7 +1305,7 @@ def test_report_includes_boot_sections_and_respects_filters(monkeypatch, tmp_pat
     monkeypatch.setattr(ss, "list_parent_clones", lambda c, n: [])
     monkeypatch.setattr(ss, "list_target_snapshots", lambda c, rd: [])
     _BootRemote(monkeypatch, layout="new",
-                versions=["20260702T060000Z"])
+                versions=["20260702-060000+0000"])
 
     class _Args:
         subvol = None

@@ -41,7 +41,8 @@ PARENT_KEEP="2"                               # live parent + 1 redundancy slot
 # snapshot tiers (parent dir, dated backups below, a .latest symlink):
 #
 #   <RECV_BASE>/<hostname>/boot/          (and boot-efi/)
-#       mirror                            live rsync target (subvolume)
+#       .mirror                           live rsync target (subvolume; hidden
+#                                         like .snapshots — machinery, not a backup)
 #       <UTC-stamp>                       read-only versions of the mirror
 #       boot.latest -> <UTC-stamp>        newest version
 #

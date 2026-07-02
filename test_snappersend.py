@@ -986,7 +986,8 @@ class _BootRemote:
     records every command, maintaining a tiny model of the destination.
 
     `layout` is the parent path's state:
-      "new"        parent dir holding a `mirror` subvolume (current layout)
+      "new"        parent dir holding a `.mirror` subvolume (current layout)
+      "interim"    parent dir holding an un-hidden `mirror` subvolume
       "old-dir"    parent IS the mirror, a plain dir (pre-versioning layout)
       "old-subvol" parent IS the mirror, a subvolume (early versioned layout)
       "absent"     nothing there yet
@@ -1009,6 +1010,9 @@ class _BootRemote:
             if cmd.endswith("/" + ss._BOOT_MIRROR):
                 return _CP(0 if self.layout == "new" else 1, "",
                            "Not a Btrfs subvolume")
+            if cmd.endswith("/mirror"):           # interim un-hidden name
+                return _CP(0 if self.layout == "interim" else 1, "",
+                           "Not a Btrfs subvolume")
             return _CP(0 if self.layout == "old-subvol" else 1, "",
                        "Not a Btrfs subvolume")
         if cmd.startswith("sudo ls -d"):
@@ -1026,10 +1030,8 @@ class _BootRemote:
                 return _CP(0, "".join(v + "\n" for v in self.legacy_versions))
             if self.layout == "absent":
                 return _CP(2, "", "No such file or directory")
-            listing = list(self.versions)
-            if self.layout == "new":
-                listing.append(ss._BOOT_MIRROR)
-            return _CP(0, "".join(v + "\n" for v in listing))
+            # Real `ls -1` hides dotfiles, so `.mirror` never appears here.
+            return _CP(0, "".join(v + "\n" for v in self.versions))
         if "subvolume create" in cmd:
             self.layout = "new"
             return _CP(0)
@@ -1133,7 +1135,7 @@ def test_boot_prune_routes_through_bucket_keep(monkeypatch):
 
     assert "keep" in calls                       # bucketing went through the ONE loop
     all_paths = {v.path for v in calls["targets"]}
-    assert "/v/boot/mirror" not in all_paths     # live mirror never a candidate
+    assert "/v/boot/.mirror" not in all_paths    # live mirror never a candidate
     assert "/v/boot/boot.latest" not in all_paths
     undatable = {v.path for v in calls["targets"] if v.when is None}
     assert undatable == {"/v/boot/junk-version"}
@@ -1242,12 +1244,12 @@ def test_boot_rsync_targets_mirror_subvol(monkeypatch, tmp_path):
 
 def test_boot_migration_plain_dir_migrates(monkeypatch):
     # Pre-versioning layout (prod): parent IS the mirror, a plain dir -> becomes
-    # <parent>/mirror with content preserved.
+    # <parent>/.mirror with content preserved.
     r = _BootRemote(monkeypatch, layout="old-dir")
     assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
     joined = " || ".join(r.commands)
     assert "sudo mv /recv/h/boot /recv/h/boot.premigrate" in joined  # moved aside
-    assert "subvolume create /recv/h/boot/mirror" in joined
+    assert "subvolume create /recv/h/boot/.mirror" in joined
     assert "cp -a" in joined                     # content preserved
     assert r.layout == "new"
 
@@ -1260,7 +1262,7 @@ def test_boot_migration_early_subvol_layout_moves_mirror_and_history(monkeypatch
     assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
     joined = " || ".join(r.commands)
     # The mirror subvol is MOVED (no copy needed), not recreated.
-    assert "sudo mv /recv/h/boot.premigrate /recv/h/boot/mirror" in joined
+    assert "sudo mv /recv/h/boot.premigrate /recv/h/boot/.mirror" in joined
     assert "cp -a" not in joined
     # Version history preserved. A read-only subvol can't be mv'd across dirs
     # (EROFS), so each legacy version is re-snapshotted into the parent and the
@@ -1284,10 +1286,20 @@ def test_boot_migration_current_layout_is_readonly_noop(monkeypatch):
                for c in r.commands)
 
 
+def test_boot_migration_interim_visible_mirror_renamed(monkeypatch):
+    # Interim layout (un-hidden `mirror`): a plain same-dir rename to `.mirror`
+    # — the mirror is writable, so no read-only rename trap — and nothing else.
+    r = _BootRemote(monkeypatch, layout="interim")
+    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
+    assert "sudo mv /recv/h/boot/mirror /recv/h/boot/.mirror" in r.commands
+    assert r.layout == "new"
+    assert not any("subvolume create" in c or "cp -a" in c for c in r.commands)
+
+
 def test_boot_migration_absent_creates_fresh(monkeypatch):
     r = _BootRemote(monkeypatch, layout="absent")
     assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    assert any("subvolume create" in c and c.endswith("/mirror")
+    assert any("subvolume create" in c and c.endswith("/.mirror")
                for c in r.commands)
     assert not any(c.startswith("sudo mv /recv/h/boot ")
                    for c in r.commands)          # nothing to migrate

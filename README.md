@@ -138,7 +138,7 @@ through the **same** GFS bucketing loop and policy, so the two tiers can never d
 
 `/boot` (ext4) and `/boot/efi` (FAT32) aren't Btrfs, so `btrfs send` can't carry them.
 Instead **rsync is the transport and the destination does the versioning**: each
-`BOOT_PATHS` entry syncs into a live `mirror` subvolume inside a per-path parent
+`BOOT_PATHS` entry syncs into a live `.mirror` subvolume inside a per-path parent
 directory, and after a clean sync that **actually changed the mirror** the destination
 takes a read-only snapshot of it as a sibling version. The layout deliberately matches
 the snapshot tiers — parent folder, dated backups below, a `.latest` symlink — just
@@ -146,10 +146,16 @@ without the uuid/num that only the send chain needs:
 
 ```
 <RECV_BASE>/<hostname>/boot/            (and boot-efi/, and any future BOOT_PATHS entry)
-    mirror                              live rsync target (subvolume)
+    .mirror                             live rsync target (subvolume; hidden like
+                                        .snapshots — machinery, not a backup)
     20260702T092948Z                    read-only versions (UTC stamps)
     boot.latest -> …/20260702T092948Z   newest version
 ```
+
+The mirror is dotted for the same reason Snapper's `.snapshots` is: a plain `ls` of the
+parent shows only restorable content — the dated versions and `boot.latest` — while the
+mutable working area (possibly mid-sync, never a thing to restore from) stays out of
+sight.
 
 - **Same idempotence as the snapshot tiers.** rsync runs with `--itemize-changes`; a
   version is created only when the sync transferred/deleted something (or no version

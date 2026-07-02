@@ -84,7 +84,8 @@ THE BOOT TIER (non-Btrfs sources: /boot ext4, /boot/efi FAT32)
 --------------------------------------------------------------
 `btrfs send` can't carry non-Btrfs sources, so rsync is the transport and the
 DESTINATION (which is Btrfs) does the versioning: each boot path syncs into a live
-`mirror` subvolume inside a per-path parent dir, and a read-only snapshot of the
+`.mirror` subvolume inside a per-path parent dir (hidden like Snapper's .snapshots —
+machinery, not a backup), and a read-only snapshot of the
 mirror is taken as a sibling <UTC-STAMP> version — the same parent/backups/.latest
 layout, GFS retention (through the same bucketing loop), and idempotence as the
 snapshot tiers: a version is created only when the sync actually CHANGED the mirror
@@ -318,7 +319,7 @@ class Config:
     parent_keep: int = 2                # live parent + one slot of redundancy
 
     # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd into the live
-    # `mirror` subvolume inside <recv_base>/<host>/<name>/, which is snapshotted
+    # `.mirror` subvolume inside <recv_base>/<host>/<name>/, which is snapshotted
     # to a sibling <STAMP> version when a clean sync CHANGED it — same layout
     # shape, GFS retention, and idempotence as the snapshot tiers, with rsync
     # as the transport. See the BOOT TIER section.
@@ -1099,7 +1100,8 @@ def _update_latest_symlink(cfg: Config, recv_dir: str, name: str,
 # below it, a `.latest` symlink), just without the uuid/num the send chain needs:
 #
 #   <recv_base>/<host>/<name>/            e.g. .../boot/
-#       mirror                            live rsync target (subvolume)
+#       .mirror                           live rsync target (subvolume, hidden
+#                                         like .snapshots — machinery, not a backup)
 #       <STAMP>                           read-only versions of the mirror
 #       <name>.latest -> <STAMP>          newest version (archiver-stable path)
 #
@@ -1110,9 +1112,11 @@ def _update_latest_symlink(cfg: Config, recv_dir: str, name: str,
 # and fail-safe: every failure warns and continues, never aborting the run or
 # the snapshot tiers.
 
-# The live rsync target inside the per-path parent dir. Never a prune candidate
-# (excluded by name, and its name doesn't parse as a stamp anyway).
-_BOOT_MIRROR = "mirror"
+# The live rsync target inside the per-path parent dir. Hidden (dotted) like
+# Snapper's .snapshots: it's machinery, not a backup — the parent then lists as
+# pure content (dated versions + .latest). Never a prune candidate (skipped by
+# `ls -1`, excluded by name, and it doesn't parse as a stamp anyway).
+_BOOT_MIRROR = ".mirror"
 
 
 def _boot_name(src: str) -> str:
@@ -1190,13 +1194,14 @@ def _absorb_legacy_versions(cfg: Config, parent: str) -> None:
 
 def _ensure_boot_mirror_subvol(cfg: Config, parent: str) -> bool:
     """Ensure the boot layout at `parent`: a plain parent dir holding the live
-    `mirror` SUBVOLUME (the rsync target, snapshot-able in place). Idempotent,
+    `.mirror` SUBVOLUME (the rsync target, snapshot-able in place). Idempotent,
     and migrates every prior layout without losing mirror content or version
     history:
-      * <parent>/mirror already a subvolume            -> no-op
+      * <parent>/.mirror already a subvolume           -> no-op
+      * <parent>/mirror (interim layout, un-hidden)     -> renamed to .mirror
       * <parent> is itself the mirror (a plain dir from the pre-versioning
         code, or a subvolume from the early versioned layout)  -> moved to
-        <parent>/mirror, content preserved
+        <parent>/.mirror, content preserved
       * absent                                          -> created fresh
     Versions from the early sibling `<parent>.versions/` dir are absorbed into
     the parent. False on failure (the caller warns and continues — fail-safe)."""
@@ -1206,6 +1211,21 @@ def _ensure_boot_mirror_subvol(cfg: Config, parent: str) -> bool:
         if not cfg.dry_run:
             _absorb_legacy_versions(cfg, parent)     # crash-safe: sweep leftovers
         return True                                  # current layout already
+    # Interim layout: the mirror existed un-hidden as <parent>/mirror. A plain
+    # same-dir rename (the mirror is writable, so no read-only rename trap).
+    visible = os.path.join(parent, "mirror")
+    if run_remote(cfg, f"sudo btrfs subvolume show {shlex.quote(visible)}",
+                  check=False).returncode == 0:
+        if cfg.dry_run:
+            log_info(f"[dry-run] would rename {visible} -> {mirror}")
+            return True
+        if run_remote(cfg, f"sudo mv {shlex.quote(visible)} {qm}",
+                      check=False).returncode == 0:
+            log_info(f"  renamed {visible} -> {mirror} (hidden, one-time)")
+            _absorb_legacy_versions(cfg, parent)
+            return True
+        log_warn(f"  could not rename {visible} -> {mirror} — leaving as-is")
+        return False
     ls = run_remote(cfg, f"sudo ls -d {qp}", check=False)
     if _is_ssh_transport_failure(ls):
         log_warn(f"  cannot inspect {parent} (destination unreachable) — "
@@ -1221,7 +1241,7 @@ def _ensure_boot_mirror_subvol(cfg: Config, parent: str) -> bool:
         return True
 
     if exists:
-        # <parent> IS the old mirror: move it aside, rebuild as parent/mirror.
+        # <parent> IS the old mirror: move it aside, rebuild as parent/.mirror.
         old = parent.rstrip("/") + ".premigrate"
         qold = shlex.quote(old)
         # Stale scratch from a crashed prior attempt: a subvol needs `subvolume
@@ -1355,7 +1375,7 @@ def _prune_boot_versions(cfg: Config, name: str, parent: str) -> bool:
 
 
 def boot_backup(cfg: Config, hostname: str) -> bool:
-    """rsync each non-Btrfs boot path into <parent>/mirror, snapshot the mirror
+    """rsync each non-Btrfs boot path into <parent>/.mirror, snapshot the mirror
     to <parent>/<STAMP> when the sync changed it (idempotent otherwise, like the
     snapshot tiers), then apply GFS retention over the versions. True iff every
     path completed cleanly. Fail-safe: a failure warns but does not abort the

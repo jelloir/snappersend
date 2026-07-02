@@ -1062,12 +1062,16 @@ def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
     return all_ok
 
 
-def _update_latest_symlink(cfg: Config, recv_dir: str, name: str) -> None:
-    """Maintain <recv_dir>/<subvol>.latest -> newest received SUBVOL, a stable
-    target for a downstream archiver (e.g. restic) running on the destination."""
+def _update_latest_symlink(cfg: Config, recv_dir: str, name: str,
+                           subdir: str = "snapshot") -> None:
+    """Maintain <recv_dir>/<base>.latest -> newest received subvol, a stable
+    target for a downstream archiver (e.g. restic) running on the destination.
+    Snapshot tiers point at the wrapper's inner `snapshot` subvol; the boot tier
+    (subdir="") points at the version directory itself."""
     base = os.path.basename(recv_dir.rstrip("/"))
     link = os.path.join(recv_dir, f"{base}.latest")
-    target = os.path.join(recv_dir, name, "snapshot")
+    target = os.path.join(recv_dir, name, subdir) if subdir \
+        else os.path.join(recv_dir, name)
     run_remote(cfg, f"sudo ln -sfn {shlex.quote(target)} {shlex.quote(link)}", check=False)
 
 
@@ -1075,17 +1079,29 @@ def _update_latest_symlink(cfg: Config, recv_dir: str, name: str) -> None:
 # BOOT TIER  (non-Btrfs: EFI=FAT32, /boot=ext4 — rsync mirror + dest-side versions)
 # ============================================================================
 # The boot sources aren't Btrfs, so `btrfs send` can't carry them — but the
-# DESTINATION is Btrfs, so it can do the versioning: each boot path rsyncs into a
-# per-path live-mirror SUBVOLUME at <recv_base>/<host>/<name>, and after every
-# clean sync the mirror is snapshotted read-only into <name>.versions/<STAMP>.
-# The versioning model is thus identical to the snapshot tiers — GFS retention
-# over dated read-only snapshots — with rsync as the transport. The tier stays
-# independent and fail-safe: every failure warns and continues, never aborting
-# the run or the snapshot tiers.
+# DESTINATION is Btrfs, so it can do the versioning. The destination layout
+# mirrors the snapshot tiers (parent dir named for the source, dated backups
+# below it, a `.latest` symlink), just without the uuid/num the send chain needs:
+#
+#   <recv_base>/<host>/<name>/            e.g. .../boot/
+#       mirror                            live rsync target (subvolume)
+#       <STAMP>                           read-only versions of the mirror
+#       <name>.latest -> <STAMP>          newest version (archiver-stable path)
+#
+# Versioning honours the snapshot tiers' idempotence methodology: a version is
+# created only when the sync actually CHANGED the mirror (rsync itemizes what it
+# did), so re-running when nothing changed creates nothing — the analogue of
+# "newest already on destination, no send needed". The tier stays independent
+# and fail-safe: every failure warns and continues, never aborting the run or
+# the snapshot tiers.
+
+# The live rsync target inside the per-path parent dir. Never a prune candidate
+# (excluded by name, and its name doesn't parse as a stamp anyway).
+_BOOT_MIRROR = "mirror"
 
 
 def _boot_name(src: str) -> str:
-    """Mirror name for a boot path: /boot -> boot, /boot/efi -> boot-efi. Also
+    """Parent-dir name for a boot path: /boot -> boot, /boot/efi -> boot-efi. Also
     the retention-override name (uppercased, '-' -> '_': BOOT_EFI_TIMELINE_...)."""
     return src.strip("/").replace("/", "-")
 
@@ -1126,97 +1142,167 @@ def _rsync_mtime_opts(src: str) -> list[str]:
     return ["--modify-window=1"] if fstype in ("vfat", "msdos") else []
 
 
-def _ensure_boot_mirror_subvol(cfg: Config, mirror: str) -> bool:
-    """Ensure the live mirror at `mirror` is a Btrfs SUBVOLUME (snapshot-able).
-    Idempotent: already a subvolume -> no-op; absent -> create; plain directory
-    (the pre-versioning layout) -> one-time migration preserving the mirror
-    content best-effort (a content-copy failure only costs a re-rsync — it's a
-    mirror, not a version). Never touches <mirror>.versions. False on failure."""
-    q = shlex.quote(mirror)
-    if run_remote(cfg, f"sudo btrfs subvolume show {q}", check=False).returncode == 0:
-        return True                                    # already a subvolume
-    ls = run_remote(cfg, f"sudo ls -d {q}", check=False)
+def _absorb_legacy_versions(cfg: Config, parent: str) -> None:
+    """One-time sweep: an early layout kept versions in a sibling
+    `<parent>.versions/` dir — absorb them into the parent so history survives
+    the layout change. A read-only subvolume cannot be mv'd across directories
+    (rename hits EROFS on its own RO tree), so each version is re-snapshotted at
+    the new location and the original deleted — same content, same stamp
+    identity (a boot version's uuid carries no meaning). Best-effort; anything
+    unabsorbable stays put (and is therefore never deleted)."""
+    legacy = parent.rstrip("/") + ".versions"
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(legacy)}", check=False)
+    if cp.returncode != 0:
+        return
+    for n in cp.stdout.split():
+        src = shlex.quote(os.path.join(legacy, n))
+        dst = os.path.join(parent, n)
+        # `snapshot -r a b` with an EXISTING b creates b/<basename> instead of
+        # failing, so probe first (also skips work a crashed prior sweep did).
+        if run_remote(cfg, f"sudo ls -d {shlex.quote(dst)}",
+                      check=False).returncode != 0:
+            snap = run_remote(cfg, f"sudo btrfs subvolume snapshot -r {src} "
+                                   f"{shlex.quote(dst)}", check=False)
+            if snap.returncode != 0:
+                log_warn(f"  could not absorb legacy version {n} into {parent}/ "
+                         f"({snap.stderr.strip()}) — leaving it in place")
+                continue
+        if run_remote(cfg, f"sudo btrfs subvolume delete {src}",
+                      check=False).returncode == 0:
+            log_info(f"  absorbed legacy version {n} into {parent}/")
+    run_remote(cfg, f"sudo rmdir {shlex.quote(legacy)}", check=False)
+
+
+def _ensure_boot_mirror_subvol(cfg: Config, parent: str) -> bool:
+    """Ensure the boot layout at `parent`: a plain parent dir holding the live
+    `mirror` SUBVOLUME (the rsync target, snapshot-able in place). Idempotent,
+    and migrates every prior layout without losing mirror content or version
+    history:
+      * <parent>/mirror already a subvolume            -> no-op
+      * <parent> is itself the mirror (a plain dir from the pre-versioning
+        code, or a subvolume from the early versioned layout)  -> moved to
+        <parent>/mirror, content preserved
+      * absent                                          -> created fresh
+    Versions from the early sibling `<parent>.versions/` dir are absorbed into
+    the parent. False on failure (the caller warns and continues — fail-safe)."""
+    mirror = os.path.join(parent, _BOOT_MIRROR)
+    qp, qm = shlex.quote(parent), shlex.quote(mirror)
+    if run_remote(cfg, f"sudo btrfs subvolume show {qm}", check=False).returncode == 0:
+        if not cfg.dry_run:
+            _absorb_legacy_versions(cfg, parent)     # crash-safe: sweep leftovers
+        return True                                  # current layout already
+    ls = run_remote(cfg, f"sudo ls -d {qp}", check=False)
     if _is_ssh_transport_failure(ls):
-        log_warn(f"  cannot inspect {mirror} (destination unreachable) — "
+        log_warn(f"  cannot inspect {parent} (destination unreachable) — "
                  "skipping versioning setup")
         return False
     exists = ls.returncode == 0
+    was_subvol = exists and run_remote(
+        cfg, f"sudo btrfs subvolume show {qp}", check=False).returncode == 0
 
     if cfg.dry_run:
-        log_info(f"[dry-run] would {'migrate dir to' if exists else 'create'} "
-                 f"mirror subvolume {mirror}")
+        log_info(f"[dry-run] would {'migrate old mirror into' if exists else 'create'}"
+                 f" {mirror}")
         return True
 
-    if not exists:
-        run_remote(cfg, f"sudo mkdir -p {shlex.quote(os.path.dirname(mirror))}",
-                   check=False)
-        cp = run_remote(cfg, f"sudo btrfs subvolume create {q}", check=False)
+    if exists:
+        # <parent> IS the old mirror: move it aside, rebuild as parent/mirror.
+        old = parent.rstrip("/") + ".premigrate"
+        qold = shlex.quote(old)
+        # Stale scratch from a crashed prior attempt: a subvol needs `subvolume
+        # delete`; a plain dir needs `rm -rf` (each is a no-op for the other).
+        run_remote(cfg, f"sudo btrfs subvolume delete {qold}", check=False)
+        run_remote(cfg, f"sudo rm -rf {qold}", check=False)
+        if run_remote(cfg, f"sudo mv {qp} {qold}", check=False).returncode != 0:
+            log_warn(f"  migration: could not move {parent} aside — leaving as-is")
+            return False
+        run_remote(cfg, f"sudo mkdir -p {qp}", check=False)
+        if was_subvol:
+            # Early versioned layout: the mirror subvol just moves into place.
+            cp = run_remote(cfg, f"sudo mv {qold} {qm}", check=False)
+            if cp.returncode != 0:
+                log_warn(f"  migration: could not move mirror subvolume into "
+                         f"{mirror}: {cp.stderr.strip()}")
+                return False
+        else:
+            # Pre-versioning plain-dir mirror: new subvol + preserved content
+            # (reflinked where possible; a copy failure only costs a re-rsync).
+            cp = run_remote(cfg, f"sudo btrfs subvolume create {qm}", check=False)
+            if cp.returncode != 0:
+                log_warn(f"  migration: subvolume create failed "
+                         f"({cp.stderr.strip()}); restoring plain-dir mirror")
+                run_remote(cfg, f"sudo rmdir {qp}", check=False)
+                run_remote(cfg, f"sudo mv {qold} {qp}", check=False)
+                return False
+            if run_remote(cfg, f"sudo cp -a --reflink=auto {qold}/. {qm}/",
+                          check=False).returncode != 0:
+                log_warn(f"  migration: content copy into {mirror} failed — "
+                         "next rsync repopulates the mirror")
+            run_remote(cfg, f"sudo rm -rf {qold}", check=False)
+        log_info(f"  migrated old mirror layout to {mirror} (one-time)")
+    else:
+        run_remote(cfg, f"sudo mkdir -p {qp}", check=False)
+        cp = run_remote(cfg, f"sudo btrfs subvolume create {qm}", check=False)
         if cp.returncode != 0:
             log_warn(f"  could not create mirror subvolume {mirror}: "
                      f"{cp.stderr.strip()}")
             return False
-        return True
 
-    # Plain directory -> subvolume, preserving content (reflinked where possible).
-    old = mirror.rstrip("/") + ".premigrate"
-    qold = shlex.quote(old)
-    run_remote(cfg, f"sudo rm -rf {qold}", check=False)   # stale scratch from a crash
-    if run_remote(cfg, f"sudo mv {q} {qold}", check=False).returncode != 0:
-        log_warn(f"  migration: could not move {mirror} aside — leaving as-is")
-        return False
-    cp = run_remote(cfg, f"sudo btrfs subvolume create {q}", check=False)
-    if cp.returncode != 0:
-        log_warn(f"  migration: subvolume create failed ({cp.stderr.strip()}); "
-                 "restoring plain-dir mirror")
-        run_remote(cfg, f"sudo mv {qold} {q}", check=False)
-        return False
-    if run_remote(cfg, f"sudo cp -a --reflink=auto {qold}/. {q}/",
-                  check=False).returncode != 0:
-        log_warn(f"  migration: content copy into {mirror} failed — "
-                 "next rsync repopulates the mirror")
-    run_remote(cfg, f"sudo rm -rf {qold}", check=False)
-    log_info(f"  migrated {mirror} to a subvolume (one-time, enables versioning)")
+    _absorb_legacy_versions(cfg, parent)
     return True
 
 
-def _snapshot_boot_mirror(cfg: Config, mirror: str, versions_dir: str) -> bool:
-    """Version the just-synced mirror: a read-only destination-side snapshot at
-    <versions_dir>/<STAMP>. Only called after a clean rsync (rc 0/24), so the
-    newest version always represents a fully-synced mirror."""
-    dst = os.path.join(versions_dir, _boot_stamp())
+def _list_boot_versions(cfg: Config, parent: str) -> Optional[list]:
+    """The dated version snapshots directly under the boot parent — everything
+    except the live mirror and the `.latest` symlink. Returns None when the
+    destination listing FAILED (transport) — the caller must then not prune —
+    and [] for a merely absent/empty parent. Unparseable names get when=None."""
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(parent)}", check=False)
+    if cp.returncode != 0:
+        if _is_ssh_transport_failure(cp):
+            log_warn(f"  cannot list {parent} (destination unreachable)")
+            return None
+        return []
+    return [BootVersion(path=os.path.join(parent, n), when=_parse_boot_stamp(n))
+            for n in cp.stdout.split()
+            if n != _BOOT_MIRROR and not n.endswith(".latest")]
+
+
+def _snapshot_boot_mirror(cfg: Config, parent: str) -> bool:
+    """Version the just-synced mirror: a read-only snapshot at <parent>/<STAMP>,
+    then point <parent>/<name>.latest at it. Only called after a clean rsync
+    (rc 0/24) that CHANGED the mirror (or when no version exists yet), so the
+    newest version always represents a fully-synced mirror and an unchanged
+    re-run creates nothing."""
+    stamp = _boot_stamp()
+    mirror = os.path.join(parent, _BOOT_MIRROR)
+    dst = os.path.join(parent, stamp)
     if cfg.dry_run:
         log_info(f"[dry-run] would snapshot {mirror} -> {dst}")
         return True
-    run_remote(cfg, f"sudo mkdir -p {shlex.quote(versions_dir)}", check=False)
     cp = run_remote(cfg, f"sudo btrfs subvolume snapshot -r {shlex.quote(mirror)} "
                          f"{shlex.quote(dst)}", check=False)
     if cp.returncode != 0:
         log_warn(f"  could not version {mirror}: {cp.stderr.strip()}")
         return False
-    log_info(f"  versioned -> {os.path.basename(versions_dir)}/"
-             f"{os.path.basename(dst)}")
+    _update_latest_symlink(cfg, parent, stamp, subdir="")
+    log_info(f"  versioned -> {os.path.basename(parent)}/{stamp}")
     return True
 
 
-def _prune_boot_versions(cfg: Config, name: str, versions_dir: str) -> bool:
+def _prune_boot_versions(cfg: Config, name: str, parent: str) -> bool:
     """GFS retention over the dated boot versions, routed through the SAME
     _bucket_keep loop as the snapshot tiers (policy from cfg.retention_for(name),
-    so BOOT_/BOOT_EFI_TIMELINE_LIMIT_* overrides apply). Prune candidates come
-    ONLY from inside <name>.versions/ — the live mirror is never a candidate; an
-    unparseable name has when=None and is always kept (the _UNDATABLE sentinel);
-    a failed destination listing prunes nothing."""
-    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(versions_dir)}", check=False)
-    if cp.returncode != 0:
-        # Either .versions doesn't exist yet (nothing to prune) or the transport
-        # failed — a possibly-incomplete listing must never drive deletions.
-        if _is_ssh_transport_failure(cp):
-            log_warn(f"  cannot list {versions_dir} (destination unreachable) — "
-                     "skipping boot retention")
-            return False
-        return True
-    versions = [BootVersion(path=os.path.join(versions_dir, n),
-                            when=_parse_boot_stamp(n))
-                for n in cp.stdout.split()]
+    so BOOT_/BOOT_EFI_TIMELINE_LIMIT_* overrides apply). Prune candidates are
+    only the version entries under the parent — the live mirror and the .latest
+    link are never candidates; an unparseable name has when=None and is always
+    kept (the _UNDATABLE sentinel); a failed destination listing prunes nothing.
+    After pruning, .latest is repointed at the newest survivor (as the snapshot
+    tiers do)."""
+    versions = _list_boot_versions(cfg, parent)
+    if versions is None:
+        log_warn("  skipping boot retention (listing failed)")
+        return False
     if not versions:
         return True
 
@@ -1232,6 +1318,8 @@ def _prune_boot_versions(cfg: Config, name: str, versions_dir: str) -> bool:
     to_delete = [v for v in versions if v.path not in keep]
     log_info(f"  [{name}] versions: {len(versions) - len(to_delete)} kept, "
              f"{len(to_delete)} pruned")
+    if not to_delete:
+        return True
     ok = True
     for v in to_delete:
         if cfg.dry_run:
@@ -1242,13 +1330,19 @@ def _prune_boot_versions(cfg: Config, name: str, versions_dir: str) -> bool:
         if dcp.returncode != 0:
             log_warn(f"  failed to prune {v.path}: {dcp.stderr.strip()}")
             ok = False
+    if not cfg.dry_run:
+        survivors = [v for v in versions if v.path in keep]
+        if survivors:
+            newest = max(survivors, key=lambda v: v.when or datetime.min)
+            _update_latest_symlink(cfg, parent,
+                                   os.path.basename(newest.path), subdir="")
     return ok
 
 
 def boot_backup(cfg: Config, hostname: str) -> bool:
-    """rsync each non-Btrfs boot path into its live-mirror subvolume at
-    <recv_base>/<hostname>/<name>/, snapshot the mirror into <name>.versions/
-    on a clean sync, then apply GFS retention over the versions. True iff every
+    """rsync each non-Btrfs boot path into <parent>/mirror, snapshot the mirror
+    to <parent>/<STAMP> when the sync changed it (idempotent otherwise, like the
+    snapshot tiers), then apply GFS retention over the versions. True iff every
     path completed cleanly. Fail-safe: a failure warns but does not abort the
     run (the boot tier is independent of the snapshot tiers)."""
     if not cfg.boot_backup_enabled:
@@ -1265,24 +1359,27 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
             log_warn(f"  boot path {src} not present — skipping")
             continue
         name = _boot_name(src)                    # /boot/efi -> boot-efi
-        dest = f"{cfg.recv_base}/{hostname}/{name}"
-        versions_dir = f"{dest}.versions"
+        parent = f"{cfg.recv_base}/{hostname}/{name}"
+        mirror = f"{parent}/{_BOOT_MIRROR}"
 
-        if not _ensure_boot_mirror_subvol(cfg, dest):
+        if not _ensure_boot_mirror_subvol(cfg, parent):
             all_ok = False    # warned already; mirror stays as-is this run
 
+        # -i (itemize-changes) is the change detector: any output line means the
+        # sync transferred/deleted/re-attributed something, i.e. the mirror now
+        # differs from the last version and deserves a new one.
         rsync_argv = [
-            "rsync", "-aAX", "--delete",
+            "rsync", "-aAXi", "--delete",
             *_rsync_mtime_opts(src),
             "-e", rsh,
             "--rsync-path", "sudo rsync",
             f"{src.rstrip('/')}/",
-            f"{cfg.server_user}@{cfg.server_host}:{dest}/",
+            f"{cfg.server_user}@{cfg.server_host}:{mirror}/",
         ]
         if cfg.dry_run:
-            log_info(f"[dry-run] rsync {src}/ -> {dest}/")
-            _snapshot_boot_mirror(cfg, dest, versions_dir)   # logs intent only
-            all_ok = _prune_boot_versions(cfg, name, versions_dir) and all_ok
+            log_info(f"[dry-run] rsync {src}/ -> {mirror}/ "
+                     "(would version only if the sync changed the mirror)")
+            all_ok = _prune_boot_versions(cfg, name, parent) and all_ok
             continue
 
         cp = run_local(rsync_argv, check=False)
@@ -1291,15 +1388,21 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
         # (don't fail) otherwise — and version ONLY a clean sync, so the newest
         # version always represents a fully-synced mirror.
         if cp.returncode in (0, 24):
-            log_ok(f"  {src} mirrored to {dest}")
-            all_ok = _snapshot_boot_mirror(cfg, dest, versions_dir) and all_ok
+            changed = bool(cp.stdout.strip())
+            versions = _list_boot_versions(cfg, parent)   # None (unknown) -> version
+            if changed or not versions:
+                log_ok(f"  {src} mirrored to {mirror}")
+                all_ok = _snapshot_boot_mirror(cfg, parent) and all_ok
+            else:
+                log_info(f"  [{name}] mirror unchanged — already versioned, "
+                         "no new version needed.")
         else:
             log_warn(f"  rsync of {src} failed (rc={cp.returncode}) — continuing; "
                      "boot tier is independent of the snapshot tiers; "
                      "no version snapshot this run"
                      + (f": {cp.stderr.strip()}" if cp.stderr.strip() else ""))
             all_ok = False
-        all_ok = _prune_boot_versions(cfg, name, versions_dir) and all_ok
+        all_ok = _prune_boot_versions(cfg, name, parent) and all_ok
     return all_ok
 
 
@@ -1803,9 +1906,9 @@ def _report_boot_path(cfg: Config, hostname: str, src: str) -> None:
     `_bucket_attribute` — the same loop boot retention uses — so this view can never
     disagree with what a real run would prune. Mutates nothing (remote reads only)."""
     name = _boot_name(src)
-    mirror = f"{cfg.recv_base}/{hostname}/{name}"
-    versions_dir = f"{mirror}.versions"
-    print(f"\n=== {name}  ({src} -> {mirror}, rsync mirror + dest-side versions) ===")
+    parent = f"{cfg.recv_base}/{hostname}/{name}"
+    mirror = os.path.join(parent, _BOOT_MIRROR)
+    print(f"\n=== {name}  ({src} -> {parent}, rsync mirror + dest-side versions) ===")
 
     if not os.path.ismount(src) and not os.path.isdir(src):
         print(f"  Source {src} not present on this host — nothing mirrored.")
@@ -1819,8 +1922,8 @@ def _report_boot_path(cfg: Config, hostname: str, src: str) -> None:
         print("  Mirror: unreachable — cannot report mirror/versions")
         return
     else:
-        ls = run_remote(cfg, f"sudo ls -d {shlex.quote(mirror)}", check=False)
-        print("  Mirror: " + ("plain directory (next run migrates it to a subvolume)"
+        ls = run_remote(cfg, f"sudo ls -d {shlex.quote(parent)}", check=False)
+        print("  Mirror: " + ("old layout (next run migrates it in place)"
                               if ls.returncode == 0 else
                               "absent (next run creates it)"))
 
@@ -1833,10 +1936,7 @@ def _report_boot_path(cfg: Config, hostname: str, src: str) -> None:
     print(f"  Versions  (policy: hourly={kh} daily={kd} weekly={kw} "
           f"monthly={km} yearly={ky}, tz={cfg.retention_timezone}):")
 
-    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(versions_dir)}", check=False)
-    versions = [] if cp.returncode != 0 else \
-        [BootVersion(path=os.path.join(versions_dir, n), when=_parse_boot_stamp(n))
-         for n in cp.stdout.split()]
+    versions = _list_boot_versions(cfg, parent) or []
     if not versions:
         print("    (none yet)")
         return

@@ -36,12 +36,18 @@ PARENT_TREE_BASE="/.snappersend"
 PARENT_KEEP="2"                               # live parent + 1 redundancy slot
 
 # ---- Boot tier (optional) ----------------------------------------------------
-# /boot + /boot/efi are not Btrfs, so btrfs send can't carry them. Instead each
-# path is rsync'd into a live-mirror Btrfs SUBVOLUME on the destination
-# (<RECV_BASE>/<hostname>/{boot,boot-efi}), and after every clean sync the
-# destination snapshots that mirror into <name>.versions/<UTC-stamp> — the same
-# GFS-versioned model as the snapshot tiers, with rsync as the transport.
-# Retention over those versions uses the TIMELINE_LIMIT_* block below, with
+# /boot + /boot/efi are not Btrfs, so btrfs send can't carry them; rsync is the
+# transport and the DESTINATION does the versioning. The layout matches the
+# snapshot tiers (parent dir, dated backups below, a .latest symlink):
+#
+#   <RECV_BASE>/<hostname>/boot/          (and boot-efi/)
+#       mirror                            live rsync target (subvolume)
+#       <UTC-stamp>                       read-only versions of the mirror
+#       boot.latest -> <UTC-stamp>        newest version
+#
+# A new version is created only when a clean sync actually CHANGED the mirror —
+# an unchanged re-run creates nothing, the same idempotence as the snapshot
+# tiers. Retention over the versions uses the TIMELINE_LIMIT_* block below, with
 # optional per-path overrides (see the overrides section at the bottom). FAT32's
 # 2-second mtime granularity is handled automatically (--modify-window=1 for
 # vfat sources).

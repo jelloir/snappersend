@@ -285,11 +285,13 @@ To cleanly remove the destination transport config (transport user + its
 
 ```sh
 sudo snappersend decom-dest admin@backup-host        # received data is PRESERVED
-sudo snappersend decom-dest admin@backup-host --purge-data   # also delete THIS host's
-                                                             # received snapshots (asks first)
 ```
 
-`decom-dest` never touches the received backups unless you pass `--purge-data`. If the
+`decom-dest` never touches the received backups — snappersend deliberately offers no
+way to delete them, so a mistyped command can never destroy your backup history.
+Removing the received data after decommissioning is your job, done by hand on the
+destination (the received snapshots and boot mirrors/versions are Btrfs subvolumes:
+`btrfs subvolume delete` them, then remove the plain wrapper dirs). If the
 `setup-dest`/`verify` transport check fails: `Permission denied (publickey)` means the key
 wasn't authorized (re-run `setup-dest`); `Host key verification failed` means the pinned
 host key changed; a hang then `Connection timed out` means a wrong `SERVER_HOST`/`SSH_PORT`

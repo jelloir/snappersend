@@ -305,8 +305,10 @@ class Config:
     parent_tree_base: str = "/.snappersend"
     parent_keep: int = 2                # live parent + one slot of redundancy
 
-    # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd as a single current
-    # mirror, not versioned, not through the snapshot machinery.
+    # Non-Btrfs boot tier (EFI=FAT32, /boot=ext4): rsync'd into a live-mirror
+    # Btrfs SUBVOLUME on the destination, which is then snapshotted into
+    # <name>.versions/<STAMP> after each clean sync — same GFS-versioned model
+    # as the snapshot tiers, with rsync as the transport.
     boot_backup_enabled: bool = True
     boot_paths: tuple = ("/boot", "/boot/efi")
 
@@ -334,6 +336,22 @@ def _parse_tiers(d: dict, prefix: str = "") -> dict:
                      "treating tier as disabled (0)")
             keep[gfs_key] = 0
     return keep
+
+
+def _tier_override(d: dict, prefix: str, default_keep: dict) -> Optional[dict]:
+    """The merged retention policy for one <PREFIX>_TIMELINE_LIMIT_* override block
+    (subvol or boot path), or None if the file mentions no key under that prefix.
+    A tier counts as overridden if the key is PRESENT (even "0" — an explicit 0
+    disables that tier); a tier the user didn't mention keeps the default value."""
+    raw = {gk: d.get(f"{prefix}{sk}") for sk, gk in _TIER_KEYS}
+    if not any(v not in (None, "") for v in raw.values()):
+        return None
+    override = _parse_tiers(d, prefix=prefix)
+    merged = dict(default_keep)
+    for gk, val in override.items():
+        if raw[gk] not in (None, ""):
+            merged[gk] = val
+    return merged
 
 
 def load_config(path: str = "/etc/snappersend/config") -> dict:
@@ -422,18 +440,12 @@ def load_config(path: str = "/etc/snappersend/config") -> dict:
                         "keep_monthly": 6, "keep_yearly": 2}
     retention = {"default": default_keep}
     names = list(kwargs.get("subvols", {"root": 0, "home": 0}).keys())
+    # Boot-path versions use the same override scheme, named by the path's derived
+    # mirror name with '-' -> '_' (BOOT_TIMELINE_LIMIT_*, BOOT_EFI_TIMELINE_LIMIT_*).
+    names += [_boot_name(p) for p in kwargs.get("boot_paths", ("/boot", "/boot/efi"))]
     for name in names:
-        override = _parse_tiers(d, prefix=f"{name.upper()}_")
-        # A tier counts as overridden if the key is PRESENT (even "0" — an explicit
-        # 0 disables that tier for this subvol); a tier the user didn't mention
-        # keeps the default value.
-        raw = {gk: d.get(f"{name.upper()}_{sk}")
-               for sk, gk in _TIER_KEYS}
-        if any(v not in (None, "") for v in raw.values()):
-            merged = dict(default_keep)
-            for gk, val in override.items():
-                if raw[gk] not in (None, ""):
-                    merged[gk] = val
+        merged = _tier_override(d, f"{name.upper().replace('-', '_')}_", default_keep)
+        if merged is not None:
             retention[name] = merged
     kwargs["retention"] = retention
 
@@ -1060,13 +1072,185 @@ def _update_latest_symlink(cfg: Config, recv_dir: str, name: str) -> None:
 
 
 # ============================================================================
-# BOOT TIER  (non-Btrfs: EFI=FAT32, /boot=ext4 — rsync mirror, not versioned)
+# BOOT TIER  (non-Btrfs: EFI=FAT32, /boot=ext4 — rsync mirror + dest-side versions)
 # ============================================================================
+# The boot sources aren't Btrfs, so `btrfs send` can't carry them — but the
+# DESTINATION is Btrfs, so it can do the versioning: each boot path rsyncs into a
+# per-path live-mirror SUBVOLUME at <recv_base>/<host>/<name>, and after every
+# clean sync the mirror is snapshotted read-only into <name>.versions/<STAMP>.
+# The versioning model is thus identical to the snapshot tiers — GFS retention
+# over dated read-only snapshots — with rsync as the transport. The tier stays
+# independent and fail-safe: every failure warns and continues, never aborting
+# the run or the snapshot tiers.
+
+
+def _boot_name(src: str) -> str:
+    """Mirror name for a boot path: /boot -> boot, /boot/efi -> boot-efi. Also
+    the retention-override name (uppercased, '-' -> '_': BOOT_EFI_TIMELINE_...)."""
+    return src.strip("/").replace("/", "-")
+
+
+# UTC, filesystem-safe, second precision. The stamp IS the version's identity —
+# it round-trips to the naive-UTC instant retention buckets on.
+_BOOT_STAMP_FMT = "%Y%m%dT%H%M%SZ"
+
+
+def _boot_stamp(now: Optional[datetime] = None) -> str:
+    dt = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    return dt.strftime(_BOOT_STAMP_FMT)
+
+
+def _parse_boot_stamp(name: str) -> Optional[datetime]:
+    """Naive-UTC instant from a version dir name; None if it isn't a stamp (an
+    undatable version is always KEPT — never delete what can't be dated)."""
+    try:
+        return datetime.strptime(name, _BOOT_STAMP_FMT)
+    except ValueError:
+        return None
+
+
+@dataclass
+class BootVersion:
+    """One dated boot-mirror version on the destination — exactly the surface
+    (.path/.when) the shared _bucket_keep loop needs."""
+    path: str
+    when: Optional[datetime]
+
+
+def _rsync_mtime_opts(src: str) -> list[str]:
+    """FAT32 (the ESP) stores mtimes at 2-second granularity, so rsync's exact
+    mtime comparison spuriously re-copies everything each run; --modify-window=1
+    tolerates the rounding. Applied only to vfat/msdos sources — ext4 stays exact."""
+    cp = run_local(["findmnt", "-n", "-o", "FSTYPE", "--target", src], check=False)
+    fstype = (cp.stdout or "").strip().lower() if cp.returncode == 0 else ""
+    return ["--modify-window=1"] if fstype in ("vfat", "msdos") else []
+
+
+def _ensure_boot_mirror_subvol(cfg: Config, mirror: str) -> bool:
+    """Ensure the live mirror at `mirror` is a Btrfs SUBVOLUME (snapshot-able).
+    Idempotent: already a subvolume -> no-op; absent -> create; plain directory
+    (the pre-versioning layout) -> one-time migration preserving the mirror
+    content best-effort (a content-copy failure only costs a re-rsync — it's a
+    mirror, not a version). Never touches <mirror>.versions. False on failure."""
+    q = shlex.quote(mirror)
+    if run_remote(cfg, f"sudo btrfs subvolume show {q}", check=False).returncode == 0:
+        return True                                    # already a subvolume
+    ls = run_remote(cfg, f"sudo ls -d {q}", check=False)
+    if _is_ssh_transport_failure(ls):
+        log_warn(f"  cannot inspect {mirror} (destination unreachable) — "
+                 "skipping versioning setup")
+        return False
+    exists = ls.returncode == 0
+
+    if cfg.dry_run:
+        log_info(f"[dry-run] would {'migrate dir to' if exists else 'create'} "
+                 f"mirror subvolume {mirror}")
+        return True
+
+    if not exists:
+        run_remote(cfg, f"sudo mkdir -p {shlex.quote(os.path.dirname(mirror))}",
+                   check=False)
+        cp = run_remote(cfg, f"sudo btrfs subvolume create {q}", check=False)
+        if cp.returncode != 0:
+            log_warn(f"  could not create mirror subvolume {mirror}: "
+                     f"{cp.stderr.strip()}")
+            return False
+        return True
+
+    # Plain directory -> subvolume, preserving content (reflinked where possible).
+    old = mirror.rstrip("/") + ".premigrate"
+    qold = shlex.quote(old)
+    run_remote(cfg, f"sudo rm -rf {qold}", check=False)   # stale scratch from a crash
+    if run_remote(cfg, f"sudo mv {q} {qold}", check=False).returncode != 0:
+        log_warn(f"  migration: could not move {mirror} aside — leaving as-is")
+        return False
+    cp = run_remote(cfg, f"sudo btrfs subvolume create {q}", check=False)
+    if cp.returncode != 0:
+        log_warn(f"  migration: subvolume create failed ({cp.stderr.strip()}); "
+                 "restoring plain-dir mirror")
+        run_remote(cfg, f"sudo mv {qold} {q}", check=False)
+        return False
+    if run_remote(cfg, f"sudo cp -a --reflink=auto {qold}/. {q}/",
+                  check=False).returncode != 0:
+        log_warn(f"  migration: content copy into {mirror} failed — "
+                 "next rsync repopulates the mirror")
+    run_remote(cfg, f"sudo rm -rf {qold}", check=False)
+    log_info(f"  migrated {mirror} to a subvolume (one-time, enables versioning)")
+    return True
+
+
+def _snapshot_boot_mirror(cfg: Config, mirror: str, versions_dir: str) -> bool:
+    """Version the just-synced mirror: a read-only destination-side snapshot at
+    <versions_dir>/<STAMP>. Only called after a clean rsync (rc 0/24), so the
+    newest version always represents a fully-synced mirror."""
+    dst = os.path.join(versions_dir, _boot_stamp())
+    if cfg.dry_run:
+        log_info(f"[dry-run] would snapshot {mirror} -> {dst}")
+        return True
+    run_remote(cfg, f"sudo mkdir -p {shlex.quote(versions_dir)}", check=False)
+    cp = run_remote(cfg, f"sudo btrfs subvolume snapshot -r {shlex.quote(mirror)} "
+                         f"{shlex.quote(dst)}", check=False)
+    if cp.returncode != 0:
+        log_warn(f"  could not version {mirror}: {cp.stderr.strip()}")
+        return False
+    log_info(f"  versioned -> {os.path.basename(versions_dir)}/"
+             f"{os.path.basename(dst)}")
+    return True
+
+
+def _prune_boot_versions(cfg: Config, name: str, versions_dir: str) -> bool:
+    """GFS retention over the dated boot versions, routed through the SAME
+    _bucket_keep loop as the snapshot tiers (policy from cfg.retention_for(name),
+    so BOOT_/BOOT_EFI_TIMELINE_LIMIT_* overrides apply). Prune candidates come
+    ONLY from inside <name>.versions/ — the live mirror is never a candidate; an
+    unparseable name has when=None and is always kept (the _UNDATABLE sentinel);
+    a failed destination listing prunes nothing."""
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(versions_dir)}", check=False)
+    if cp.returncode != 0:
+        # Either .versions doesn't exist yet (nothing to prune) or the transport
+        # failed — a possibly-incomplete listing must never drive deletions.
+        if _is_ssh_transport_failure(cp):
+            log_warn(f"  cannot list {versions_dir} (destination unreachable) — "
+                     "skipping boot retention")
+            return False
+        return True
+    versions = [BootVersion(path=os.path.join(versions_dir, n),
+                            when=_parse_boot_stamp(n))
+                for n in cp.stdout.split()]
+    if not versions:
+        return True
+
+    policy = cfg.retention_for(name)
+    versions.sort(key=lambda v: v.when or datetime.min, reverse=True)
+    keep = _bucket_keep(versions,
+                        int(policy.get("keep_hourly", 0)),
+                        int(policy.get("keep_daily", 0)),
+                        int(policy.get("keep_weekly", 0)),
+                        int(policy.get("keep_monthly", 0)),
+                        int(policy.get("keep_yearly", 0)),
+                        cfg.retention_timezone)
+    to_delete = [v for v in versions if v.path not in keep]
+    log_info(f"  [{name}] versions: {len(versions) - len(to_delete)} kept, "
+             f"{len(to_delete)} pruned")
+    ok = True
+    for v in to_delete:
+        if cfg.dry_run:
+            log_info(f"[dry-run] would prune boot version {v.path}")
+            continue
+        dcp = run_remote(cfg, f"sudo btrfs subvolume delete {shlex.quote(v.path)}",
+                         check=False)
+        if dcp.returncode != 0:
+            log_warn(f"  failed to prune {v.path}: {dcp.stderr.strip()}")
+            ok = False
+    return ok
+
 
 def boot_backup(cfg: Config, hostname: str) -> bool:
-    """rsync each non-Btrfs boot path to <recv_base>/<hostname>/<name>/ over SSH.
-    True iff every path synced cleanly. Fail-safe: a failure warns but does not
-    abort the run (the boot tier is independent of the snapshot tiers)."""
+    """rsync each non-Btrfs boot path into its live-mirror subvolume at
+    <recv_base>/<hostname>/<name>/, snapshot the mirror into <name>.versions/
+    on a clean sync, then apply GFS retention over the versions. True iff every
+    path completed cleanly. Fail-safe: a failure warns but does not abort the
+    run (the boot tier is independent of the snapshot tiers)."""
     if not cfg.boot_backup_enabled:
         log_info("Boot backup disabled — skipping.")
         return True
@@ -1080,12 +1264,16 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
         if not os.path.ismount(src) and not os.path.isdir(src):
             log_warn(f"  boot path {src} not present — skipping")
             continue
-        name = src.strip("/").replace("/", "-")   # /boot -> boot, /boot/efi -> boot-efi
+        name = _boot_name(src)                    # /boot/efi -> boot-efi
         dest = f"{cfg.recv_base}/{hostname}/{name}"
-        run_remote(cfg, f"sudo mkdir -p {shlex.quote(dest)}", check=False)
+        versions_dir = f"{dest}.versions"
+
+        if not _ensure_boot_mirror_subvol(cfg, dest):
+            all_ok = False    # warned already; mirror stays as-is this run
 
         rsync_argv = [
             "rsync", "-aAX", "--delete",
+            *_rsync_mtime_opts(src),
             "-e", rsh,
             "--rsync-path", "sudo rsync",
             f"{src.rstrip('/')}/",
@@ -1093,19 +1281,25 @@ def boot_backup(cfg: Config, hostname: str) -> bool:
         ]
         if cfg.dry_run:
             log_info(f"[dry-run] rsync {src}/ -> {dest}/")
+            _snapshot_boot_mirror(cfg, dest, versions_dir)   # logs intent only
+            all_ok = _prune_boot_versions(cfg, name, versions_dir) and all_ok
             continue
 
         cp = run_local(rsync_argv, check=False)
         # rc 24 = "source files vanished during transfer" — benign for a live /boot
         # (e.g. a concurrent kernel update). Treat rc 0 and 24 as success; warn
-        # (don't fail) otherwise.
+        # (don't fail) otherwise — and version ONLY a clean sync, so the newest
+        # version always represents a fully-synced mirror.
         if cp.returncode in (0, 24):
             log_ok(f"  {src} mirrored to {dest}")
+            all_ok = _snapshot_boot_mirror(cfg, dest, versions_dir) and all_ok
         else:
             log_warn(f"  rsync of {src} failed (rc={cp.returncode}) — continuing; "
-                     "boot tier is independent of the snapshot tiers"
+                     "boot tier is independent of the snapshot tiers; "
+                     "no version snapshot this run"
                      + (f": {cp.stderr.strip()}" if cp.stderr.strip() else ""))
             all_ok = False
+        all_ok = _prune_boot_versions(cfg, name, versions_dir) and all_ok
     return all_ok
 
 
@@ -1425,12 +1619,13 @@ def _write_success_stamp() -> None:
 # ============================================================================
 # REPORT  (read-only: derive live tiers + KEEP/PRUNE from the SAME retention logic)
 # ============================================================================
-# --report shows, per subvol, how the destination snapshots and source parent clones
-# stand RIGHT NOW: their current GFS tier (recomputed live — a tier is never stored),
-# what the next retention run would KEEP vs PRUNE, and chain/lag health. It mutates
-# NOTHING: no sends, clones, deletes, renames, property writes, mkdir, symlink, or
-# success stamp. Tiers are derived from `_bucket_attribute` — the same loop retention
-# uses — so this view can never disagree with what a real run would actually prune.
+# --report shows, per source (every subvol AND every boot path), how the destination
+# stands RIGHT NOW: each snapshot/version's current GFS tier (recomputed live — a
+# tier is never stored), what the next retention run would KEEP vs PRUNE, and (for
+# subvols) source parent clones + chain/lag health. It mutates NOTHING: no sends,
+# clones, deletes, renames, property writes, mkdir, symlink, or success stamp. Tiers
+# are derived from `_bucket_attribute` — the same loop retention uses — so this view
+# can never disagree with what a real run would actually prune.
 
 
 def _fmt_when(dt: Optional[datetime]) -> str:
@@ -1602,9 +1797,64 @@ def _report_subvol(cfg: Config, name: str, mountpoint: str, recv_dir: str) -> No
               f"{when_txt}{flag}")
 
 
+def _report_boot_path(cfg: Config, hostname: str, src: str) -> None:
+    """Print the read-only report for one boot path: mirror state plus each version's
+    tier(s) and the KEEP/PRUNE verdict the next run would apply. Derived from
+    `_bucket_attribute` — the same loop boot retention uses — so this view can never
+    disagree with what a real run would prune. Mutates nothing (remote reads only)."""
+    name = _boot_name(src)
+    mirror = f"{cfg.recv_base}/{hostname}/{name}"
+    versions_dir = f"{mirror}.versions"
+    print(f"\n=== {name}  ({src} -> {mirror}, rsync mirror + dest-side versions) ===")
+
+    if not os.path.ismount(src) and not os.path.isdir(src):
+        print(f"  Source {src} not present on this host — nothing mirrored.")
+        return
+
+    show = run_remote(cfg, f"sudo btrfs subvolume show {shlex.quote(mirror)}",
+                      check=False)
+    if show.returncode == 0:
+        print("  Mirror: subvolume (versioned)")
+    elif _is_ssh_transport_failure(show):
+        print("  Mirror: unreachable — cannot report mirror/versions")
+        return
+    else:
+        ls = run_remote(cfg, f"sudo ls -d {shlex.quote(mirror)}", check=False)
+        print("  Mirror: " + ("plain directory (next run migrates it to a subvolume)"
+                              if ls.returncode == 0 else
+                              "absent (next run creates it)"))
+
+    policy = cfg.retention_for(name)
+    kh = int(policy.get("keep_hourly", 0))
+    kd = int(policy.get("keep_daily", 0))
+    kw = int(policy.get("keep_weekly", 0))
+    km = int(policy.get("keep_monthly", 0))
+    ky = int(policy.get("keep_yearly", 0))
+    print(f"  Versions  (policy: hourly={kh} daily={kd} weekly={kw} "
+          f"monthly={km} yearly={ky}, tz={cfg.retention_timezone}):")
+
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(versions_dir)}", check=False)
+    versions = [] if cp.returncode != 0 else \
+        [BootVersion(path=os.path.join(versions_dir, n), when=_parse_boot_stamp(n))
+         for n in cp.stdout.split()]
+    if not versions:
+        print("    (none yet)")
+        return
+    versions.sort(key=lambda v: v.when or datetime.min, reverse=True)
+    attrib = _bucket_attribute(versions, kh, kd, kw, km, ky, cfg.retention_timezone)
+    for v in versions:
+        verdict = "KEEP " if v.path in attrib else "PRUNE"
+        codes = attrib.get(v.path, [])
+        reason = ("kept (undatable)" if _UNDATABLE in codes
+                  else ", ".join(_TIER_CODE_LABEL[c] for c in codes) or "-")
+        print(f"    {verdict}  {os.path.basename(v.path):<17} "
+              f"{_fmt_when(v.when)}  [{reason}]")
+
+
 def _report(cfg: Config, args: argparse.Namespace) -> int:
-    """Read-only report across the configured subvols. Takes NO run lock and writes NO
-    success stamp — it mutates nothing, so it never blocks or interferes with a
+    """Read-only report across ALL configured sources — every subvol plus every boot
+    path (whatever BOOT_PATHS lists, now or in future). Takes NO run lock and writes
+    NO success stamp — it mutates nothing, so it never blocks or interferes with a
     concurrent real run. Returns 0."""
     hostname = socket.gethostname()
     print(f"snappersend report — {hostname} -> {cfg.server_user}@{cfg.server_host}")
@@ -1618,6 +1868,15 @@ def _report(cfg: Config, args: argparse.Namespace) -> int:
             _report_subvol(cfg, name, sv["mountpoint"], recv_dir)
         except Exception as e:   # a broken subvol must not abort the whole report
             print(f"\n=== {name} ===\n  ERROR building report: {e}")
+    # Boot tier: mirrors the run's own selection semantics (--subvol narrows to one
+    # snapshot subvol; --skip-boot skips the tier; BOOT_ENABLED=no disables it).
+    if not args.subvol and not getattr(args, "skip_boot", False) \
+            and cfg.boot_backup_enabled:
+        for src in cfg.boot_paths:
+            try:
+                _report_boot_path(cfg, hostname, src)
+            except Exception as e:   # a broken path must not abort the whole report
+                print(f"\n=== {_boot_name(src)} ===\n  ERROR building report: {e}")
     return 0
 
 
@@ -1707,6 +1966,7 @@ BTRFS="$(command -v btrfs || true)"
 RSYNC="$(command -v rsync || echo /usr/bin/rsync)"
 MKDIR="$(command -v mkdir)"; RMDIR="$(command -v rmdir)"
 LS="$(command -v ls)"; LN="$(command -v ln)"
+MV="$(command -v mv)"; CP="$(command -v cp)"; RM="$(command -v rm)"
 if [ -z "$BTRFS" ]; then echo "btrfs not found on destination" >&2; exit 3; fi
 umask 077
 cat > /etc/sudoers.d/snappersend <<SUDOERS
@@ -1714,11 +1974,16 @@ Cmnd_Alias SNAPPERSEND_CMDS = \\
     $BTRFS receive *, \\
     $BTRFS subvolume show *, \\
     $BTRFS subvolume delete *, \\
+    $BTRFS subvolume create *, \\
+    $BTRFS subvolume snapshot *, \\
     $BTRFS property get *, \\
     $MKDIR -p *, \\
     $RMDIR *, \\
     $LS *, \\
     $LN -sfn *, \\
+    $MV *, \\
+    $CP *, \\
+    $RM -rf *, \\
     $RSYNC *
 $U ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
 Defaults!SNAPPERSEND_CMDS !requiretty
@@ -1734,33 +1999,19 @@ echo "PROVISION_OK user=$U btrfs=$BTRFS rsync=$RSYNC"
 """
 
 
-def _deprovision_script(user: str, recv_base: str, host_subdir: str,
-                        purge_data: bool) -> str:
+def _deprovision_script(user: str) -> str:
     """The bash executed as root on the destination to remove the transport config:
     the sudoers file and the transport user (with its home, hence its authorized_keys).
-    Received data under RECV_BASE is PRESERVED unless purge_data, which additionally
-    deletes THIS host's received subvolumes. Emits a final DECOM_OK line."""
-    purge = ""
-    if purge_data:
-        hostdir = os.path.join(recv_base, host_subdir)
-        purge = f"""
-HOSTDIR={shlex.quote(hostdir)}
-if [ -d "$HOSTDIR" ]; then
-  for d in "$HOSTDIR"/*/; do
-    [ -d "${{d}}snapshot" ] && btrfs subvolume delete "${{d}}snapshot" 2>/dev/null || true
-    rm -rf "$d" 2>/dev/null || true
-  done
-  rmdir "$HOSTDIR" 2>/dev/null || true
-  echo "purged received data under $HOSTDIR"
-fi
-"""
+    Received data is ALWAYS preserved — deleting backups is deliberately not
+    something this tool can do; that is the operator's own decision, by hand.
+    Emits a final DECOM_OK line."""
     return f"""set -euo pipefail
 U={shlex.quote(user)}
 rm -f /etc/sudoers.d/snappersend
 if id "$U" >/dev/null 2>&1; then
   userdel --remove "$U" 2>/dev/null || userdel "$U" 2>/dev/null || true
 fi
-{purge}echo "DECOM_OK user=$U"
+echo "DECOM_OK user=$U"
 """
 
 
@@ -1953,7 +2204,8 @@ def cmd_setup_dest(args: argparse.Namespace) -> int:
 
 def cmd_decom_dest(args: argparse.Namespace) -> int:
     """Remove the destination transport config (user + sudoers + key line) over the
-    admin login. Received data is preserved unless --purge-data."""
+    admin login. Received data is ALWAYS preserved: this tool deliberately offers
+    no way to delete backups — that stays in the operator's hands."""
     if os.geteuid() != 0:
         print("decom-dest must run as root. Try: sudo snappersend decom-dest <admin@host>",
               file=sys.stderr)
@@ -1972,15 +2224,7 @@ def cmd_decom_dest(args: argparse.Namespace) -> int:
         return 2
     admin_user, host, port = resolved
 
-    if args.purge_data:
-        print(f"WARNING: --purge-data will DELETE this host's received snapshots under "
-              f"{cfg.recv_base}/{socket.gethostname()} on {cfg.server_host}.")
-        if sys.stdin.isatty():
-            if input("Type 'purge' to confirm: ").strip() != "purge":
-                print("aborted."); return 1
-
-    script = _deprovision_script(cfg.server_user, cfg.recv_base,
-                                 socket.gethostname(), args.purge_data)
+    script = _deprovision_script(cfg.server_user)
     print(f"Decommissioning {cfg.server_user}@{cfg.server_host} via admin login "
           f"{admin_user}@{host} ...")
     rc, out, err = _run_admin_script(admin_user, host, port, script)
@@ -1991,8 +2235,8 @@ def cmd_decom_dest(args: argparse.Namespace) -> int:
     for line in out.strip().splitlines():
         if line and line != "DECOM_OK user=" + cfg.server_user:
             print("  " + line)
-    print(f"  removed transport user + sudoers on {cfg.server_host}"
-          + ("" if args.purge_data else "; received data preserved"))
+    print(f"  removed transport user + sudoers on {cfg.server_host}; received data "
+          f"preserved (removing backups under {cfg.recv_base} is yours to do by hand)")
     return 0
 
 
@@ -2028,8 +2272,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="log what would happen; change nothing ($SNAPPERSEND_DRY_RUN)")
     p.add_argument("--report", action="store_true",
                    help="read-only: show each subvol's current dest tiers + next-prune "
-                        "KEEP/PRUNE, source clones + incremental parent, and chain/lag "
-                        "health. Mutates nothing; mutually exclusive with a real run.")
+                        "KEEP/PRUNE, source clones + incremental parent, chain/lag "
+                        "health, and each boot path's mirror + versions. Mutates "
+                        "nothing; mutually exclusive with a real run.")
     p.add_argument("--skip-boot", action="store_true",
                    help="skip the non-Btrfs /boot + /boot/efi rsync tier")
     p.add_argument("--no-mbuffer", action="store_true",
@@ -2050,13 +2295,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="verbose")
 
     dd = sub.add_parser("decom-dest",
-                        help="remove the destination transport config (preserves "
-                             "received data unless --purge-data)")
+                        help="remove the destination transport config (received data "
+                             "is always preserved — deleting it is the operator's job)")
     dd.add_argument("admin", nargs="?",
                     help="admin login on the destination, user@host (prompted if omitted)")
-    dd.add_argument("--purge-data", action="store_true",
-                    help="ALSO delete THIS host's received snapshots on the destination "
-                         "(irreversible; asks for confirmation)")
     _add_config_flag(dd, suppress=True)
     dd.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
                     help="verbose")

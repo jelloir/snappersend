@@ -36,8 +36,15 @@ PARENT_TREE_BASE="/.snappersend"
 PARENT_KEEP="2"                               # live parent + 1 redundancy slot
 
 # ---- Boot tier (optional) ----------------------------------------------------
-# /boot + /boot/efi are not Btrfs, so they're rsync-mirrored (single current copy,
-# not versioned) under <RECV_BASE>/<hostname>/{boot,boot-efi}.
+# /boot + /boot/efi are not Btrfs, so btrfs send can't carry them. Instead each
+# path is rsync'd into a live-mirror Btrfs SUBVOLUME on the destination
+# (<RECV_BASE>/<hostname>/{boot,boot-efi}), and after every clean sync the
+# destination snapshots that mirror into <name>.versions/<UTC-stamp> — the same
+# GFS-versioned model as the snapshot tiers, with rsync as the transport.
+# Retention over those versions uses the TIMELINE_LIMIT_* block below, with
+# optional per-path overrides (see the overrides section at the bottom). FAT32's
+# 2-second mtime granularity is handled automatically (--modify-window=1 for
+# vfat sources).
 BOOT_ENABLED="yes"
 BOOT_PATHS="/boot /boot/efi"
 
@@ -65,3 +72,10 @@ TIMELINE_LIMIT_YEARLY="2"
 # disables that tier for that subvol). Example — keep a deeper archive of the OS root:
 ROOT_TIMELINE_LIMIT_DAILY="30"
 ROOT_TIMELINE_LIMIT_MONTHLY="12"
+
+# Boot-path versions take the same scheme, named by the path's mirror name
+# uppercased with '-' -> '_' (so /boot -> BOOT_..., /boot/efi -> BOOT_EFI_...).
+# Note: a Btrfs subvol literally named "boot" would share the BOOT_ prefix.
+#BOOT_TIMELINE_LIMIT_HOURLY="0"
+#BOOT_TIMELINE_LIMIT_DAILY="7"
+#BOOT_EFI_TIMELINE_LIMIT_DAILY="7"

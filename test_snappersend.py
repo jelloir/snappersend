@@ -794,22 +794,21 @@ def test_provision_script_shape():
     assert "PROVISION_OK" in s
 
 
-def test_deprovision_script_preserves_data_by_default():
-    s = ss._deprovision_script("snappersend", "/srv/snapshots-recv", "laptop",
-                               purge_data=False)
+def test_deprovision_script_always_preserves_data():
+    s = ss._deprovision_script("snappersend")
     assert "rm -f /etc/sudoers.d/snappersend" in s
     assert "userdel --remove" in s
     assert "DECOM_OK" in s
-    # No data destruction without --purge-data.
+    # decom can NEVER destroy received data — no deletion machinery at all.
     assert "subvolume delete" not in s
-    assert "/srv/snapshots-recv/laptop" not in s
+    assert "rm -rf" not in s
 
 
-def test_deprovision_script_purge_deletes_this_hosts_data_only():
-    s = ss._deprovision_script("snappersend", "/srv/snapshots-recv", "laptop",
-                               purge_data=True)
-    assert "subvolume delete" in s
-    assert "/srv/snapshots-recv/laptop" in s      # scoped to THIS host's subdir
+def test_cli_has_no_purge_data_flag():
+    # Deleting backups is the operator's job, by hand: the CLI must not offer a
+    # flag that could destroy valuable data by accident (or otherwise).
+    with pytest.raises(SystemExit):
+        ss.build_parser().parse_args(["decom-dest", "--purge-data"])
 
 
 def test_admin_ssh_argv_uses_invoking_user_when_root(monkeypatch):
@@ -916,8 +915,8 @@ def test_ensure_config_writes_when_missing(tmp_path, monkeypatch):
 def test_cli_subcommands_parse():
     a = ss.build_parser().parse_args(["setup-dest", "james@dest"])
     assert a.command == "setup-dest" and a.admin == "james@dest"
-    a = ss.build_parser().parse_args(["decom-dest", "--purge-data"])
-    assert a.command == "decom-dest" and a.purge_data is True and a.admin is None
+    a = ss.build_parser().parse_args(["decom-dest"])
+    assert a.command == "decom-dest" and a.admin is None
     # Bare invocation and --report still route to the run/report path (no subcommand).
     assert getattr(ss.build_parser().parse_args([]), "command", None) is None
     assert ss.build_parser().parse_args(["--report"]).command is None
@@ -972,6 +971,292 @@ def test_run_lock_collision(tmp_path, monkeypatch):
     finally:
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()
+
+
+# ============================================================================
+# (10) Boot tier versioning — stamps, migration decisions, snapshot-on-success,
+#      GFS retention through THE one bucketing loop, vfat mtime windows
+# ============================================================================
+
+class _BootRemote:
+    """Scripted run_remote for the boot tier: dispatches on the command text and
+    records every command, maintaining a tiny model of the destination (is the
+    mirror a subvolume? does a plain dir exist? which versions are present?)."""
+
+    def __init__(self, monkeypatch, *, is_subvol=False, dir_exists=False,
+                 versions=()):
+        self.commands = []
+        self.is_subvol = is_subvol
+        self.dir_exists = dir_exists
+        self.versions = list(versions)
+        monkeypatch.setattr(ss, "run_remote", self)
+
+    def __call__(self, cfg, cmd, check=True):
+        self.commands.append(cmd)
+        if "subvolume show" in cmd:
+            return _CP(0 if self.is_subvol else 1, "", "Not a Btrfs subvolume")
+        if cmd.startswith("sudo ls -d"):
+            return _CP(0 if (self.is_subvol or self.dir_exists) else 2)
+        if cmd.startswith("sudo ls -1"):
+            return _CP(0, "".join(v + "\n" for v in self.versions))
+        if "subvolume create" in cmd:
+            self.is_subvol = True
+            return _CP(0)
+        if "subvolume snapshot" in cmd:
+            self.versions.append(cmd.rsplit("/", 1)[-1])
+            return _CP(0)
+        if "subvolume delete" in cmd:
+            self.versions = [v for v in self.versions
+                             if not cmd.endswith("/" + v)]
+            return _CP(0)
+        return _CP(0)
+
+    def deleted(self):
+        return [c.rsplit(" ", 1)[-1] for c in self.commands
+                if "subvolume delete" in c]
+
+
+def _boot_cfg(**kw):
+    kw.setdefault("server_host", "d")
+    return ss.Config(**kw)
+
+
+def _drive_boot(monkeypatch, tmp_path, rsync_rc=0, fstype="ext4", **remote_kw):
+    """Run the REAL boot_backup for one tmp source path against a scripted
+    destination, capturing the rsync argv."""
+    src = tmp_path / "bootsrc"
+    src.mkdir(exist_ok=True)
+    cfg2 = _boot_cfg(boot_paths=(str(src),))
+    remote = _BootRemote(monkeypatch, **remote_kw)
+    captured = {}
+
+    def fake_run_local(argv, check=True):
+        if argv[0] == "findmnt":
+            return _CP(0, fstype + "\n")
+        if argv[0] == "rsync":
+            captured["rsync"] = argv
+            return _CP(rsync_rc)
+        return _CP(0)
+    monkeypatch.setattr(ss, "run_local", fake_run_local)
+    ok = ss.boot_backup(cfg2, "h")
+    return ok, remote, captured
+
+
+def test_boot_stamp_round_trip():
+    from datetime import datetime
+    dt0 = datetime(2026, 7, 2, 6, 0, 0)                 # naive UTC
+    s = ss._boot_stamp(dt0)
+    assert s == "20260702T060000Z"                      # filesystem-safe, UTC
+    assert ss._parse_boot_stamp(s) == dt0               # round-trips to the instant
+    assert ss._parse_boot_stamp("garbage") is None
+    assert ss._parse_boot_stamp("20260702T060000") is None   # missing Z != stamp
+
+
+def test_boot_unparseable_version_never_deleted(monkeypatch):
+    # Three dated versions on distinct days + one junk name; keep_daily=1 keeps
+    # only the newest dated one — the undatable version must survive regardless.
+    r = _BootRemote(monkeypatch, is_subvol=True, versions=[
+        "20260630T060000Z", "20260701T060000Z", "20260702T060000Z", "not-a-stamp"])
+    cfg2 = _boot_cfg(retention={"default": {
+        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+    assert ss._prune_boot_versions(cfg2, "boot", "/v/boot.versions") is True
+    deleted = r.deleted()
+    assert "/v/boot.versions/20260702T060000Z" not in deleted   # newest kept
+    assert "/v/boot.versions/not-a-stamp" not in deleted        # undatable kept
+    assert set(deleted) == {"/v/boot.versions/20260630T060000Z",
+                            "/v/boot.versions/20260701T060000Z"}
+
+
+def test_boot_prune_routes_through_bucket_keep(monkeypatch):
+    # Anti-drift: the boot prune path must call THE shared _bucket_keep (no second
+    # GFS loop), and the delete-set must be exactly all − keep − undatable.
+    r = _BootRemote(monkeypatch, is_subvol=True, versions=[
+        "20260629T060000Z", "20260630T060000Z", "20260701T060000Z",
+        "20260702T060000Z", "junk-version"])
+    calls = {}
+    real = ss._bucket_keep
+
+    def spy(targets, *a, **k):
+        calls["targets"] = list(targets)
+        calls["keep"] = real(targets, *a, **k)
+        return calls["keep"]
+    monkeypatch.setattr(ss, "_bucket_keep", spy)
+    cfg2 = _boot_cfg(retention={"default": {
+        "keep_hourly": 0, "keep_daily": 2, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+    ss._prune_boot_versions(cfg2, "boot", "/v")
+
+    assert "keep" in calls                       # bucketing went through the ONE loop
+    all_paths = {v.path for v in calls["targets"]}
+    undatable = {v.path for v in calls["targets"] if v.when is None}
+    assert undatable == {"/v/junk-version"}
+    assert set(r.deleted()) == all_paths - calls["keep"] - undatable
+    assert undatable <= calls["keep"]            # undatable inside the keep-set too
+
+
+def test_boot_no_prune_when_listing_fails(monkeypatch):
+    # Transport failure on the destination listing -> prune NOTHING.
+    cmds = []
+
+    def down(cfg, cmd, check=True):
+        cmds.append(cmd)
+        return _CP(255, "", "ssh: connect to host d port 22: Connection refused")
+    monkeypatch.setattr(ss, "run_remote", down)
+    assert ss._prune_boot_versions(_boot_cfg(), "boot", "/v") is False
+    assert not any("delete" in c for c in cmds)
+
+
+def test_config_boot_retention_override(tmp_path):
+    # BOOT_EFI_TIMELINE_LIMIT_DAILY overrides only that tier for boot-efi
+    # ('-' -> '_' in the prefix); unlisted tiers and the boot path inherit the
+    # default block — same semantics as the subvol overrides.
+    p = tmp_path / "config"
+    p.write_text(
+        'SERVER_HOST="d"\n'
+        'BOOT_PATHS="/boot /boot/efi"\n'
+        'TIMELINE_LIMIT_HOURLY="24"\n'
+        'TIMELINE_LIMIT_DAILY="14"\n'
+        'BOOT_EFI_TIMELINE_LIMIT_DAILY="3"\n'
+    )
+    cfg2 = ss.Config(**ss.load_config(str(p)))
+    efi = cfg2.retention_for("boot-efi")
+    assert efi["keep_daily"] == 3                # overridden tier
+    assert efi["keep_hourly"] == 24              # unlisted tier inherits default
+    boot = cfg2.retention_for("boot")            # no BOOT_ keys -> pure default
+    assert boot["keep_daily"] == 14 and boot["keep_hourly"] == 24
+
+
+def test_boot_rc24_versions_rc23_does_not(monkeypatch, tmp_path):
+    # rc 24 (vanished source files) keeps the existing success semantics and still
+    # produces a version snapshot; any other nonzero rc must NOT create one.
+    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=24, is_subvol=True)
+    assert ok is True
+    assert any("subvolume snapshot -r" in c and ".versions/" in c
+               for c in remote.commands)
+
+    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=23, is_subvol=True)
+    assert ok is False
+    assert not any("subvolume snapshot" in c for c in remote.commands)
+
+
+def test_boot_modify_window_vfat_only(monkeypatch, tmp_path):
+    _, _, cap = _drive_boot(monkeypatch, tmp_path, fstype="vfat", is_subvol=True)
+    assert "--modify-window=1" in cap["rsync"]
+    _, _, cap = _drive_boot(monkeypatch, tmp_path, fstype="ext4", is_subvol=True)
+    assert "--modify-window=1" not in cap["rsync"]
+
+
+def test_boot_migration_plain_dir_migrates(monkeypatch):
+    r = _BootRemote(monkeypatch, is_subvol=False, dir_exists=True)
+    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
+    joined = " || ".join(r.commands)
+    assert "subvolume create" in joined
+    assert "sudo mv /recv/h/boot " in joined     # old dir moved aside
+    assert "cp -a" in joined                     # content preserved
+    assert not any(".versions" in c for c in r.commands)   # history untouched
+
+
+def test_boot_migration_subvol_is_noop(monkeypatch):
+    r = _BootRemote(monkeypatch, is_subvol=True)
+    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
+    assert len(r.commands) == 1 and "subvolume show" in r.commands[0]
+
+
+def test_boot_migration_absent_creates_fresh(monkeypatch):
+    r = _BootRemote(monkeypatch, is_subvol=False, dir_exists=False)
+    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
+    assert any("subvolume create" in c for c in r.commands)
+    assert not any(c.startswith("sudo mv") for c in r.commands)   # nothing to migrate
+
+
+# ============================================================================
+# (11) --report boot section — same read-only verdict-preview contract as subvols
+# ============================================================================
+
+def test_report_boot_verdicts_match_prune_and_flag_undatable(monkeypatch, tmp_path,
+                                                             capsys):
+    # The boot report's KEEP/PRUNE must equal what _prune_boot_versions actually
+    # deletes, version for version — and the undatable one shows its reason.
+    versions = ["20260630T060000Z", "20260701T060000Z", "20260702T060000Z",
+                "not-a-stamp"]
+    src = tmp_path / "boot"
+    src.mkdir()
+    cfg2 = _boot_cfg(boot_paths=(str(src),), retention={"default": {
+        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
+        "keep_monthly": 0, "keep_yearly": 0}})
+    name = ss._boot_name(str(src))
+
+    # Ground truth: what the real prune deletes.
+    r = _BootRemote(monkeypatch, is_subvol=True, versions=list(versions))
+    ss._prune_boot_versions(cfg2, name, "/v")
+    pruned = {p.rsplit("/", 1)[-1] for p in r.deleted()}
+    assert pruned == {"20260630T060000Z", "20260701T060000Z"}
+
+    _BootRemote(monkeypatch, is_subvol=True, versions=list(versions))
+    ss._report_boot_path(cfg2, "h", str(src))
+    out = capsys.readouterr().out
+    assert "Mirror: subvolume (versioned)" in out
+    verdicts = {}
+    for line in out.splitlines():
+        s = line.strip()
+        for v in ("KEEP", "PRUNE"):
+            if s.startswith(v):
+                verdicts[s.split()[1]] = v
+    assert {n for n, v in verdicts.items() if v == "PRUNE"} == pruned
+    assert verdicts["not-a-stamp"] == "KEEP"
+    undatable_line = next(l for l in out.splitlines() if "not-a-stamp" in l)
+    assert "kept (undatable)" in undatable_line
+
+
+def test_report_boot_states_and_mutation_freedom(monkeypatch, tmp_path, capsys):
+    # Plain dir / absent mirrors are reported as pre-migration states, and the
+    # report issues ONLY reads (show/ls) — never create/snapshot/delete/mv.
+    src = tmp_path / "boot"
+    src.mkdir()
+    cfg2 = _boot_cfg(boot_paths=(str(src),))
+
+    r = _BootRemote(monkeypatch, is_subvol=False, dir_exists=True)
+    ss._report_boot_path(cfg2, "h", str(src))
+    assert "plain directory (next run migrates" in capsys.readouterr().out
+
+    r = _BootRemote(monkeypatch, is_subvol=False, dir_exists=False)
+    ss._report_boot_path(cfg2, "h", str(src))
+    assert "absent (next run creates" in capsys.readouterr().out
+    for cmds in (r.commands,):
+        assert all(c.startswith(("sudo btrfs subvolume show", "sudo ls"))
+                   for c in cmds)
+
+
+def test_report_includes_boot_sections_and_respects_filters(monkeypatch, tmp_path,
+                                                            capsys):
+    # _report covers every configured boot path (future additions included for
+    # free), skips them under --subvol/--skip-boot, and never lets a boot failure
+    # abort the report.
+    a = tmp_path / "boot"
+    b = tmp_path / "boot" / "extra"           # a hypothetical future boot path
+    b.mkdir(parents=True)
+    cfg2 = _boot_cfg(boot_paths=(str(a), str(b)),
+                     subvols={"home": {"mountpoint": "/home"}})
+    monkeypatch.setattr(ss, "list_snapper_snapshots", lambda mp: [])
+    monkeypatch.setattr(ss, "list_parent_clones", lambda c, n: [])
+    monkeypatch.setattr(ss, "list_target_snapshots", lambda c, rd: [])
+    _BootRemote(monkeypatch, is_subvol=True,
+                versions=["20260702T060000Z"])
+
+    class _Args:
+        subvol = None
+        skip_boot = False
+    rc = ss._report(cfg2, _Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"=== {ss._boot_name(str(a))} " in out
+    assert f"=== {ss._boot_name(str(b))} " in out     # every path, present & future
+
+    class _Skip(_Args):
+        skip_boot = True
+    ss._report(cfg2, _Skip())
+    assert f"=== {ss._boot_name(str(a))} " not in capsys.readouterr().out
 
 
 if __name__ == "__main__":

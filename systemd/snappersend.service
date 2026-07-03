@@ -15,7 +15,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/snappersend
+ExecStart=/usr/bin/snappersend
 # Runs as root: needs btrfs, ssh, and write access to the parent tree,
 # /var/log/snappersend.log, /var/lock/snappersend.lock, and /var/lib/snappersend/.
 # No PrivateNetwork sandbox (unlike snapper's own unit) — we need the network.

@@ -330,7 +330,7 @@ which `snappersend setup-dest` writes for you over your own admin login.
 ### 1. Source (the sender) — as root
 
 ```sh
-sudo install -m 0755 snappersend /usr/local/bin/snappersend
+sudo install -m 0755 snappersend /usr/bin/snappersend
 sudo apt-get install -y python3-dotenv btrfs-progs openssh-client mbuffer rsync
 sudo install -d -m 0755 /etc/snappersend
 sudo cp -n config.example /etc/snappersend/config
@@ -410,7 +410,7 @@ Wants=network-online.target
 After=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/snappersend
+ExecStart=/usr/bin/snappersend
 ```
 
 `/etc/systemd/system/snapper-timeline.service.d/10-snappersend.conf` — the trigger:
@@ -434,7 +434,7 @@ Before=snapper-timeline.service
 # NO Requires/BindsTo — ordering only.
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/snappersend --bootmirror-sync
+ExecStart=/usr/bin/snappersend --bootmirror-sync
 TimeoutStartSec=90
 ```
 
@@ -510,7 +510,7 @@ sudo apt-get install -y libnotify-bin
 user's session:
 
 ```sh
-sudo tee /usr/local/bin/snappersend-notify >/dev/null <<'EOF'
+sudo tee /usr/bin/snappersend-notify >/dev/null <<'EOF'
 #!/usr/bin/env bash
 # snappersend-notify — pop a desktop toast into every logged-in graphical session.
 # Called by an OnFailure= unit (root, no session of its own), so it must reach into
@@ -532,7 +532,7 @@ for uid in $(loginctl list-users --no-legend | awk '{print $1}'); do
 done
 exit 0
 EOF
-sudo chmod 0755 /usr/local/bin/snappersend-notify
+sudo chmod 0755 /usr/bin/snappersend-notify
 ```
 
 **3. Add the notifier unit** — a small template unit whose instance name (`%i`) is the
@@ -545,7 +545,7 @@ Description=Desktop notification that %i failed
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/snappersend-notify %i
+ExecStart=/usr/bin/snappersend-notify %i
 EOF
 ```
 
@@ -567,7 +567,7 @@ sudo systemctl daemon-reload
 immediately:
 
 ```sh
-sudo /usr/local/bin/snappersend-notify snappersend.service
+sudo /usr/bin/snappersend-notify snappersend.service
 ```
 
 *b) The notifier under systemd* — start the notifier unit the way `OnFailure=` will (as

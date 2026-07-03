@@ -117,15 +117,14 @@ EOF
 # --- README into the doc dir -----------------------------------------------
 echo 'README.md' > debian/docs
 
-# --- systemd units: same as systemd/*.service but with the packaged /usr/bin
-#     path (and doc path) instead of /usr/local. dh_installsystemd picks up
-#     debian/<pkg>.service automatically and debian/<pkg>.bootmirror-sync.service
-#     via the --name call in debian/rules. ----------------------------------
-sed -e 's#/usr/local/bin/snappersend#/usr/bin/snappersend#' \
-    -e 's#/usr/local/share/doc/snappersend#/usr/share/doc/snappersend#' \
+# --- systemd units: the shipped units already use the canonical /usr/bin
+#     binary path; only the Documentation= doc path needs the packaged
+#     /usr/share/doc location. dh_installsystemd picks up debian/<pkg>.service
+#     automatically and debian/<pkg>.bootmirror-sync.service via the --name
+#     call in debian/rules. --------------------------------------------------
+sed -e 's#/usr/local/share/doc/snappersend#/usr/share/doc/snappersend#' \
     systemd/snappersend.service > debian/snappersend.service
-sed -e 's#/usr/local/bin/snappersend#/usr/bin/snappersend#' \
-    systemd/bootmirror-sync.service > debian/snappersend.bootmirror-sync.service
+cp systemd/bootmirror-sync.service debian/snappersend.bootmirror-sync.service
 
 # --- timeline drop-ins (verbatim from the repo) ----------------------------
 cp systemd/snapper-timeline.service.d/10-snappersend.conf \

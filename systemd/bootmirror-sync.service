@@ -13,7 +13,7 @@ Before=snapper-timeline.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/snappersend --bootmirror-sync
+ExecStart=/usr/bin/snappersend --bootmirror-sync
 # The sync is source-local (no SSH, no network — see --bootmirror-sync), so it
 # is normally sub-second; the bound is a backstop so a wedged rsync can never
 # hold up the ordering queue indefinitely.

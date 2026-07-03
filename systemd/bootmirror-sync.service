@@ -1,0 +1,20 @@
+# bootmirror-sync.service — refresh the @bootmirror subvolume just before
+# snapper's timeline snapshot, so /boot + the ESP are captured in the SAME
+# snapper tick as root/home (epoch-matched: no initramfs/root-module skew).
+#
+# The coupling to snapper is ORDERING-ONLY and lives in the drop-in
+# snapper-timeline.service.d/20-bootmirror.conf (Wants= this unit). There is
+# deliberately no Requires=/BindsTo= in either direction: snapper never waits
+# on this unit's exit status, and a sync failure never marks the timeline
+# failed. Worst case the mirror is one tick stale — degraded, not broken.
+[Unit]
+Description=SnapperSend: refresh /.bootmirror before snapper timeline
+Before=snapper-timeline.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snappersend --bootmirror-sync
+# The sync is source-local (no SSH, no network — see --bootmirror-sync), so it
+# is normally sub-second; the bound is a backstop so a wedged rsync can never
+# hold up the ordering queue indefinitely.
+TimeoutStartSec=90

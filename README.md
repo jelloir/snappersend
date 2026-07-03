@@ -131,53 +131,101 @@ owns local retention entirely.
 `RETENTION_TIMEZONE` (`local` default, or `utc`) chooses the calendar used for bucket
 boundaries; folder names are always local-time + UTC offset regardless. For the `root`
 subvolume, snappersend also avoids orphaning half of an apt pre/post snapshot pair (a
-small nicety that composes fine with pure GFS). The boot tier's versions (below) go
-through the **same** GFS bucketing loop and policy, so the two tiers can never drift.
+small nicety that composes fine with pure GFS). The `bootmirror` subvolume (below) is
+just another configured subvolume, so its retention is the same mechanism by
+construction.
 
-## The boot tier — versioned rsync mirrors
+## The boot tier — the `@bootmirror` subvolume
 
-`/boot` (ext4) and `/boot/efi` (FAT32) aren't Btrfs, so `btrfs send` can't carry them.
-Instead **rsync is the transport and the destination does the versioning**: each
-`BOOT_PATHS` entry syncs into a live `.mirror` subvolume inside a per-path parent
-directory, and after a clean sync that **actually changed the mirror** the destination
-takes a read-only snapshot of it as a sibling version. The layout deliberately matches
-the snapshot tiers — parent folder, dated backups below, a `.latest` symlink — just
-without the uuid/num that only the send chain needs:
+`/boot` (ext4) and `/boot/efi` (FAT32) aren't Btrfs, so `btrfs send` can't carry them
+directly. Instead they are mirrored **into** Btrfs on the source, and everything
+downstream is ordinary subvolume machinery:
 
-```
-<RECV_BASE>/<hostname>/boot/            (and boot-efi/, and any future BOOT_PATHS entry)
-    .mirror                             live rsync target (subvolume; hidden like
-                                        .snapshots — machinery, not a backup)
-    20260702-210001+1000                read-only versions — the same date+offset
-                                        label as the subvol dir names, minus the
-                                        num/uuid only the send chain needs
-    boot.latest -> …/20260702-210001+1000   newest version
-```
+1. **`snappersend --bootmirror-sync`** rsyncs each `BOOT_PATHS` entry into the
+   `@bootmirror` subvolume (mounted at `/.bootmirror`), re-rooted to match the live
+   absolute paths — so a restore is a straight copy back:
 
-The mirror is dotted for the same reason Snapper's `.snapshots` is: a plain `ls` of the
-parent shows only restorable content — the dated versions and `boot.latest` — while the
-mutable working area (possibly mid-sync, never a thing to restore from) stays out of
-sight.
+   ```
+   btrfs top-level
+   ├── @            → /              (root, snapper-managed)
+   ├── @home        → /home
+   └── @bootmirror  → /.bootmirror   ← own snapper config ("bootmirror")
+       ├── boot/                       mirror of /boot      (ext4 contents)
+       └── boot/efi/                   mirror of /boot/efi  (ESP contents)
+   ```
 
-- **Same idempotence as the snapshot tiers.** rsync runs with `--itemize-changes`; a
-  version is created only when the sync transferred/deleted something (or no version
-  exists yet). Re-running snappersend when nothing changed creates nothing anywhere.
-- **Versions only of fully-synced mirrors.** A failed rsync (any rc other than 0/24)
-  never gets a version, so the newest version always represents a complete sync.
-- **Retention** uses the default `TIMELINE_LIMIT_*` block, overridable per path with
-  the parent-dir name uppercased (`-` → `_`): `BOOT_TIMELINE_LIMIT_*`,
-  `BOOT_EFI_TIMELINE_LIMIT_*`. Undatable version names are never deleted, and the live
-  mirror is never a prune candidate.
+2. A systemd oneshot (**`bootmirror-sync.service`**) runs that sync **just before
+   each snapper timeline tick**, so Snapper — with its own `bootmirror` config —
+   snapshots the fresh mirror **in the same tick** as `@` and `@home`.
+3. snappersend then replicates `bootmirror` as a perfectly ordinary configured
+   subvolume: same parent-preservation tree, same incremental sends, same WYSIWYG
+   GFS retention. There is **no boot special-case in the replication path at all**.
+
+Why this design:
+
+- **Epoch matching.** The old approach (rsync the live `/boot` to the destination at
+  snappersend run time) sampled the boot state at a different moment than the Snapper
+  root snapshot — potentially far from it. A kernel update landing between the two
+  produced an initramfs/root-modules skew: exactly the case that breaks a restored
+  snapshot's boot. Now the mirror is refreshed immediately before the timeline tick,
+  so `/boot`, the ESP, and `/` share one epoch per snapshot.
+- **The ESP's FAT32-ness stops mattering** once mirrored: `btrfs send` ships the
+  mirrored files as ordinary file contents.
+- **The pre-snapper step can never block or break snapper.** The coupling is
+  ordering-only (`Wants=` + `Before=` from a drop-in — snapper does not wait on the
+  sync's exit status), the unit has a bounded `TimeoutStartSec`, and the sync is
+  **source-local**: no SSH, no destination, no network, no lock shared with the send
+  run — a network or destination problem cannot stall it. Worst case the mirror is
+  one tick stale and snapper snapshots the previous boot state: degraded, not broken.
+
+Details:
+
 - **FAT32 mtimes** (2-second granularity on the ESP) are handled automatically:
   vfat/msdos sources get rsync `--modify-window=1`; ext4 stays exact.
-- **Fail-safe and independent**: any boot-tier failure warns and continues — it never
-  aborts the snapshot tiers.
+- **Nested mounts**: `/boot/efi` lives inside `/boot`'s tree, so the `/boot` pass
+  excludes it (rsync shields excluded paths from `--delete`) and the `/boot/efi` pass
+  syncs it separately with its own mtime window.
+- rsync's `--itemize-changes` is kept **for the log only** (a "N change(s)" /
+  "unchanged" line per path); Snapper does the versioning now, so nothing downstream
+  depends on change detection.
+- rsync rc 24 ("source files vanished" — e.g. a kernel update touching the live
+  `/boot` mid-sync) counts as success.
+- **Retention** for `bootmirror` is the ordinary per-subvol mechanism —
+  `BOOTMIRROR_TIMELINE_LIMIT_*` — like any other name in `SUBVOLUMES`. (The old
+  per-boot-path `BOOT_TIMELINE_LIMIT_*` / `BOOT_EFI_TIMELINE_LIMIT_*` overrides went
+  away with the dest-side versioning.)
 
-> **Upgrading from the pre-versioning mirror layout** (where
-> `<RECV_BASE>/<host>/{boot,boot-efi}` was itself the rsync'd copy): delete those old
-> mirror directories on the destination first — the next run creates the new layout
-> and rsync repopulates the mirror. snappersend deliberately carries no migration
-> code for this one-time step.
+### Provisioning `@bootmirror` (source, one-time)
+
+```sh
+# 1. Create it as a TOP-LEVEL subvolume (a sibling of @/@home, NOT nested inside @,
+#    so it is never captured inside @'s own snapshots).
+mnt=$(mktemp -d) && sudo mount -o subvolid=5 UUID=<btrfs-fs-uuid> "$mnt"
+sudo btrfs subvolume create "$mnt/@bootmirror"
+sudo umount "$mnt" && rmdir "$mnt"
+
+# 2. Mount it at /.bootmirror:
+echo 'UUID=<btrfs-fs-uuid>  /.bootmirror  btrfs  subvol=@bootmirror  0 0' \
+  | sudo tee -a /etc/fstab
+sudo mkdir -p /.bootmirror && sudo mount /.bootmirror
+
+# 3. Give it its own snapper config so it timelines like any other subvolume:
+sudo snapper -c bootmirror create-config /.bootmirror
+
+# 4. Declare it to snappersend in /etc/snappersend/config:
+#      SUBVOLUMES="root:/ home:/home bootmirror:/.bootmirror"
+
+# 5. Install bootmirror-sync.service + the snapper drop-in (systemd section below),
+#    then seed the mirror once by hand:
+sudo snappersend --bootmirror-sync
+```
+
+> **Upgrading from the dest-side versioned mirrors** (the old
+> `<RECV_BASE>/<host>/{boot,boot-efi}` parents holding a `.mirror` subvolume plus
+> dated versions): provision `@bootmirror` as above, then remove the old boot parents
+> on the destination by hand (`btrfs subvolume delete` the `.mirror` and version
+> subvolumes, then remove the plain wrapper dirs). snappersend deliberately carries
+> no migration code for one-time steps.
 
 ## Configuration
 
@@ -189,9 +237,9 @@ main). The retention block uses Snapper's exact `TIMELINE_LIMIT_*` names — inc
 
 - **Honoured keys:** `SERVER_HOST` (required), `SSH_PORT`, `SERVER_USER`, `SSH_KEY`,
   `RECV_BASE`, `USE_MBUFFER`, `SUBVOLUMES`, `PARENT_TREE_BASE`, `PARENT_KEEP`,
-  `BOOT_ENABLED`, `BOOT_PATHS`, `RETENTION_TIMEZONE`, `TIMELINE_LIMIT_{HOURLY,DAILY,
-  WEEKLY,MONTHLY,YEARLY}`, per-subvol overrides `<SUBVOL>_TIMELINE_LIMIT_*`, and
-  per-boot-path overrides `BOOT_TIMELINE_LIMIT_*` / `BOOT_EFI_TIMELINE_LIMIT_*`.
+  `BOOT_ENABLED` (gates `--bootmirror-sync`), `BOOT_PATHS` (its rsync sources),
+  `RETENTION_TIMEZONE`, `TIMELINE_LIMIT_{HOURLY,DAILY,WEEKLY,MONTHLY,YEARLY}`, and
+  per-subvol overrides `<SUBVOL>_TIMELINE_LIMIT_*` (incl. `BOOTMIRROR_...`).
 - **Ignored gracefully** (so you can keep Snapper-style keys around, or point
   snappersend at a Snapper-shaped file without it choking): `SUBVOLUME`, `FSTYPE`,
   `QGROUP`, `SPACE_LIMIT`, `FREE_LIMIT`, `ALLOW_USERS`, `ALLOW_GROUPS`, `SYNC_ACL`,
@@ -217,7 +265,8 @@ snappersend --report        # read-only status view (see below); change nothing
 snappersend --subvol home   # just one subvolume
 snappersend --config PATH   # alternate config (default /etc/snappersend/config)
 snappersend --no-mbuffer    # don't pipe through mbuffer
-snappersend --skip-boot     # skip the boot tier (rsync mirrors + their versions)
+snappersend --bootmirror-sync   # ONLY rsync BOOT_PATHS into /.bootmirror, then exit
+                                #   (source-local, no SSH — the pre-snapper-tick step)
 snappersend -v              # verbose: log every shell command
 
 snappersend setup-dest admin@host   # provision the destination over your admin login
@@ -227,11 +276,11 @@ snappersend decom-dest  admin@host   # remove that transport config (keeps recei
 
 ### `--report` — read-only status & health view
 
-`--report` prints, per source (every subvolume **and** every boot path), how the
-destination stands **right now** — it **changes nothing** (no sends, clones, deletes,
-renames, property writes, or success stamp) and takes no run lock, so it is safe to run
-alongside a real replication. It honours `--subvol`, `--skip-boot` and `--server`, and
-each source's own `retention_for()` policy. For each subvol it shows:
+`--report` prints, per configured subvolume (`bootmirror` included, like any other),
+how the destination stands **right now** — it **changes nothing** (no sends, clones,
+deletes, renames, property writes, or success stamp) and takes no run lock, so it is
+safe to run alongside a real replication. It honours `--subvol` and `--server`, and
+each subvolume's own `retention_for()` policy. For each subvol it shows:
 
 - **Destination snapshots** (newest first): num + date, current **tier(s)**
   (`hourly|daily|weekly|monthly|yearly`, or `pinned parent` / `prepost partner` /
@@ -244,10 +293,6 @@ each source's own `retention_for()` policy. For each subvol it shows:
 - **Health lines**: *Chain* — intact, or `WARN: next run will full-send` when no clone
   correlates with any destination snapshot; and *Lag* — how far (snapshots + wall-clock)
   the destination trails the source's newest.
-
-And for each boot path: the **mirror state** (subvolume / not initialized /
-unreachable) and every **version** with its tier(s) and `KEEP`/`PRUNE` verdict,
-derived from the same bucketing loop the boot prune uses.
 
 Tiers are **computed live** from the current policy, not stored: a snapshot that is
 today's `daily` survivor becomes a `weekly` one as newer snapshots age out, so the report
@@ -278,7 +323,7 @@ pty/forwarding but not exec sessions.
 ## Install / first run
 
 snappersend installs on the **source only** — the destination runs no snappersend code.
-Every remote action is a stock command (`btrfs receive`, `rsync`, `mkdir`, …) invoked as
+Every remote action is a stock command (`btrfs receive`, `mkdir`, `ls`, …) invoked as
 `ssh <transport-user> "sudo <command>"`, so the destination needs just a little config,
 which `snappersend setup-dest` writes for you over your own admin login.
 
@@ -326,7 +371,7 @@ seed clone, and every later run is a small incremental off the preserved parent.
 ### Security model & uninstalling the destination
 
 The transport is least-privilege: the scoped `/etc/sudoers.d/snappersend` is the security
-boundary (the key can only run the exact send/receive/rsync commands snappersend issues,
+boundary (the key can only run the exact receive/list/delete commands snappersend issues,
 as root), and `restrict` on the `authorized_keys` line denies the key a pty and any
 forwarding. There is deliberately **no forced-command wrapper script** on the destination —
 one fewer file to install, rot, or forget on removal.
@@ -341,7 +386,7 @@ sudo snappersend decom-dest admin@backup-host        # received data is PRESERVE
 `decom-dest` never touches the received backups — snappersend deliberately offers no
 way to delete them, so a mistyped command can never destroy your backup history.
 Removing the received data after decommissioning is your job, done by hand on the
-destination (the received snapshots and boot mirrors/versions are Btrfs subvolumes:
+destination (the received snapshots are Btrfs subvolumes:
 `btrfs subvolume delete` them, then remove the plain wrapper dirs). If the
 `setup-dest`/`verify` transport check fails: `Permission denied (publickey)` means the key
 wasn't authorized (re-run `setup-dest`); `Host key verification failed` means the pinned
@@ -376,15 +421,50 @@ Wants=snappersend.service               # pull us in each timeline run…
 Before=snappersend.service              # …ordered after the snapshot completes
 ```
 
+The boot tier hangs off the **same** timeline service, on the other side: a
+`bootmirror-sync.service` oneshot ordered strictly *before* the snapshot (so snapper
+captures a fresh `/.bootmirror` in the same tick), pulled in by its own drop-in.
+
+`/etc/systemd/system/bootmirror-sync.service` — the pre-tick mirror refresh:
+
+```ini
+[Unit]
+Description=SnapperSend: refresh /.bootmirror before snapper timeline
+Before=snapper-timeline.service
+# NO Requires/BindsTo — ordering only.
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snappersend --bootmirror-sync
+TimeoutStartSec=90
+```
+
+`/etc/systemd/system/snapper-timeline.service.d/20-bootmirror.conf` — its trigger:
+
+```ini
+[Unit]
+Wants=bootmirror-sync.service
+```
+
 ```sh
-sudo install -m0644 systemd/snappersend.service /etc/systemd/system/
+sudo install -m0644 systemd/snappersend.service systemd/bootmirror-sync.service \
+     /etc/systemd/system/
 sudo install -Dm0644 systemd/snapper-timeline.service.d/10-snappersend.conf \
      /etc/systemd/system/snapper-timeline.service.d/10-snappersend.conf
+sudo install -m0644 systemd/snapper-timeline.service.d/20-bootmirror.conf \
+     /etc/systemd/system/snapper-timeline.service.d/20-bootmirror.conf
 sudo systemctl daemon-reload
 # verify the ordering graph:
-systemctl show snapper-timeline.service -p Wants -p Before | grep snappersend
+systemctl show snapper-timeline.service -p Wants -p Before -p After | grep -E 'snappersend|bootmirror'
 systemctl show snappersend.service -p After | grep snapper-timeline
+systemctl show bootmirror-sync.service -p Before | grep snapper-timeline
 ```
+
+So one timeline tick runs, in order: `bootmirror-sync.service` (refresh the mirror) →
+`snapper-timeline.service` (snapshot `@`, `@home`, `@bootmirror` in one epoch) →
+`snappersend.service` (replicate them all). Both couplings are `Wants=`-soft: a
+failure on either side never propagates into snapper's own health, and snapper never
+waits on the sync's exit status — a wedged sync is cut off by `TimeoutStartSec` and
+the tick proceeds with a one-tick-stale mirror.
 
 Why this shape:
 
@@ -540,5 +620,8 @@ success promotes and prunes; diverged destination → full send + reseed; an **u
 destination is not treated as divergence** — the parent tree is left intact and the next
 run recovers incrementally; crash-after-send-before-promote is safe), WYSIWYG GFS
 retention including the yearly tier (and that no source-backed snapshot survives beyond
-GFS), Snapper-schema config parsing, and the carried-over correctness logic
-(valid-received detection, UUID correlation, receive-in-place, run-lock collision).
+GFS), Snapper-schema config parsing, the carried-over correctness logic
+(valid-received detection, UUID correlation, receive-in-place, run-lock collision),
+and the bootmirror sync (above all that it is **source-local**: any attempt to run a
+remote command fails the test; plus the nested-ESP exclude, the vfat mtime window,
+and rc-24 tolerance).

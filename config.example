@@ -24,8 +24,10 @@ USE_MBUFFER="yes"                             # smooth throughput, a live rate r
 
 # ---- Subvolumes to replicate -------------------------------------------------
 # Space-separated  name:mountpoint  pairs. The mountpoint is where that subvol's
-# Snapper .snapshots directory lives (e.g. "/" and "/home").
-SUBVOLUMES="root:/ home:/home"
+# Snapper .snapshots directory lives (e.g. "/" and "/home"). `bootmirror` is the
+# @bootmirror subvolume holding the /boot + ESP mirrors (see the boot tier below)
+# — declare it once it's provisioned; it replicates like any other subvolume.
+SUBVOLUMES="root:/ home:/home bootmirror:/.bootmirror"
 
 # ---- Parent-preservation tree (snappersend's incremental base) ---------------
 # snappersend keeps read-only clones of the snapshots it has confirmed-sent here,
@@ -36,26 +38,23 @@ PARENT_TREE_BASE="/.snappersend"
 PARENT_KEEP="2"                               # live parent + 1 redundancy slot
 
 # ---- Boot tier (optional) ----------------------------------------------------
-# /boot + /boot/efi are not Btrfs, so btrfs send can't carry them; rsync is the
-# transport and the DESTINATION does the versioning. The layout matches the
-# snapshot tiers (parent dir, dated backups below, a .latest symlink):
+# /boot + /boot/efi are not Btrfs, so btrfs send can't carry them directly.
+# Instead `snappersend --bootmirror-sync` rsyncs them SOURCE-LOCALLY (no SSH)
+# into the @bootmirror subvolume, re-rooted to the live absolute paths:
 #
-#   <RECV_BASE>/<hostname>/boot/          (and boot-efi/)
-#       .mirror                           live rsync target (subvolume; hidden
-#                                         like .snapshots — machinery, not a backup)
-#       <date-stamp>                      read-only versions of the mirror, named
-#                                         with the same YYYYMMDD-HHMMSS±ZZZZ label
-#                                         as the subvol dir names (no num/uuid)
-#       boot.latest -> <date-stamp>       newest version
+#   /.bootmirror/            the @bootmirror subvolume (own snapper config)
+#       boot/                mirror of /boot        (ext4 contents)
+#       boot/efi/            mirror of /boot/efi    (ESP contents)
 #
-# A new version is created only when a clean sync actually CHANGED the mirror —
-# an unchanged re-run creates nothing, the same idempotence as the snapshot
-# tiers. Retention over the versions uses the TIMELINE_LIMIT_* block below, with
-# optional per-path overrides (see the overrides section at the bottom). FAT32's
+# The bootmirror-sync.service oneshot runs it just BEFORE each snapper timeline
+# tick, so snapper snapshots the fresh mirror in the same tick as root/home
+# (boot state epoch-matched to the root snapshot) and snappersend replicates
+# `bootmirror` as an ordinary subvolume — see SUBVOLUMES above. FAT32's
 # 2-second mtime granularity is handled automatically (--modify-window=1 for
-# vfat sources).
-BOOT_ENABLED="yes"
-BOOT_PATHS="/boot /boot/efi"
+# vfat sources). Provisioning @bootmirror (subvol + fstab + snapper config +
+# systemd units) is a one-time step — see the README.
+BOOT_ENABLED="yes"                            # gates --bootmirror-sync
+BOOT_PATHS="/boot /boot/efi"                  # its rsync sources
 
 # ---- Destination retention — WYSIWYG GFS, Snapper's TIMELINE_LIMIT_* vocabulary
 # =============================================================================
@@ -82,9 +81,7 @@ TIMELINE_LIMIT_YEARLY="2"
 ROOT_TIMELINE_LIMIT_DAILY="30"
 ROOT_TIMELINE_LIMIT_MONTHLY="12"
 
-# Boot-path versions take the same scheme, named by the path's parent-dir name
-# uppercased with '-' -> '_' (so /boot -> BOOT_..., /boot/efi -> BOOT_EFI_...).
-# Note: a Btrfs subvol literally named "boot" would share the BOOT_ prefix.
-#BOOT_TIMELINE_LIMIT_HOURLY="0"
-#BOOT_TIMELINE_LIMIT_DAILY="7"
-#BOOT_EFI_TIMELINE_LIMIT_DAILY="7"
+# The bootmirror subvolume takes the same scheme as any other SUBVOLUMES name —
+# e.g. keep a shallower boot history than the roots:
+#BOOTMIRROR_TIMELINE_LIMIT_HOURLY="0"
+#BOOTMIRROR_TIMELINE_LIMIT_DAILY="7"

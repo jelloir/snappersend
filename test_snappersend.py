@@ -8,11 +8,11 @@ the bulk of this file drives the real `replicate_subvol` orchestration against a
 in-memory fake of the two stateful worlds it touches — the destination's received
 snapshots and the source's parent-clone tree — by monkeypatching the btrfs/ssh IO
 boundary. The pure logic (correlation, WYSIWYG GFS incl. yearly, config parsing) is
-unit-tested directly. The boot tier (sections 10-11) is driven the same way: the real
-boot_backup/migration/prune/report code against a scripted destination (_BootRemote),
-covering layout migration, change-gated versioning, and retention through the shared
-bucketing loop. Real end-to-end btrfs send/receive and rsync are covered separately by
-the VM validation (see the build report), not here.
+unit-tested directly. The bootmirror sync (section 10) drives the real
+bootmirror_sync against faked-out rsync, asserting above all that it stays
+SOURCE-LOCAL (any remote command is an instant failure). Real end-to-end btrfs
+send/receive and rsync are covered separately by the VM validation (see the build
+report), not here.
 """
 
 import importlib.machinery
@@ -977,349 +977,142 @@ def test_run_lock_collision(tmp_path, monkeypatch):
 
 
 # ============================================================================
-# (10) Boot tier versioning — stamps, migration decisions, snapshot-on-success,
-#      GFS retention through THE one bucketing loop, vfat mtime windows
+# (10) --bootmirror-sync — source-local rsync of BOOT_PATHS into @bootmirror.
+#      The load-bearing property: it must NEVER go near the network (it runs
+#      just before snapper's timeline tick), so every test here fails the run
+#      instantly if a remote command is attempted.
 # ============================================================================
 
-class _BootRemote:
-    """Scripted run_remote for the boot tier: dispatches on the command text and
-    records every command, maintaining a tiny model of the destination.
-
-    `layout` is the parent path's state: "new" (parent dir holding a `.mirror`
-    subvolume) or "absent" (nothing there yet). `versions` are the dated
-    entries under the parent."""
-
-    def __init__(self, monkeypatch, *, layout="new", versions=()):
-        self.commands = []
-        self.layout = layout
-        self.versions = list(versions)
-        monkeypatch.setattr(ss, "run_remote", self)
-
-    def __call__(self, cfg, cmd, check=True):
-        self.commands.append(cmd)
-        tail = cmd.rsplit("/", 1)[-1]
-        if "subvolume show" in cmd:
-            return _CP(0 if self.layout == "new" else 1, "",
-                       "Not a Btrfs subvolume")
-        if cmd.startswith("sudo ls -1"):
-            if self.layout == "absent":
-                return _CP(2, "", "No such file or directory")
-            # Real `ls -1` hides dotfiles, so `.mirror` never appears here.
-            return _CP(0, "".join(v + "\n" for v in self.versions))
-        if "subvolume create" in cmd:
-            self.layout = "new"
-            return _CP(0)
-        if "subvolume snapshot" in cmd:
-            self.versions.append(tail)       # dst is always under the parent
-            return _CP(0)
-        if "subvolume delete" in cmd:
-            self.versions = [v for v in self.versions if v != tail]
-            return _CP(0)
-        return _CP(0)
-
-    def deleted(self):
-        return [c.rsplit(" ", 1)[-1] for c in self.commands
-                if "subvolume delete" in c]
-
-
-def _boot_cfg(**kw):
+def _sync_cfg(**kw):
     kw.setdefault("server_host", "d")
     return ss.Config(**kw)
 
 
-def _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="", fstype="ext4",
-                **remote_kw):
-    """Run the REAL boot_backup for one tmp source path against a scripted
-    destination, capturing the rsync argv. `rsync_out` is the itemized-changes
-    stdout ("" = nothing changed)."""
-    src = tmp_path / "bootsrc"
+def _drive_sync(monkeypatch, tmp_path, rsync_rc=0, rsync_out="", fstype="ext4",
+                boot_paths=None, **cfg_kw):
+    """Run the REAL bootmirror_sync for tmp source path(s) against a tmp mirror
+    root, capturing every rsync argv. run_remote is booby-trapped: the sync
+    must be source-local, so ANY remote command fails the test."""
+    src = tmp_path / "boot"
     src.mkdir(exist_ok=True)
-    cfg2 = _boot_cfg(boot_paths=(str(src),))
-    remote = _BootRemote(monkeypatch, **remote_kw)
-    captured = {}
+    root = tmp_path / "bootmirror"
+    root.mkdir(exist_ok=True)
+    cfg2 = _sync_cfg(boot_paths=tuple(boot_paths or (str(src),)),
+                     subvols={"bootmirror": {"mountpoint": str(root)}}, **cfg_kw)
+    rsyncs = []
 
     def fake_run_local(argv, check=True):
         if argv[0] == "findmnt":
             return _CP(0, fstype + "\n")
         if argv[0] == "rsync":
-            captured["rsync"] = argv
+            rsyncs.append(argv)
             return _CP(rsync_rc, rsync_out)
         return _CP(0)
     monkeypatch.setattr(ss, "run_local", fake_run_local)
-    ok = ss.boot_backup(cfg2, "h")
-    return ok, remote, captured
+    monkeypatch.setattr(ss, "run_remote",
+                        lambda *a, **k: pytest.fail("bootmirror sync went remote"))
+    return ss.bootmirror_sync(cfg2), rsyncs, root
 
 
-def test_boot_stamp_round_trip():
-    import re
-    from datetime import datetime
-    dt0 = datetime(2026, 7, 2, 6, 0, 0)                 # naive UTC
-    s = ss._boot_stamp(dt0)
-    # The SAME label family as the subvol dir names (local date + UTC offset,
-    # second precision), minus the -num-uuid suffix.
-    assert re.fullmatch(r"\d{8}-\d{6}[+-]\d{4}", s)
-    assert ss._parse_dt_name(s) == dt0                  # round-trips to the instant
-    assert ss._parse_dt_name("garbage") is None
-    # A full subvol-style name (with -num-uuid) is NOT a bare stamp.
-    assert ss._parse_dt_name(s + "-88-1f17a813") is None
+def test_bootmirror_sync_is_source_local_rsync(monkeypatch, tmp_path):
+    # The whole point of the design: a plain local rsync — no -e ssh, no
+    # --rsync-path "sudo rsync", no user@host: target — into the source path
+    # re-rooted under the mirror, with --delete so removals propagate.
+    rc, rsyncs, root = _drive_sync(monkeypatch, tmp_path)
+    assert rc == 0 and len(rsyncs) == 1
+    argv = rsyncs[0]
+    assert "-e" not in argv and "--rsync-path" not in argv
+    assert not any("@" in a for a in argv)               # no remote target
+    assert "--delete" in argv and "-aAXi" in argv
+    assert argv[-2] == f"{tmp_path / 'boot'}/"
+    assert argv[-1].startswith(str(root)) and argv[-1].endswith("/boot/")
 
 
-def test_boot_unparseable_version_never_deleted(monkeypatch):
-    # Three dated versions on distinct days + one junk name; keep_daily=1 keeps
-    # only the newest dated one — the undatable version must survive regardless.
-    r = _BootRemote(monkeypatch, layout="new", versions=[
-        "20260630-060000+0000", "20260701-060000+0000", "20260702-060000+0000",
-        "not-a-stamp"])
-    cfg2 = _boot_cfg(retention={"default": {
-        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
-        "keep_monthly": 0, "keep_yearly": 0}})
-    assert ss._prune_boot_versions(cfg2, "boot", "/v/boot") is True
-    deleted = r.deleted()
-    assert "/v/boot/20260702-060000+0000" not in deleted   # newest kept
-    assert "/v/boot/not-a-stamp" not in deleted            # undatable kept
-    assert set(deleted) == {"/v/boot/20260630-060000+0000",
-                            "/v/boot/20260701-060000+0000"}
+def test_bootmirror_sync_excludes_nested_boot_path(monkeypatch, tmp_path):
+    # /boot/efi is a separate mount INSIDE /boot's tree, so the /boot pass must
+    # exclude it (excluded paths are also protected from --delete, keeping the
+    # already-mirrored ESP intact) while the /boot/efi pass — the one carrying
+    # the vfat mtime window — syncs it for real, re-rooted under the mirror.
+    boot = tmp_path / "boot"
+    efi = boot / "efi"
+    efi.mkdir(parents=True)
+    rc, rsyncs, root = _drive_sync(monkeypatch, tmp_path,
+                                   boot_paths=(str(boot), str(efi)))
+    assert rc == 0 and len(rsyncs) == 2
+    outer = next(a for a in rsyncs if a[-2] == f"{boot}/")
+    inner = next(a for a in rsyncs if a[-2] == f"{efi}/")
+    assert "--exclude=/efi/" in outer
+    assert not any(x.startswith("--exclude=") for x in inner)
+    assert inner[-1] == outer[-1].rstrip("/") + "/efi/"  # nested in the mirror too
 
 
-def test_boot_prune_routes_through_bucket_keep(monkeypatch):
-    # Anti-drift: the boot prune path must call THE shared _bucket_keep (no second
-    # GFS loop), and the delete-set must be exactly all − keep − undatable.
-    # The live mirror and the .latest link must never even be candidates.
-    r = _BootRemote(monkeypatch, layout="new", versions=[
-        "20260629-060000+0000", "20260630-060000+0000", "20260701-060000+0000",
-        "20260702-060000+0000", "junk-version", "boot.latest"])
-    calls = {}
-    real = ss._bucket_keep
-
-    def spy(targets, *a, **k):
-        calls["targets"] = list(targets)
-        calls["keep"] = real(targets, *a, **k)
-        return calls["keep"]
-    monkeypatch.setattr(ss, "_bucket_keep", spy)
-    cfg2 = _boot_cfg(retention={"default": {
-        "keep_hourly": 0, "keep_daily": 2, "keep_weekly": 0,
-        "keep_monthly": 0, "keep_yearly": 0}})
-    ss._prune_boot_versions(cfg2, "boot", "/v/boot")
-
-    assert "keep" in calls                       # bucketing went through the ONE loop
-    all_paths = {v.path for v in calls["targets"]}
-    assert "/v/boot/.mirror" not in all_paths    # live mirror never a candidate
-    assert "/v/boot/boot.latest" not in all_paths
-    undatable = {v.path for v in calls["targets"] if v.when is None}
-    assert undatable == {"/v/boot/junk-version"}
-    assert set(r.deleted()) == all_paths - calls["keep"] - undatable
-    assert undatable <= calls["keep"]            # undatable inside the keep-set too
+def test_bootmirror_sync_modify_window_vfat_only(monkeypatch, tmp_path):
+    _, rsyncs, _ = _drive_sync(monkeypatch, tmp_path, fstype="vfat")
+    assert "--modify-window=1" in rsyncs[0]
+    _, rsyncs, _ = _drive_sync(monkeypatch, tmp_path, fstype="ext4")
+    assert "--modify-window=1" not in rsyncs[0]
 
 
-def test_boot_no_prune_when_listing_fails(monkeypatch):
-    # Transport failure on the destination listing -> prune NOTHING.
-    cmds = []
-
-    def down(cfg, cmd, check=True):
-        cmds.append(cmd)
-        return _CP(255, "", "ssh: connect to host d port 22: Connection refused")
-    monkeypatch.setattr(ss, "run_remote", down)
-    assert ss._prune_boot_versions(_boot_cfg(), "boot", "/v/boot") is False
-    assert not any("delete" in c for c in cmds)
+def test_bootmirror_sync_rc24_ok_other_rc_fails(monkeypatch, tmp_path):
+    # rc 24 (source files vanished mid-transfer — e.g. a concurrent kernel
+    # update touching the live /boot) is success; any other nonzero rc is not.
+    rc, _, _ = _drive_sync(monkeypatch, tmp_path, rsync_rc=24)
+    assert rc == 0
+    rc, _, _ = _drive_sync(monkeypatch, tmp_path, rsync_rc=23)
+    assert rc == 1
 
 
-def test_config_boot_retention_override(tmp_path):
-    # BOOT_EFI_TIMELINE_LIMIT_DAILY overrides only that tier for boot-efi
-    # ('-' -> '_' in the prefix); unlisted tiers and the boot path inherit the
-    # default block — same semantics as the subvol overrides.
+def test_bootmirror_sync_dry_run_and_disabled_run_nothing(monkeypatch, tmp_path):
+    rc, rsyncs, _ = _drive_sync(monkeypatch, tmp_path, dry_run=True)
+    assert rc == 0 and rsyncs == []
+    rc, rsyncs, _ = _drive_sync(monkeypatch, tmp_path, bootmirror_enabled=False)
+    assert rc == 0 and rsyncs == []
+
+
+def test_bootmirror_sync_missing_root_errors_before_any_command(monkeypatch,
+                                                                tmp_path):
+    # An unprovisioned mirror root is a loud, fast error — never a half-sync
+    # into a plain directory that snapper can't snapshot.
+    src = tmp_path / "boot"
+    src.mkdir()
+    cfg2 = _sync_cfg(boot_paths=(str(src),),
+                     subvols={"bootmirror": {"mountpoint": str(tmp_path / "absent")}})
+    monkeypatch.setattr(ss, "run_local",
+                        lambda *a, **k: pytest.fail("ran a command"))
+    assert ss.bootmirror_sync(cfg2) == 1
+
+
+def test_config_bootmirror_is_an_ordinary_subvol(tmp_path):
+    # bootmirror is declared like root/home and uses the SAME per-subvol
+    # retention-override mechanism (BOOTMIRROR_TIMELINE_LIMIT_*) — no boot
+    # special-case anywhere in config parsing.
     p = tmp_path / "config"
     p.write_text(
         'SERVER_HOST="d"\n'
-        'BOOT_PATHS="/boot /boot/efi"\n'
+        'SUBVOLUMES="root:/ home:/home bootmirror:/.bootmirror"\n'
         'TIMELINE_LIMIT_HOURLY="24"\n'
         'TIMELINE_LIMIT_DAILY="14"\n'
-        'BOOT_EFI_TIMELINE_LIMIT_DAILY="3"\n'
+        'BOOTMIRROR_TIMELINE_LIMIT_DAILY="3"\n'
     )
     cfg2 = ss.Config(**ss.load_config(str(p)))
-    efi = cfg2.retention_for("boot-efi")
-    assert efi["keep_daily"] == 3                # overridden tier
-    assert efi["keep_hourly"] == 24              # unlisted tier inherits default
-    boot = cfg2.retention_for("boot")            # no BOOT_ keys -> pure default
-    assert boot["keep_daily"] == 14 and boot["keep_hourly"] == 24
+    assert cfg2.subvols["bootmirror"] == {"mountpoint": "/.bootmirror"}
+    assert cfg2.bootmirror_root == "/.bootmirror"        # from SUBVOLUMES
+    bm = cfg2.retention_for("bootmirror")
+    assert bm["keep_daily"] == 3                         # overridden tier
+    assert bm["keep_hourly"] == 24                       # unlisted tier inherits
+    assert cfg2.retention_for("root")["keep_daily"] == 14
 
 
-def test_boot_rc24_versions_rc23_does_not(monkeypatch, tmp_path):
-    # rc 24 (vanished source files) keeps the existing success semantics and still
-    # produces a version snapshot; any other nonzero rc must NOT create one.
-    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=24,
-                                rsync_out=">f+++++++++ vmlinuz\n", layout="new")
-    assert ok is True
-    assert any("subvolume snapshot -r" in c for c in remote.commands)
-
-    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=23,
-                                rsync_out=">f+++++++++ vmlinuz\n", layout="new")
-    assert ok is False
-    assert not any("subvolume snapshot" in c for c in remote.commands)
+def test_config_bootmirror_root_defaults_when_undeclared():
+    # The sync still has a target when bootmirror isn't (yet) in SUBVOLUMES.
+    assert _sync_cfg().bootmirror_root == "/.bootmirror"
 
 
-def test_boot_unchanged_mirror_creates_no_version(monkeypatch, tmp_path):
-    # The snapshot tiers' idempotence, honoured by the boot tier: a clean sync
-    # that CHANGED NOTHING (empty itemized output) creates no new version when
-    # one already exists — re-running snappersend mints nothing anywhere.
-    ok, remote, cap = _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="",
-                                  layout="new",
-                                  versions=["20260702-060000+0000"])
-    assert ok is True
-    assert "-aAXi" in cap["rsync"]              # itemize-changes is the detector
-    assert not any("subvolume snapshot" in c for c in remote.commands)
-    assert remote.versions == ["20260702-060000+0000"]   # untouched
-
-    # ...but the FIRST version is still created even from an unchanged sync.
-    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=0, rsync_out="",
-                                layout="new", versions=[])
-    assert ok is True
-    assert any("subvolume snapshot -r" in c for c in remote.commands)
-
-    # And a changed sync versions as usual.
-    ok, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=0,
-                                rsync_out=">f.st...... grub/grub.cfg\n",
-                                layout="new",
-                                versions=["20260702-060000+0000"])
-    assert ok is True
-    assert any("subvolume snapshot -r" in c for c in remote.commands)
-
-
-def test_boot_version_updates_latest_symlink(monkeypatch, tmp_path):
-    # Layout parity with the subvol tiers: a new version repoints
-    # <parent>/<name>.latest at it (no inner /snapshot component).
-    _, remote, _ = _drive_boot(monkeypatch, tmp_path, rsync_rc=0,
-                               rsync_out=">f+++++++++ vmlinuz\n", layout="new")
-    ln = next(c for c in remote.commands if c.startswith("sudo ln -sfn"))
-    target, link = ln.split()[3], ln.split()[4]
-    assert link.endswith(".latest")
-    assert ss._parse_dt_name(os.path.basename(target)) is not None
-    assert not target.endswith("/snapshot")
-    # link lives in the same parent dir the version does
-    assert os.path.dirname(target) == os.path.dirname(link)
-
-
-def test_boot_prune_repoints_latest_even_without_deletions(monkeypatch):
-    # Self-healing: .latest is (re)pointed at the newest version EVERY run, so a
-    # version that arrived without a link (or a hand-deleted link) gets one.
-    r = _BootRemote(monkeypatch, layout="new",
-                    versions=["20260701-060000+0000", "20260702-060000+0000"])
-    assert ss._prune_boot_versions(_boot_cfg(), "boot", "/v/boot") is True
-    assert r.deleted() == []                     # nothing pruned...
-    ln = next(c for c in r.commands if c.startswith("sudo ln -sfn"))
-    assert ln.endswith("/v/boot/boot.latest")    # ...link still (re)pointed
-    assert "/v/boot/20260702-060000+0000" in ln  # at the newest version
-
-
-def test_boot_modify_window_vfat_only(monkeypatch, tmp_path):
-    _, _, cap = _drive_boot(monkeypatch, tmp_path, fstype="vfat", layout="new")
-    assert "--modify-window=1" in cap["rsync"]
-    _, _, cap = _drive_boot(monkeypatch, tmp_path, fstype="ext4", layout="new")
-    assert "--modify-window=1" not in cap["rsync"]
-
-
-def test_boot_rsync_targets_mirror_subvol(monkeypatch, tmp_path):
-    # The rsync destination is the live mirror INSIDE the parent, so versions and
-    # the .latest link (its siblings) are never inside the --delete scope.
-    _, _, cap = _drive_boot(monkeypatch, tmp_path, layout="new")
-    assert cap["rsync"][-1].endswith(f"/{ss._BOOT_MIRROR}/")
-
-
-def test_boot_mirror_present_is_single_probe_noop(monkeypatch):
-    r = _BootRemote(monkeypatch, layout="new")
-    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    assert len(r.commands) == 1 and "subvolume show" in r.commands[0]
-
-
-def test_boot_mirror_absent_creates_fresh(monkeypatch):
-    r = _BootRemote(monkeypatch, layout="absent")
-    assert ss._ensure_boot_mirror_subvol(_boot_cfg(), "/recv/h/boot") is True
-    assert any("mkdir -p /recv/h/boot" in c for c in r.commands)
-    assert any("subvolume create" in c and c.endswith("/.mirror")
-               for c in r.commands)
-
-
-# ============================================================================
-# (11) --report boot section — same read-only verdict-preview contract as subvols
-# ============================================================================
-
-def test_report_boot_verdicts_match_prune_and_flag_undatable(monkeypatch, tmp_path,
-                                                             capsys):
-    # The boot report's KEEP/PRUNE must equal what _prune_boot_versions actually
-    # deletes, version for version — and the undatable one shows its reason.
-    versions = ["20260630-060000+0000", "20260701-060000+0000",
-                "20260702-060000+0000", "not-a-stamp"]
-    src = tmp_path / "boot"
-    src.mkdir()
-    cfg2 = _boot_cfg(boot_paths=(str(src),), retention={"default": {
-        "keep_hourly": 0, "keep_daily": 1, "keep_weekly": 0,
-        "keep_monthly": 0, "keep_yearly": 0}})
-    name = ss._boot_name(str(src))
-
-    # Ground truth: what the real prune deletes.
-    r = _BootRemote(monkeypatch, layout="new", versions=list(versions))
-    ss._prune_boot_versions(cfg2, name, "/v/boot")
-    pruned = {p.rsplit("/", 1)[-1] for p in r.deleted()}
-    assert pruned == {"20260630-060000+0000", "20260701-060000+0000"}
-
-    _BootRemote(monkeypatch, layout="new", versions=list(versions))
-    ss._report_boot_path(cfg2, "h", str(src))
-    out = capsys.readouterr().out
-    assert "Mirror: subvolume (versioned)" in out
-    verdicts = {}
-    for line in out.splitlines():
-        s = line.strip()
-        for v in ("KEEP", "PRUNE"):
-            if s.startswith(v):
-                verdicts[s.split()[1]] = v
-    assert {n for n, v in verdicts.items() if v == "PRUNE"} == pruned
-    assert verdicts["not-a-stamp"] == "KEEP"
-    undatable_line = next(l for l in out.splitlines() if "not-a-stamp" in l)
-    assert "kept (undatable)" in undatable_line
-
-
-def test_report_boot_states_and_mutation_freedom(monkeypatch, tmp_path, capsys):
-    # An uninitialized mirror is reported as such, and the report issues ONLY
-    # reads (show/ls) — never create/snapshot/delete/ln.
-    src = tmp_path / "boot"
-    src.mkdir()
-    cfg2 = _boot_cfg(boot_paths=(str(src),))
-
-    r = _BootRemote(monkeypatch, layout="absent")
-    ss._report_boot_path(cfg2, "h", str(src))
-    assert "not initialized (next run creates it)" in capsys.readouterr().out
-    assert all(c.startswith(("sudo btrfs subvolume show", "sudo ls"))
-               for c in r.commands)
-
-
-def test_report_includes_boot_sections_and_respects_filters(monkeypatch, tmp_path,
-                                                            capsys):
-    # _report covers every configured boot path (future additions included for
-    # free), skips them under --subvol/--skip-boot, and never lets a boot failure
-    # abort the report.
-    a = tmp_path / "boot"
-    b = tmp_path / "boot" / "extra"           # a hypothetical future boot path
-    b.mkdir(parents=True)
-    cfg2 = _boot_cfg(boot_paths=(str(a), str(b)),
-                     subvols={"home": {"mountpoint": "/home"}})
-    monkeypatch.setattr(ss, "list_snapper_snapshots", lambda mp: [])
-    monkeypatch.setattr(ss, "list_parent_clones", lambda c, n: [])
-    monkeypatch.setattr(ss, "list_target_snapshots", lambda c, rd: [])
-    _BootRemote(monkeypatch, layout="new",
-                versions=["20260702-060000+0000"])
-
-    class _Args:
-        subvol = None
-        skip_boot = False
-    rc = ss._report(cfg2, _Args())
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert f"=== {ss._boot_name(str(a))} " in out
-    assert f"=== {ss._boot_name(str(b))} " in out     # every path, present & future
-
-    class _Skip(_Args):
-        skip_boot = True
-    ss._report(cfg2, _Skip())
-    assert f"=== {ss._boot_name(str(a))} " not in capsys.readouterr().out
+def test_cli_bootmirror_sync_flag_and_skip_boot_removed():
+    assert ss.build_parser().parse_args(["--bootmirror-sync"]).bootmirror_sync is True
+    assert ss.build_parser().parse_args([]).bootmirror_sync is False
+    with pytest.raises(SystemExit):                      # boot is just a subvol now
+        ss.build_parser().parse_args(["--skip-boot"])
 
 
 if __name__ == "__main__":

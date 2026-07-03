@@ -11,7 +11,9 @@ This produces a `snappersend` package that installs:
 |------|-------------|
 | `snappersend` | `/usr/bin/snappersend` |
 | `snappersend.service` | `/lib/systemd/system/snappersend.service` |
+| `bootmirror-sync.service` | `/lib/systemd/system/bootmirror-sync.service` |
 | `10-snappersend.conf` (timeline drop-in) | `/usr/lib/systemd/system/snapper-timeline.service.d/` |
+| `20-bootmirror.conf` (timeline drop-in) | `/usr/lib/systemd/system/snapper-timeline.service.d/` |
 | `config.example` | `/usr/share/doc/snappersend/examples/` |
 | `README.md` | `/usr/share/doc/snappersend/` |
 
@@ -95,10 +97,12 @@ cat > debian/rules <<'EOF'
 %:
 	dh $@
 
-# snappersend.service has no [Install] and is triggered by the timeline drop-in,
-# so never enable or start it at install time.
+# Neither unit has an [Install] section — both are triggered by the timeline
+# drop-ins — so never enable or start them at install time. The second
+# dh_installsystemd call picks up debian/snappersend.bootmirror-sync.service.
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
+	dh_installsystemd --no-enable --no-start --name=bootmirror-sync
 EOF
 chmod +x debian/rules
 
@@ -107,21 +111,27 @@ cat > debian/install <<'EOF'
 snappersend usr/bin
 config.example usr/share/doc/snappersend/examples
 debian/snapper-timeline.service.d/10-snappersend.conf usr/lib/systemd/system/snapper-timeline.service.d
+debian/snapper-timeline.service.d/20-bootmirror.conf usr/lib/systemd/system/snapper-timeline.service.d
 EOF
 
 # --- README into the doc dir -----------------------------------------------
 echo 'README.md' > debian/docs
 
-# --- systemd unit: same as systemd/snappersend.service but with the packaged
-#     /usr/bin path (and doc path) instead of /usr/local. dh_installsystemd
-#     picks up debian/<pkg>.service automatically. --------------------------
+# --- systemd units: same as systemd/*.service but with the packaged /usr/bin
+#     path (and doc path) instead of /usr/local. dh_installsystemd picks up
+#     debian/<pkg>.service automatically and debian/<pkg>.bootmirror-sync.service
+#     via the --name call in debian/rules. ----------------------------------
 sed -e 's#/usr/local/bin/snappersend#/usr/bin/snappersend#' \
     -e 's#/usr/local/share/doc/snappersend#/usr/share/doc/snappersend#' \
     systemd/snappersend.service > debian/snappersend.service
+sed -e 's#/usr/local/bin/snappersend#/usr/bin/snappersend#' \
+    systemd/bootmirror-sync.service > debian/snappersend.bootmirror-sync.service
 
-# --- timeline drop-in (verbatim from the repo) -----------------------------
+# --- timeline drop-ins (verbatim from the repo) ----------------------------
 cp systemd/snapper-timeline.service.d/10-snappersend.conf \
    debian/snapper-timeline.service.d/10-snappersend.conf
+cp systemd/snapper-timeline.service.d/20-bootmirror.conf \
+   debian/snapper-timeline.service.d/20-bootmirror.conf
 ```
 
 ## 3. Build the package
@@ -159,6 +169,22 @@ sudo snappersend setup-dest admin@backup-host       # creates config if absent,
 sudo snappersend --dry-run
 sudo snappersend
 ```
+
+For the boot tier, provision `@bootmirror` on the source (one-time, per host — a
+subvolume/fstab/snapper change the package deliberately can't make for you; see the
+README's "Provisioning `@bootmirror`" section):
+
+```sh
+# top-level subvol mounted at /.bootmirror + its own snapper config
+sudo btrfs subvolume create <top-level>/@bootmirror   # + fstab entry, then mount
+sudo snapper -c bootmirror create-config /.bootmirror
+# declare it in /etc/snappersend/config:
+#   SUBVOLUMES="root:/ home:/home bootmirror:/.bootmirror"
+sudo snappersend --bootmirror-sync                    # seed the mirror once
+```
+
+The packaged `bootmirror-sync.service` + `20-bootmirror.conf` drop-in then refresh it
+before every snapper timeline tick automatically.
 
 ## 5. Upgrades and removal
 

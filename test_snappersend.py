@@ -797,6 +797,16 @@ def test_provision_script_shape():
     assert "PROVISION_OK" in s
 
 
+def test_provision_script_allows_btrfs_send():
+    # The restore direction (the companion snapperrestore script) streams BACK
+    # from the destination, so the sudoers grant must include `btrfs send`.
+    # test_snapperrestore.py pins the two scripts' provision scripts identical.
+    s = ss._provision_script("snappersend", "ssh-ed25519 AAAAKEY c",
+                             "/srv/snapshots-recv")
+    assert "$BTRFS send *" in s                     # restore streams back
+    assert "$BTRFS receive *" in s                  # forward path unchanged
+
+
 def test_deprovision_script_always_preserves_data():
     s = ss._deprovision_script("snappersend")
     assert "rm -f /etc/sudoers.d/snappersend" in s

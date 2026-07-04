@@ -107,6 +107,17 @@ BTRFS CORRECTNESS RULES (proven on real btrfs; distilled from btrbk)
     (copy fallback fails on the RO source) nor flip it RW (resets received_uuid).
 (4) DESTINATION SNAPSHOTS STAY READ-ONLY — RO is what makes received_uuid a
     trustworthy base.
+
+DISASTER RECOVERY (`snapperrestore` — a separate, self-contained script)
+-------------------------------------------------------------------------
+The destination doubles as a bare-metal restore source: the companion
+`snapperrestore` script (run from a live ISO) rebuilds a machine from the
+received tree, driven by the received root snapshot itself — etc/fstab +
+etc/crypttab as UUID-rewritten TEMPLATES and etc/snappersend/restore-manifest
+for what a send stream cannot carry (nested subvols, No-COW map). snappersend's
+part of that contract is the SEND side: it writes the restore manifest on
+every run (see the RESTORE MANIFEST section) and its setup-dest sudoers grant
+includes `btrfs send` so the restore direction can stream back. See the README.
 """
 
 from __future__ import annotations
@@ -482,7 +493,11 @@ def run_local(argv: list[str], *, check: bool = True) -> subprocess.CompletedPro
     rc=127 CompletedProcess when check=False."""
     log_debug("local: " + " ".join(shlex.quote(a) for a in argv))
     try:
-        cp = subprocess.run(argv, check=False, capture_output=True, text=True)
+        # stdin=DEVNULL: a captured command must never read the terminal/pipe —
+        # ssh in particular drains inherited stdin into its channel, which would
+        # eat input meant for our own interactive prompts (setup-dest).
+        cp = subprocess.run(argv, check=False, capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
     except FileNotFoundError as e:
         if check:
             raise
@@ -1032,7 +1047,9 @@ def _run_pipe(send_argv, ssh_argv_list, use_mbuffer) -> bool:
             is_last = (i == len(stages) - 1)
             p = subprocess.Popen(
                 argv,
-                stdin=prev_stdout,
+                # First stage: DEVNULL, never the inherited stdin — a stage
+                # must never drain the terminal/pipe our prompts read.
+                stdin=(subprocess.DEVNULL if prev_stdout is None else prev_stdout),
                 stdout=(subprocess.DEVNULL if is_last else subprocess.PIPE),
                 stderr=errf,
             )
@@ -1182,6 +1199,183 @@ def bootmirror_sync(cfg: Config) -> int:
                      + (f": {cp.stderr.strip()}" if cp.stderr.strip() else ""))
             ok = False
     return 0 if ok else 1
+
+
+# ============================================================================
+# FSTAB PARSING  (feeds the restore manifest — kept in sync with snapperrestore)
+# ============================================================================
+# The live /etc/fstab tells the manifest builder which mountpoints are btrfs
+# subvols (for the top-level No-COW map). The companion snapperrestore script
+# carries its own copy of this parser: there the received root snapshot's
+# fstab/crypttab are the restore TEMPLATES.
+
+
+@dataclass
+class FstabEntry:
+    """One non-comment /etc/fstab line split into its six fields, with the raw
+    line kept verbatim (UUID rewriting is a substring replacement over the raw
+    text so options and column layout survive untouched)."""
+    device: str
+    mountpoint: str
+    fstype: str
+    options: str
+    dump: str = "0"
+    passno: str = "0"
+    raw: str = ""
+
+    @property
+    def subvol(self) -> Optional[str]:
+        """The subvol=... mount option (leading '/' stripped), or None."""
+        for opt in self.options.split(","):
+            if opt.startswith("subvol="):
+                return opt.split("=", 1)[1].lstrip("/")
+        return None
+
+    @property
+    def uuid(self) -> Optional[str]:
+        return self.device[5:] if self.device.startswith("UUID=") else None
+
+
+def parse_fstab_template(text: str) -> list[FstabEntry]:
+    """Parse fstab text into entries, skipping comments/blanks. Lines with fewer
+    than 4 fields are ignored (never raises — the template rides inside a backup
+    and must be read tolerantly)."""
+    entries: list[FstabEntry] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        fields = s.split()
+        if len(fields) < 4:
+            continue
+        while len(fields) < 6:
+            fields.append("0")
+        entries.append(FstabEntry(fields[0], fields[1], fields[2], fields[3],
+                                  fields[4], fields[5], raw=line))
+    return entries
+
+
+# ============================================================================
+# RESTORE MANIFEST  (send-side: record what a btrfs send stream cannot carry)
+# ============================================================================
+# Nested subvolumes (e.g. ~/.cache as a nested subvol, or @home/.snapshots)
+# arrive in a send stream as EMPTY DIRECTORIES — invisible in fstab and
+# indistinguishable from ordinary dirs in the received tree. So each send run
+# records them here, on the source filesystem inside @, and Snapper's next
+# timeline snapshot carries the file to the destination automatically — no new
+# transport, no server-side state, at most one snapshot-cycle stale. The file
+# also records the send-time facts a restore cannot derive on its own: the
+# configured subvol-name -> mountpoint map (how server directories map onto
+# fstab entries), the parent-tree base (its remnants are scrubbed on restore),
+# the btrfs label, and each top-level subvol's No-COW flag.
+# The CONSUMER is the companion snapperrestore script, which carries the
+# matching parser — the record kinds written here must stay understood there.
+
+_RESTORE_MANIFEST_PATH = "/etc/snappersend/restore-manifest"
+
+
+def _lsattr_nocow(path: str) -> bool:
+    """True when `lsattr -d` reports the No-COW (C) attribute on path."""
+    cp = run_local(["lsattr", "-d", path], check=False)
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return False
+    return "C" in cp.stdout.split()[0]
+
+
+def _nested_subvols_under(mountpoint: str, exclude_abs: tuple = ()) -> list[str]:
+    """Relative paths of the DIRECT child subvolumes of the subvolume mounted at
+    `mountpoint` (`btrfs subvolume list -o` filters on the containing subvol, so
+    a child at any directory depth is included, but children-of-children — e.g.
+    the snapshots inside a nested .snapshots store — are not). Paths under any
+    of `exclude_abs` (the parent tree) are dropped."""
+    show = run_local(["btrfs", "subvolume", "show", mountpoint], check=False)
+    if show.returncode != 0 or not show.stdout.strip():
+        return []
+    container = show.stdout.splitlines()[0].strip().lstrip("/")
+    lst = run_local(["btrfs", "subvolume", "list", "-o", mountpoint], check=False)
+    if lst.returncode != 0:
+        return []
+    rels = []
+    for line in lst.stdout.splitlines():
+        m = re.search(r"\spath\s+(.+)$", line)
+        if not m:
+            continue
+        fs_path = m.group(1).strip().lstrip("/")
+        if container and fs_path.startswith(container + "/"):
+            rel = fs_path[len(container) + 1:]
+        elif not container:
+            rel = fs_path
+        else:
+            continue
+        abs_path = os.path.join(mountpoint, rel)
+        if any(abs_path == ex.rstrip("/") or
+               abs_path.startswith(ex.rstrip("/") + "/") for ex in exclude_abs if ex):
+            continue
+        rels.append(rel)
+    return sorted(rels)
+
+
+def build_restore_manifest(cfg: Config, fstab_text: Optional[str] = None) -> str:
+    """Compose the manifest text from the LIVE source: configured subvols, their
+    direct nested subvolumes (with No-COW flags), and the top-level No-COW map
+    read off the live fstab's btrfs mountpoints. `fstab_text` is injectable for
+    tests; None reads /etc/fstab."""
+    lines = [
+        "# snappersend restore-manifest — written automatically by each snappersend run.",
+        "# Consumed by `snapperrestore`. Nested subvolumes travel in a btrfs send",
+        "# stream as EMPTY DIRECTORIES, so their layout and No-COW flags are recorded",
+        "# here. NOTE: the CONTENTS of nested subvols are NOT in the backup by design;",
+        "# a restore recreates them empty.",
+        "version 1",
+        f"parenttree {cfg.parent_tree_base}",
+    ]
+    root_mnt = next((sv["mountpoint"] for sv in cfg.subvols.values()
+                     if sv["mountpoint"] == "/"), "/")
+    lbl = run_local(["btrfs", "filesystem", "label", root_mnt], check=False)
+    if lbl.returncode == 0 and lbl.stdout.strip():
+        lines.append(f"btrfslabel {lbl.stdout.strip()}")
+    for name, sv in cfg.subvols.items():
+        lines.append(f"subvol {name} {sv['mountpoint']}")
+    for name, sv in cfg.subvols.items():
+        mnt = sv["mountpoint"]
+        for rel in _nested_subvols_under(mnt, exclude_abs=(cfg.parent_tree_base,)):
+            nocow = _lsattr_nocow(os.path.join(mnt, rel))
+            lines.append(f"nested {name} {rel} nocow={int(nocow)}")
+    if fstab_text is None:
+        try:
+            with open("/etc/fstab", encoding="utf-8") as f:
+                fstab_text = f.read()
+        except OSError as e:
+            log_warn(f"manifest: could not read /etc/fstab ({e}); "
+                     "top-level No-COW flags omitted")
+            fstab_text = ""
+    for e in parse_fstab_template(fstab_text):
+        if e.fstype == "btrfs" and e.subvol:
+            lines.append(f"toplevel {e.subvol} {e.mountpoint} "
+                         f"nocow={int(_lsattr_nocow(e.mountpoint))}")
+    return "\n".join(lines) + "\n"
+
+
+def write_restore_manifest(cfg: Config) -> None:
+    """Send-side: refresh the on-source manifest so Snapper's next timeline
+    snapshot carries it to the destination inside @. Best-effort by design — a
+    failure here degrades the restore of nested subvols, it must never fail the
+    replication run."""
+    if cfg.dry_run:
+        log_info(f"[dry-run] would refresh {_RESTORE_MANIFEST_PATH}")
+        return
+    try:
+        content = build_restore_manifest(cfg)
+        os.makedirs(os.path.dirname(_RESTORE_MANIFEST_PATH), exist_ok=True)
+        tmp = _RESTORE_MANIFEST_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, _RESTORE_MANIFEST_PATH)
+        log_debug(f"refreshed {_RESTORE_MANIFEST_PATH}")
+    except Exception as e:
+        log_warn(f"could not refresh restore manifest: {e} — a future restore "
+                 "will fall back to the last successfully written one")
 
 
 # ============================================================================
@@ -1766,7 +1960,10 @@ def _provision_script(user: str, pubkey: str, recv_base: str) -> str:
     """The bash executed as root on the destination to (idempotently) create the
     transport user, install its restrict-hardened authorized_keys, write a scoped
     sudoers with the destination's OWN binary paths (auto-detected), and ensure the
-    receive dir. Emits a final PROVISION_OK line the caller checks for."""
+    receive dir. Emits a final PROVISION_OK line the caller checks for.
+    The `btrfs send` grant is for the companion snapperrestore script (the
+    restore direction streams back from the destination). MUST BE BYTE-IDENTICAL
+    to snapperrestore's _provision_script (test-pinned)."""
     authline = "restrict " + pubkey.strip()
     return f"""set -euo pipefail
 U={shlex.quote(user)}
@@ -1788,6 +1985,7 @@ umask 077
 cat > /etc/sudoers.d/snappersend <<SUDOERS
 Cmnd_Alias SNAPPERSEND_CMDS = \\
     $BTRFS receive *, \\
+    $BTRFS send *, \\
     $BTRFS subvolume show *, \\
     $BTRFS subvolume delete *, \\
     $BTRFS property get *, \\
@@ -2186,6 +2384,10 @@ def _run(cfg: Config, args: argparse.Namespace) -> int:
     hostname = socket.gethostname()
     log_step(f"snappersend on {hostname} -> {cfg.server_user}@{cfg.server_host}"
              + (" [DRY-RUN]" if cfg.dry_run else ""))
+
+    # Refresh the restore manifest FIRST, so Snapper's next timeline tick ships
+    # it inside the root snapshot (see the RESTORE MANIFEST section).
+    write_restore_manifest(cfg)
 
     snapshots_ok = True
     for name, sv in cfg.subvols.items():

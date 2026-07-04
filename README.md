@@ -272,6 +272,10 @@ snappersend -v              # verbose: log every shell command
 snappersend setup-dest admin@host   # provision the destination over your admin login
                                      #   (transport user + scoped sudoers; ships no files)
 snappersend decom-dest  admin@host   # remove that transport config (keeps received data)
+
+snapperrestore --plan               # read-only DR rehearsal: fetch templates, print the plan
+snapperrestore                      # bare-metal disaster recovery (from a live ISO — below)
+                                    #   a SEPARATE, self-contained script: see its section
 ```
 
 ### `--report` — read-only status & health view
@@ -392,6 +396,121 @@ destination (the received snapshots are Btrfs subvolumes:
 wasn't authorized (re-run `setup-dest`); `Host key verification failed` means the pinned
 host key changed; a hang then `Connection timed out` means a wrong `SERVER_HOST`/`SSH_PORT`
 or a firewall.
+
+## Disaster recovery — `snapperrestore`
+
+`sudo snapperrestore` rebuilds a machine from the destination's received
+snapshot tree: partition → LUKS2 → btrfs + subvolumes → receive → nested subvols →
+No-COW/swapfile → boot tier → fstab/crypttab → chroot initramfs/GRUB → verify. It is
+**disaster recovery only** (dead/stolen device, fresh disk, run from a live ISO such
+as grml, booted UEFI). For file-level recovery just browse the server's tree — every
+received snapshot is an ordinary directory there.
+
+It is a **separate, single self-contained script** — one tool, one job. In a
+disaster the machine that had snappersend installed is gone; all the live
+environment needs is Python 3 and the `snapperrestore` file (it carries private
+copies of the snappersend helpers it uses, and the test suite pins the one that
+must never drift — the destination sudoers provision script). It reads
+snappersend's config for transport *defaults* when one exists, but never needs
+it: flags and prompts cover everything.
+
+Provenance: the machines this rebuilds were installed by Debstillation's
+`di-btrfs.sh` (the `@…` subvolume set, the nested `~/.nocow` subvol, the
+random-suffixed `luks-<suffix>` mapper name), and snapperrestore generalises
+that repo's host-specific `millionaire-restore.sh`. There is deliberately **no
+coupling** to the installer: everything installer-specific is read back out of
+the backup itself (the fstab/crypttab templates and the manifest), so layout
+changes in `di-btrfs.sh` flow through to restores automatically.
+
+**The received root snapshot is the restore manifest.** Nothing about the machine's
+layout is hardcoded:
+
+- `root.latest/etc/fstab` — the subvol set, mountpoints, per-subvol mount options,
+  swapfile path, and the /boot + ESP filesystems. It is a **template, not a copy**:
+  structure and option strings are written back verbatim, but **every UUID is
+  rewritten** from live `blkid` of the freshly created target.
+- `root.latest/etc/crypttab` — the LUKS mapping name and unlock options (TPM or
+  not is read from here, never assumed). Also UUID-rewritten.
+- `root.latest/etc/snappersend/restore-manifest` — written automatically by every
+  send run (it rides to the server inside the next Snapper snapshot). It records
+  what a `btrfs send` stream cannot carry: **nested subvolumes** (they arrive as
+  empty directories — e.g. `@home/.snapshots`, a nested `~/.cache`) with their
+  No-COW flags, the configured name→mountpoint map, the parent-tree base, the
+  btrfs label, and each top-level subvol's No-COW flag. Restores of old backups
+  that predate the manifest warn and skip nested-subvol recreation.
+
+**Receive vs recreate is derived, never hardcoded:** every subvol the server holds
+for the hostname is received (receive → promote to a writable subvol — the
+send/receive path, never rsync); every other `subvol=@…` fstab entry is recreated
+empty. Two explicit exceptions, always recreated empty even if the server holds
+them: the snapper snapshot store (old history is parented to the dead filesystem's
+UUID — useless) and the swap container (the swapfile is recreated No-COW). Nested
+subvolumes are recreated **empty by design** — their contents were never in the
+backup; that's the point of making something a nested subvol.
+
+What the wizard asks for (everything else comes from the backup): the target disk
+(typed-device-path confirmation before any destructive step), the LUKS passphrase,
+partition sizes (`--esp-size` 512MiB, `--boot-size` 2GiB, `--swap-size` 2g), and
+the server/transport details.
+
+### Before you need it
+
+1. **Re-run `setup-dest` once.** The restore direction streams *back* from the
+   server (`sudo btrfs send` there), which older destination sudoers don't allow.
+   `setup-dest` is idempotent — re-running it upgrades the grant. Do this **before**
+   the disaster: `sudo snappersend setup-dest admin@backup-host`.
+2. **Keep an offline copy of the transport key** (`/etc/snappersend/ssh/id_ed25519`),
+   e.g. in a password manager. After a total loss, `snapperrestore --ssh-key PATH`
+   uses it directly. Without a copy, the wizard offers to bootstrap a fresh key over
+   your admin login (an embedded copy of the `setup-dest` flow, run from the live
+   environment).
+3. **Know where to get `snapperrestore`.** It is one dependency-free file: fetch it
+   from this repository onto the live ISO (or keep a copy with your recovery notes).
+   Installing it on the machine too (`sudo install -m 0755 snapperrestore
+   /usr/bin/snapperrestore`) lets you rehearse with `--plan` any time.
+
+### Running it
+
+```sh
+# rehearsal, any time, from the running system — read-only, zero writes:
+sudo snapperrestore --plan
+
+# the real thing, from a live ISO (UEFI), with the new disk attached:
+sudo snapperrestore                            # fully interactive wizard
+sudo snapperrestore --disk /dev/nvme0n1 --ssh-key /media/usb/id_ed25519
+sudo snapperrestore --snapshot 20260701-090008+1000    # older epoch, not latest
+```
+
+The wizard connects, discovers hostnames/subvols/snapshots on the server (defaulting
+to the newest **epoch-matched** set — root/home/bootmirror are snapshotted in the
+same timeline tick by design; it warns if your selection spans epochs), prints the
+full derived plan (receive-vs-empty classification, nested subvols, LUKS options,
+partition layout, UUID rewrites) and only then, after an explicit typed confirmation
+of the target device, touches the disk. `/boot` and the ESP are populated from the
+received `@bootmirror` (epoch-matched to the root snapshot), then fstab/crypttab are
+written and initramfs/GRUB installed in a chroot. A final verify cross-checks every
+rewritten UUID against `blkid`, confirms the GRUB binary on the ESP, and **extracts
+the generated initramfs to confirm it embeds the new LUKS UUID** (the classic
+chroot-restore failure is an initramfs that can't unlock the root at boot; the
+wizard both prevents and verifies this).
+
+Safety: it refuses to run outside a live environment (`LIVE_ENV=1` overrides, for
+e.g. a VM restoring onto a spare disk) and **hard-refuses** — no override — any disk
+that backs a currently-mounted filesystem. The LUKS container is opened under a
+reserved runtime name so a rehearsal can never collide with the running system's
+mappings.
+
+**Resumability:** every completed step is recorded in a state file on the new
+filesystem's top level. If a receive dies mid-stream (network blip → the run aborts
+cleanly; a partial receive is never treated as success), re-run `snapperrestore`
+and answer `resume` — completed steps are skipped via the markers plus per-step
+idempotency probes, and the LUKS container is left open after a failure so
+resuming doesn't re-prompt.
+
+**After first boot:** Snapper starts a fresh timeline (the snapshot stores were
+recreated empty — the old history remains on the server, browsable). The next
+forward `snappersend` run starts a **new lineage** on the server: one full send per
+subvol is expected and correct; the old history is untouched.
 
 ### systemd wiring — run right after each Snapper timeline snapshot
 
@@ -613,6 +732,7 @@ dependency — remove `50-notify.conf` (and `daemon-reload`) to turn it all off.
 
 ```sh
 SNAPPERSEND_QUIET=1 python3 -m pytest test_snappersend.py -q
+SNAPPERRESTORE_QUIET=1 python3 -m pytest test_snapperrestore.py -q
 ```
 
 The suite covers the parent-tree invariant (failed send leaves the parent unchanged;
@@ -625,3 +745,18 @@ GFS), Snapper-schema config parsing, the carried-over correctness logic
 and the bootmirror sync (above all that it is **source-local**: any attempt to run a
 remote command fails the test; plus the nested-ESP exclude, the vfat mtime window,
 and rc-24 tolerance).
+
+The restore suite (`test_snapperrestore.py`) covers snapperrestore's
+load-bearing constraints: the fstab/crypttab **anti-drift** guarantee (UUIDs
+rewritten, options/columns byte-identical), receive-vs-empty **derived**
+classification plus the explicit `@snapshots`/`@swap` always-empty rule,
+`--plan` running **zero local commands**, a transport failure aborting cleanly,
+epoch-matched snapshot selection, and the chroot-time `initramfs` crypttab
+option injection. Two tests deliberately import **both** scripts to pin the
+cross-file contracts: the **manifest round-trip** (snappersend writes the
+manifest from a synthetic subvol listing; snapperrestore parses it and the
+recreation plan matches paths + No-COW flags) and the **provision-script pin**
+(snapperrestore's embedded copy of the destination sudoers script must be
+byte-identical to snappersend's — it defines the transport security boundary
+and both directions' capability list). The full partition→boot-verify path is
+validated on real VMs (see the build report), not mocked here.

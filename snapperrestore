@@ -1,0 +1,2266 @@
+#!/usr/bin/env python3
+"""
+snapperrestore — bare-metal disaster recovery from a snappersend destination
+=============================================================================
+
+Rebuilds a machine from the snapshot tree a snappersend destination server
+holds for it:
+
+    partition -> LUKS2 -> btrfs + subvolumes -> btrfs receive -> nested
+    subvols -> No-COW/swapfile -> boot tier -> fstab/crypttab (UUIDs
+    rewritten) -> chroot initramfs/GRUB -> verify
+
+DISASTER RECOVERY ONLY (dead/stolen device, fresh disk, run from a live ISO
+such as grml, booted UEFI); file-level recovery is out of scope — every
+received snapshot is an ordinary directory on the server, browse it there.
+
+ONE SELF-CONTAINED FILE, ON PURPOSE. In a disaster the machine that had
+snappersend installed is gone; the only things the live environment needs are
+Python 3 and this script. It therefore carries private copies of the
+snappersend helpers it uses (logging, ssh transport, flat-config parsing, the
+send/receive pipe, the destination-provisioning script). Each copy is marked
+`kept in sync with snappersend`; the one that must never drift — the sudoers
+provision script, which defines what the transport user may run on the
+destination — is pinned equal across both files by the test suite.
+
+SOURCE OF TRUTH — the received root snapshot IS the restore manifest:
+  etc/fstab                         subvol set, mountpoints, options, swapfile
+  etc/crypttab                      LUKS mapping name + unlock options
+  etc/snappersend/restore-manifest  nested subvols, No-COW map, name map
+                                    (written by every snappersend send run)
+fstab/crypttab are TEMPLATES, not copies: structure and option strings are
+preserved verbatim; every UUID is rewritten from live blkid of the freshly
+created target (old and new UUIDs render at the same width, so a plain
+substring replacement also preserves the operator's column layout).
+
+Receive-vs-recreate is DERIVED, never hardcoded: every subvol the server
+holds for the hostname is received (receive -> promote, never rsync); every
+other fstab subvol is recreated empty. The one EXPLICIT exception (tested):
+the snapper snapshot store and the swap container are always recreated empty
+— old snapshot history is parented to the dead filesystem's UUID (useless),
+and the swapfile is recreated No-COW. Operator input is only what the tree
+cannot know: target disk, LUKS passphrase, partition sizes, server/key
+bootstrap.
+
+RESUMABILITY: a state file on the new filesystem's top level marks completed
+steps; a re-run detects the prior layout, offers to resume, and skips
+completed work via the markers plus per-step idempotency probes (partitions
+match -> skip; subvol exists -> skip) rather than blind re-execution. Any
+destination-transport failure aborts the step cleanly — partial state is
+never treated as success.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import base64
+import contextlib
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+
+# ============================================================================
+# LOGGING  ([STEP]/[INFO]/[OK]/[WARN]/[ERROR] — kept in sync with snappersend)
+# ============================================================================
+# Structured logging to a file (default /var/log/snapperrestore.log, override
+# with $SNAPPERRESTORE_LOG) plus the terminal (coloured when stderr is a tty).
+# File logging is best-effort: an unwritable log path (common on a live ISO)
+# degrades to stderr only. Set $SNAPPERRESTORE_QUIET to silence (tests).
+
+_VERBOSE = False
+_QUIET = bool(os.environ.get("SNAPPERRESTORE_QUIET"))
+_LOG_PATH = os.environ.get("SNAPPERRESTORE_LOG", "/var/log/snapperrestore.log")
+_RESET = "\033[0m"
+_LEVEL_COLOR = {
+    "STEP":  "\033[1;36m",   # bold cyan
+    "INFO":  "\033[0;34m",   # blue
+    "OK":    "\033[0;32m",   # green
+    "WARN":  "\033[0;33m",   # yellow
+    "ERROR": "\033[0;31m",   # red
+}
+_logfile = None  # None=untried, False=tried-and-failed, else file object
+
+
+def _open_logfile():
+    global _logfile
+    if _logfile is not None:
+        return _logfile
+    try:
+        _logfile = open(_LOG_PATH, "a", encoding="utf-8")
+    except OSError:
+        _logfile = False
+    return _logfile
+
+
+def _emit(level: str, msg: str) -> None:
+    if _QUIET:
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    plain = f"{ts} [{level}] {msg}"
+    lf = _open_logfile()
+    if lf:
+        try:
+            lf.write(plain + "\n")
+            lf.flush()
+        except OSError:
+            pass
+    if sys.stderr.isatty():
+        color = _LEVEL_COLOR.get(level, "")
+        sys.stderr.write(f"{ts} {color}[{level}]{_RESET} {msg}\n")
+    else:
+        sys.stderr.write(plain + "\n")
+
+
+def log_step(m: str) -> None:  _emit("STEP", m)
+def log_info(m: str) -> None:  _emit("INFO", m)
+def log_ok(m: str) -> None:    _emit("OK", m)
+def log_warn(m: str) -> None:  _emit("WARN", m)
+def log_error(m: str) -> None: _emit("ERROR", m)
+
+
+def log_debug(m: str) -> None:
+    if _VERBOSE:
+        _emit("INFO", m)
+
+
+# ============================================================================
+# SHELL + SSH TRANSPORT  (kept in sync with snappersend)
+# ============================================================================
+
+def run_local(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a local command, capturing output. Missing executables degrade to a
+    rc=127 CompletedProcess when check=False."""
+    log_debug("local: " + " ".join(shlex.quote(a) for a in argv))
+    try:
+        # stdin=DEVNULL: a captured command must never read the terminal/pipe —
+        # ssh in particular drains inherited stdin into its channel, which would
+        # eat input meant for the wizard's own prompts.
+        cp = subprocess.run(argv, check=False, capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
+    except FileNotFoundError as e:
+        if check:
+            raise
+        return subprocess.CompletedProcess(argv, 127, "", str(e))
+    if check and cp.returncode != 0:
+        raise subprocess.CalledProcessError(cp.returncode, argv, cp.stdout, cp.stderr)
+    return cp
+
+
+# --- SSH connection multiplexing ---------------------------------------------
+# The discovery phase issues MANY small remote commands (one `ls` per server
+# subvol, three `cat`s for the templates, ...). A fresh ssh connection costs a
+# full TCP + key handshake each; ControlMaster multiplexing pays that once and
+# every later command rides the master as a cheap channel. Works with the
+# destination's `restrict` authorized_keys line (multiplexed exec channels are
+# plain sessions; restrict only denies pty/forwarding).
+_SSH_CONTROL_DIR: Optional[str] = None
+
+
+def _ssh_control_opts() -> list[str]:
+    global _SSH_CONTROL_DIR
+    if _SSH_CONTROL_DIR is None:
+        _SSH_CONTROL_DIR = tempfile.mkdtemp(prefix="snapperrestore-ssh-")
+        atexit.register(_cleanup_ssh_masters)
+    return ["-o", "ControlMaster=auto",
+            "-o", f"ControlPath={_SSH_CONTROL_DIR}/%C",
+            "-o", "ControlPersist=60"]
+
+
+def _cleanup_ssh_masters() -> None:
+    """Ask any live control master to exit, then remove the socket dir. Best
+    effort — an already-gone master (or an unwritable dir) is not an error."""
+    if _SSH_CONTROL_DIR is None:
+        return
+    with contextlib.suppress(OSError):
+        for sock in os.listdir(_SSH_CONTROL_DIR):
+            path = os.path.join(_SSH_CONTROL_DIR, sock)
+            # -O exit talks straight to the socket; the host arg is unused then.
+            with contextlib.suppress(Exception):
+                subprocess.run(["ssh", "-o", f"ControlPath={path}", "-O", "exit",
+                                "unused-host"], capture_output=True)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(_SSH_CONTROL_DIR)
+
+
+def ssh_argv(cfg: Config, remote_cmd: str) -> list[str]:
+    return [
+        "ssh", "-i", cfg.ssh_key, "-p", str(cfg.server_ssh_port),
+        "-o", "BatchMode=yes",
+        *_ssh_control_opts(),
+        f"{cfg.server_user}@{cfg.server_host}",
+        remote_cmd,
+    ]
+
+
+def run_remote(cfg: Config, remote_cmd: str, *, check: bool = True):
+    return run_local(ssh_argv(cfg, remote_cmd), check=check)
+
+
+class RemoteUnreachable(Exception):
+    """The destination could not be contacted at all (ssh transport failure —
+    name resolution, connection refused/timeout, auth). DISTINCT from a
+    reachable-but-empty destination: a transport blip must abort the step
+    cleanly, never masquerade as 'nothing there'."""
+
+
+def _is_ssh_transport_failure(cp: subprocess.CompletedProcess) -> bool:
+    """True when a run_remote result reflects ssh's own failure to establish the
+    session rather than the remote command's exit status. ssh reserves rc 255
+    for connection/resolution/auth errors; a remote `ls` otherwise returns 0
+    (ok, possibly empty) or a small code like 2 (missing dir). rc 127 is our
+    own 'ssh binary missing' sentinel."""
+    if cp.returncode in (255, 127):
+        return True
+    # Belt-and-suspenders: ssh prefixes its transport diagnostics with "ssh:".
+    return any(ln.strip().lower().startswith("ssh:")
+               for ln in (cp.stderr or "").splitlines())
+
+
+# ============================================================================
+# TRANSPORT CONFIG  (the transport subset of snappersend's flat config file)
+# ============================================================================
+# snapperrestore reads the SAME flat KEY="value" file snappersend uses
+# (/etc/snappersend/config) but only for transport defaults — server, port,
+# user, key, receive base, mbuffer. Every other snappersend key (SUBVOLUMES,
+# retention, ...) is ignored: the restored machine's layout comes from the
+# BACKUP, never from a local config. On a live ISO the file usually doesn't
+# exist at all; flags/prompts cover everything.
+
+
+@dataclass(frozen=True)
+class Config:
+    """Transport settings: config-file defaults, overridden by flags/prompts."""
+    server_host: str
+    server_ssh_port: int = 22
+    server_user: str = "snappersend"    # dedicated least-priv transport user
+    ssh_key: str = "/etc/snappersend/ssh/id_ed25519"
+    recv_base: str = "/srv/snapshots-recv"
+    use_mbuffer: bool = True
+
+
+def load_config(path: str = "/etc/snappersend/config") -> dict:
+    """Parse the transport keys out of snappersend's flat config into kwargs
+    for Config (python-dotenv — tolerant of a Snapper-shaped file). Raises
+    FileNotFoundError if the file is absent and KeyError only if SERVER_HOST
+    (the one required key) is missing."""
+    from dotenv import dotenv_values
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    d = dotenv_values(path)
+
+    def s(key, default=None):
+        v = d.get(key)
+        return v if v not in (None, "") else default
+
+    kwargs: dict = {}
+    host = s("SERVER_HOST")
+    if not host:
+        raise KeyError("SERVER_HOST is required in the config")
+    kwargs["server_host"] = host
+    if s("SSH_PORT"):
+        kwargs["server_ssh_port"] = int(s("SSH_PORT"))
+    if s("SERVER_USER"):
+        kwargs["server_user"] = s("SERVER_USER")
+    if s("SSH_KEY"):
+        kwargs["ssh_key"] = s("SSH_KEY")
+    if s("RECV_BASE"):
+        kwargs["recv_base"] = s("RECV_BASE")
+    mb = s("USE_MBUFFER")
+    if mb is not None:
+        kwargs["use_mbuffer"] = str(mb).strip().lower() in ("1", "true", "yes",
+                                                            "on")
+    return kwargs
+
+
+# ============================================================================
+# SUBVOLUME IDENTITY  (the received-validity check — kept in sync with snappersend)
+# ============================================================================
+
+@dataclass
+class Subvol:
+    """A Btrfs subvolume's identity, parsed from `btrfs subvolume show` — the
+    fields the valid-received rule depends on."""
+    path: str
+    uuid: str
+    parent_uuid: str            # '-' if none
+    received_uuid: str          # '-' if not a received subvol
+    readonly: bool
+
+    @property
+    def is_valid_received(self) -> bool:
+        """A clean receive is readonly AND has received_uuid set; a garbled
+        (partial/interrupted) one is writable with received_uuid == '-'."""
+        return self.readonly and self.received_uuid != "-"
+
+
+def parse_subvolume_show(text: str, path: str) -> Subvol:
+    """Parse the human output of `btrfs subvolume show` into a Subvol. Field
+    lines look like `Key:\\t\\tvalue`; matching is on a normalised lowercased
+    prefix so btrfs-progs version differences don't matter."""
+    uuid = parent_uuid = received_uuid = "-"
+    readonly = False
+    for line in text.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("received uuid:"):
+            received_uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("parent uuid:"):
+            parent_uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("uuid:"):
+            uuid = s.split(":", 1)[1].strip() or "-"
+        elif low.startswith("flags:"):
+            readonly = "readonly" in low
+    return Subvol(path=path, uuid=uuid, parent_uuid=parent_uuid,
+                  received_uuid=received_uuid, readonly=readonly)
+
+
+def _ro_property_local(path: str) -> bool:
+    cp = run_local(["btrfs", "property", "get", path, "ro"], check=False)
+    return "ro=true" in cp.stdout.replace(" ", "").lower()
+
+
+def show_local(path: str) -> Optional[Subvol]:
+    cp = run_local(["btrfs", "subvolume", "show", path], check=False)
+    if cp.returncode != 0:
+        log_warn(f"btrfs subvolume show failed for {path}: {cp.stderr.strip()}")
+        return None
+    sv = parse_subvolume_show(cp.stdout, path)
+    if "flags:" not in cp.stdout.lower():
+        sv.readonly = _ro_property_local(path)
+    return sv
+
+
+# A received snapshot's wrapper-directory name on the destination:
+#   <localdate>-<offset>-<num>-<clone_short_uuid>
+# <localdate> is SECOND precision (HHMMSS); date+offset = group 1 (the "epoch"
+# — root/home/bootmirror snapshots taken in the same snapper tick share it),
+# num = group 2. The older minute-precision form (HHMM) is still accepted.
+# Kept in sync with snappersend, which writes these names.
+_NAME_RE = re.compile(r"^(\d{8}-\d{4,6}[+-]\d{4})-(\d+)(?:-|$)")
+
+
+# ============================================================================
+# THE RECEIVE PIPE  (ssh send -> [mbuffer ->] btrfs receive — kept in sync)
+# ============================================================================
+
+def _parse_mbuffer_summary(text: str) -> Optional[str]:
+    """Extract mbuffer's end-of-run summary from its `-l` logfile text — e.g.
+    `summary: 5120 kiByte in  0.4sec - average of  12 MiB/s` — normalised to
+    single spaces. None if no summary line is present."""
+    for line in reversed(text.splitlines()):
+        if "summary:" in line:
+            return " ".join(line[line.index("summary:") + len("summary:"):].split())
+    return None
+
+
+def _run_pipe(send_argv, recv_argv, use_mbuffer,
+              names=("ssh send", "btrfs receive")) -> bool:
+    """
+    Connect the producer -> [mbuffer ->] consumer and return True iff EVERY
+    stage exits 0 (a failure in the sender must not be masked by a 0 from the
+    receiver). Each stage's stderr is captured to a temp file (never a pipe, so
+    a chatty stage can't deadlock the data flow) — except interactive mbuffer,
+    which inherits the terminal for its live throughput readout.
+
+    When mbuffer is in the pipe it also writes its stats to a logfile (`-l`),
+    and the end-of-run summary — stream size, duration, average rate — is
+    logged at INFO in every mode, including `-q`.
+    """
+    stages: list[tuple[str, list[str], bool]] = [(names[0], list(send_argv), True)]
+    mb = bool(use_mbuffer) and shutil.which("mbuffer") is not None
+    if use_mbuffer and not mb:
+        log_warn("use_mbuffer set but mbuffer not on PATH; continuing without it")
+    mb_stats_path = None
+    if mb:
+        fd, mb_stats_path = tempfile.mkstemp(prefix="snapperrestore-mbstats-")
+        os.close(fd)
+        if sys.stderr.isatty():
+            stages.append(("mbuffer",
+                           ["mbuffer", "-m", "256M", "-l", mb_stats_path], False))
+        else:
+            stages.append(("mbuffer",
+                           ["mbuffer", "-q", "-m", "256M", "-l", mb_stats_path], True))
+    stages.append((names[1], list(recv_argv), True))
+
+    procs: list[tuple[str, subprocess.Popen, object]] = []
+    errfiles: list = []
+    prev_stdout = None
+    try:
+        for i, (name, argv, capture) in enumerate(stages):
+            errf = tempfile.TemporaryFile() if capture else None
+            if errf is not None:
+                errfiles.append(errf)
+            is_last = (i == len(stages) - 1)
+            p = subprocess.Popen(
+                argv,
+                # First stage: DEVNULL, never the inherited stdin — the ssh
+                # producer would drain the terminal/pipe the wizard reads.
+                stdin=(subprocess.DEVNULL if prev_stdout is None else prev_stdout),
+                stdout=(subprocess.DEVNULL if is_last else subprocess.PIPE),
+                stderr=errf,
+            )
+            if prev_stdout is not None:
+                prev_stdout.close()
+            procs.append((name, p, errf))
+            prev_stdout = p.stdout
+    except (FileNotFoundError, OSError) as e:
+        log_error(f"failed to start pipe: {e}")
+        for _, p, _ef in procs:
+            with contextlib.suppress(Exception):
+                p.kill()
+        for ef in errfiles:
+            with contextlib.suppress(Exception):
+                ef.close()
+        if mb_stats_path:
+            with contextlib.suppress(OSError):
+                os.unlink(mb_stats_path)
+        return False
+
+    all_ok = True
+    for name, p, errf in procs:
+        rc = p.wait()
+        err = ""
+        if errf is not None:
+            try:
+                errf.seek(0)
+                err = errf.read().decode("utf-8", "replace").strip()
+            finally:
+                errf.close()
+        if rc != 0:
+            all_ok = False
+            log_error(f"  pipe stage '{name}' exited {rc}" + (f": {err}" if err else ""))
+        elif err:
+            log_debug(f"  pipe stage '{name}': {err}")
+
+    if mb_stats_path:
+        try:
+            with open(mb_stats_path, encoding="utf-8", errors="replace") as f:
+                summary = _parse_mbuffer_summary(f.read())
+            if summary:
+                log_info(f"  transfer stats: {summary}")
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(mb_stats_path)
+    return all_ok
+
+
+def _nested_boot_excludes(src: str, boot_paths: tuple) -> list[str]:
+    """rsync --exclude options shielding any OTHER boot path nested under `src`
+    (the stock layout: /boot/efi is a separate mount inside /boot). The nested
+    mount gets its own rsync pass with its own mtime window, so the outer pass
+    must not descend into it — and because rsync protects excluded paths from
+    --delete, the already-synced nested tree survives untouched. (Kept in sync
+    with snappersend's bootmirror sync, which mirrors with the same rules.)"""
+    base = src.rstrip("/")
+    return [f"--exclude={other.rstrip('/')[len(base):]}/"
+            for other in boot_paths
+            if other != src and other.rstrip("/").startswith(base + "/")]
+
+
+# ============================================================================
+# FSTAB / CRYPTTAB TEMPLATES  (kept in sync with snappersend's fstab parsing)
+# ============================================================================
+# The received root snapshot's etc/fstab and etc/crypttab ARE the restore
+# manifest for machine layout: authoritative for the subvol set, mountpoints,
+# per-subvol mount options, swapfile path and the LUKS mapping name/options.
+# They are TEMPLATES, not copies: structure and option strings are preserved
+# verbatim; every UUID is rewritten from the freshly created target at restore
+# time (old and new UUIDs render at the same width, so a plain substring
+# replacement also preserves the operator's column layout).
+
+
+@dataclass
+class FstabEntry:
+    """One non-comment /etc/fstab line split into its six fields, with the raw
+    line kept verbatim (UUID rewriting is a substring replacement over the raw
+    text so options and column layout survive untouched)."""
+    device: str
+    mountpoint: str
+    fstype: str
+    options: str
+    dump: str = "0"
+    passno: str = "0"
+    raw: str = ""
+
+    @property
+    def subvol(self) -> Optional[str]:
+        """The subvol=... mount option (leading '/' stripped), or None."""
+        for opt in self.options.split(","):
+            if opt.startswith("subvol="):
+                return opt.split("=", 1)[1].lstrip("/")
+        return None
+
+    @property
+    def uuid(self) -> Optional[str]:
+        return self.device[5:] if self.device.startswith("UUID=") else None
+
+
+def parse_fstab_template(text: str) -> list[FstabEntry]:
+    """Parse fstab text into entries, skipping comments/blanks. Lines with fewer
+    than 4 fields are ignored (never raises — the template rides inside a backup
+    and must be read tolerantly)."""
+    entries: list[FstabEntry] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        fields = s.split()
+        if len(fields) < 4:
+            continue
+        while len(fields) < 6:
+            fields.append("0")
+        entries.append(FstabEntry(fields[0], fields[1], fields[2], fields[3],
+                                  fields[4], fields[5], raw=line))
+    return entries
+
+
+def parse_crypttab_template(text: str):
+    """First non-comment crypttab line -> (name, uuid_or_None, keyspec, options,
+    raw). The presence/absence of TPM or other unlock options is read from here,
+    never assumed. None when the file holds no usable entry."""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        fields = s.split()
+        if len(fields) < 2:
+            continue
+        name, dev = fields[0], fields[1]
+        keyspec = fields[2] if len(fields) > 2 else "none"
+        options = fields[3] if len(fields) > 3 else ""
+        uuid = dev[5:] if dev.startswith("UUID=") else None
+        return name, uuid, keyspec, options, line
+    return None
+
+
+def rewrite_uuids(text: str, uuid_map: dict) -> str:
+    """Replace every old UUID with its new value across template text. Substring
+    replacement by design: everything that is not a mapped UUID — options,
+    comments, column layout — passes through byte-for-byte."""
+    for old, new in uuid_map.items():
+        if old and new:
+            text = text.replace(old, new)
+    return text
+
+
+# ============================================================================
+# RESTORE MANIFEST  (consumer side — snappersend writes it on every send run)
+# ============================================================================
+# Nested subvolumes (e.g. ~/.cache as a nested subvol, or @home/.snapshots)
+# arrive in a send stream as EMPTY DIRECTORIES — invisible in fstab and
+# indistinguishable from ordinary dirs in the received tree. snappersend
+# records them (plus the name->mountpoint map, the parent-tree base, the btrfs
+# label and the top-level No-COW map) in /etc/snappersend/restore-manifest on
+# each run; Snapper's next timeline snapshot carries the file to the
+# destination inside @, where this script reads it back out of the chosen root
+# snapshot. The WRITER lives in snappersend (it needs the live source); only
+# the parser lives here.
+
+_RESTORE_MANIFEST_REL = "etc/snappersend/restore-manifest"
+
+
+@dataclass
+class RestoreManifest:
+    """Parsed restore-manifest. All fields degrade to empty/defaults so an old
+    or partial manifest never aborts a restore."""
+    subvol_map: dict = field(default_factory=dict)    # config name -> mountpoint
+    nested: list = field(default_factory=list)        # (config name, relpath, nocow)
+    toplevel_nocow: dict = field(default_factory=dict)  # fstab subvol name -> bool
+    parent_tree_base: str = "/.snappersend"
+    btrfs_label: str = ""
+
+
+def parse_restore_manifest(text: str) -> RestoreManifest:
+    """Parse manifest text. Unknown record kinds and malformed lines are skipped
+    (forward compatibility; a manifest is advisory, never a hard failure)."""
+    mf = RestoreManifest()
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        f = s.split()
+        if f[0] == "parenttree" and len(f) >= 2:
+            mf.parent_tree_base = f[1]
+        elif f[0] == "btrfslabel" and len(f) >= 2:
+            mf.btrfs_label = f[1]
+        elif f[0] == "subvol" and len(f) >= 3:
+            mf.subvol_map[f[1]] = f[2]
+        elif f[0] == "nested" and len(f) >= 3:
+            mf.nested.append((f[1], f[2], "nocow=1" in f[3:]))
+        elif f[0] == "toplevel" and len(f) >= 3:
+            mf.toplevel_nocow[f[1]] = "nocow=1" in f[3:]
+    return mf
+
+
+# ============================================================================
+# KEY BOOTSTRAP  (the setup-dest flow, for total loss — kept in sync with
+# snappersend's destination provisioning)
+# ============================================================================
+# After a total loss the transport private key died with the machine. Either
+# the operator has an offline copy (--ssh-key) or a fresh key is provisioned
+# over their OWN admin login to the destination, exactly as
+# `snappersend setup-dest` does. The provision script below must stay
+# IDENTICAL to snappersend's (the test suite asserts it): it defines the
+# transport user's sudoers boundary, and a drifted grant would break either
+# the restore direction (`btrfs send`) or the forward runs after the restore.
+
+
+def _admin_ssh_argv(admin_user: str, host: str, port: int,
+                    tty: bool = False) -> list[str]:
+    """ssh argv for the one-time admin bootstrap connection. Runs as the invoking
+    user ($SUDO_USER) when we are root under sudo, so it uses the operator's keys/
+    known_hosts rather than root's. accept-new pins the host on first contact. `tty`
+    forces a remote pseudo-terminal (-tt) so a destination `sudo` can prompt for a
+    password."""
+    base = ["ssh"]
+    if tty:
+        base.append("-tt")
+    base += ["-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=15", "-p", str(port), f"{admin_user}@{host}"]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        return ["sudo", "-H", "-u", sudo_user, "--"] + base
+    return base
+
+
+def _run_admin_script(admin_user: str, host: str, port: int, script: str):
+    """Run `script` as root on the destination over the admin login. Returns
+    (rc, stdout, stderr).
+
+    The script is passed base64-encoded as a command ARGUMENT (not on stdin) so the
+    destination's `sudo` can read a password from the terminal while bash reads the
+    script from the pipe. Interactively (a tty) we allocate a remote pty and INHERIT
+    the terminal so the sudo prompt is shown and answerable — success is then judged by
+    exit code. Non-interactively (no tty) we use `sudo -n` and CAPTURE output; that
+    path requires passwordless sudo."""
+    b64 = base64.b64encode(script.encode()).decode()
+    interactive = sys.stdin.isatty()
+    sudo = "sudo" if interactive else "sudo -n"
+    remote = f"printf %s {shlex.quote(b64)} | base64 -d | {sudo} bash"
+    argv = _admin_ssh_argv(admin_user, host, port, tty=interactive) + [remote]
+    log_debug("admin: " + " ".join(shlex.quote(a) for a in argv))
+    try:
+        if interactive:
+            # Inherit the terminal so `sudo` can prompt; we can't also capture stdout,
+            # so success is the exit code (the remote script is `set -euo pipefail`).
+            cp = subprocess.run(argv)
+            return cp.returncode, "", ""
+        cp = subprocess.run(argv, text=True, capture_output=True)
+        return cp.returncode, cp.stdout, cp.stderr
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+def _provision_script(user: str, pubkey: str, recv_base: str) -> str:
+    """The bash executed as root on the destination to (idempotently) create the
+    transport user, install its restrict-hardened authorized_keys, write a scoped
+    sudoers with the destination's OWN binary paths (auto-detected), and ensure the
+    receive dir. Emits a final PROVISION_OK line the caller checks for.
+    MUST BE BYTE-IDENTICAL to snappersend's _provision_script (test-pinned)."""
+    authline = "restrict " + pubkey.strip()
+    return f"""set -euo pipefail
+U={shlex.quote(user)}
+RECV_BASE={shlex.quote(recv_base)}
+AUTHLINE={shlex.quote(authline)}
+if ! id "$U" >/dev/null 2>&1; then
+  useradd --system --create-home --shell /bin/bash "$U"
+fi
+passwd -l "$U" >/dev/null 2>&1 || true
+install -d -m 700 -o "$U" -g "$U" "/home/$U/.ssh"
+printf '%s\\n' "$AUTHLINE" > "/home/$U/.ssh/authorized_keys"
+chown "$U:$U" "/home/$U/.ssh/authorized_keys"
+chmod 600 "/home/$U/.ssh/authorized_keys"
+BTRFS="$(command -v btrfs || true)"
+MKDIR="$(command -v mkdir)"; RMDIR="$(command -v rmdir)"
+LS="$(command -v ls)"; LN="$(command -v ln)"
+if [ -z "$BTRFS" ]; then echo "btrfs not found on destination" >&2; exit 3; fi
+umask 077
+cat > /etc/sudoers.d/snappersend <<SUDOERS
+Cmnd_Alias SNAPPERSEND_CMDS = \\
+    $BTRFS receive *, \\
+    $BTRFS send *, \\
+    $BTRFS subvolume show *, \\
+    $BTRFS subvolume delete *, \\
+    $BTRFS property get *, \\
+    $MKDIR -p *, \\
+    $RMDIR *, \\
+    $LS *, \\
+    $LN -sfn *
+$U ALL=(root) NOPASSWD: SNAPPERSEND_CMDS
+Defaults!SNAPPERSEND_CMDS !requiretty
+SUDOERS
+chmod 0440 /etc/sudoers.d/snappersend
+if ! visudo -cf /etc/sudoers.d/snappersend; then
+  rm -f /etc/sudoers.d/snappersend
+  echo "sudoers validation failed" >&2; exit 4
+fi
+mkdir -p "$RECV_BASE"
+chown "$U:$U" "$RECV_BASE"
+echo "PROVISION_OK user=$U btrfs=$BTRFS"
+"""
+
+
+def _ensure_transport_key(cfg: Config) -> bool:
+    """Generate the passwordless ed25519 transport key at cfg.ssh_key if absent
+    (root-owned tree). Returns True on success/already-present."""
+    if os.path.isfile(cfg.ssh_key):
+        return True
+    keydir = os.path.dirname(cfg.ssh_key)
+    try:
+        os.makedirs(keydir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create key dir {keydir}: {e}", file=sys.stderr)
+        return False
+    cp = run_local(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                    "-C", f"snappersend@{socket.gethostname()}", "-f", cfg.ssh_key],
+                   check=False)
+    if cp.returncode != 0:
+        print(f"ssh-keygen failed: {cp.stderr.strip()}", file=sys.stderr)
+        return False
+    print(f"  generated transport key {cfg.ssh_key}")
+    return True
+
+
+def _pin_host_key(host: str, port: int) -> bool:
+    """Pin the destination's host key into ROOT's known_hosts so the transport
+    (which runs as root with BatchMode) trusts it deterministically. Idempotent:
+    stale entries for the host are removed first."""
+    kh = "/root/.ssh/known_hosts"
+    try:
+        os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    run_local(["ssh-keygen", "-R", host, "-f", kh], check=False)
+    scan = run_local(["ssh-keyscan", "-p", str(port), host], check=False)
+    if scan.returncode == 0 and scan.stdout.strip():
+        with open(kh, "a", encoding="utf-8") as f:
+            f.write(scan.stdout)
+        os.chmod(kh, 0o600)
+        return True
+    print(f"  WARN: ssh-keyscan of {host} returned nothing; transport may prompt on "
+          "host key", file=sys.stderr)
+    return False
+
+
+def _verify_transport(cfg: Config):
+    """Prove the transport end-to-end (host key + key auth + remote sudo) with an
+    allowlisted `sudo ls` of RECV_BASE. Returns (ok, message)."""
+    cp = run_remote(cfg, f"sudo ls -1d {shlex.quote(cfg.recv_base)}", check=False)
+    if cp.returncode == 0 and cfg.recv_base in (cp.stdout or ""):
+        return True, (f"{cfg.server_user}@{cfg.server_host} reachable, remote sudo OK, "
+                      f"{cfg.recv_base} present")
+    if _is_ssh_transport_failure(cp):
+        detail = (cp.stderr or "").strip().splitlines()
+        return False, "ssh transport failure: " + (detail[-1] if detail else
+                                                    f"exit {cp.returncode}")
+    return False, f"unexpected (rc={cp.returncode}): {(cp.stderr or '').strip()}"
+
+
+def _resolve_admin(admin: Optional[str], cfg: Config):
+    """Work out (admin_user, host, port) for the bootstrap login from an
+    optional user@host (or bare user) string or an interactive prompt. The host
+    defaults to cfg.server_host; the transport still targets cfg.server_host."""
+    if not admin:
+        if not sys.stdin.isatty():
+            print("no admin login given and not a tty; cannot bootstrap a key",
+                  file=sys.stderr)
+            return None
+        admin = input(f"Admin login on {cfg.server_host} (user@host, or just user): ").strip()
+    if not admin:
+        return None
+    if "@" in admin:
+        user, host = admin.split("@", 1)
+    else:
+        user, host = admin, cfg.server_host
+    return user, host or cfg.server_host, cfg.server_ssh_port
+
+
+_CONFIG_TEMPLATE = """\
+# snappersend transport config — written by `snapperrestore` (key bootstrap).
+# Only the transport keys are set here; the restored machine carries its own
+# full config inside the backup.
+SERVER_HOST="{server_host}"
+SSH_PORT="{ssh_port}"
+SERVER_USER="{server_user}"
+SSH_KEY="{ssh_key}"
+RECV_BASE="{recv_base}"
+USE_MBUFFER="yes"
+"""
+
+
+def _ensure_config(path: str) -> bool:
+    """If the config is absent (the live-ISO norm), interactively gather the
+    transport essentials and write it. Returns True if a usable config exists
+    afterwards. Never clobbers an existing config."""
+    if os.path.isfile(path):
+        return True
+    if not sys.stdin.isatty():
+        print(f"config {path} not found and not a tty to create it", file=sys.stderr)
+        return False
+    print(f"No config at {path} — let's create one (transport only).")
+
+    def ask(prompt, default):
+        v = input(f"  {prompt} [{default}]: ").strip()
+        return v or default
+
+    server_host = ask("Destination host (SERVER_HOST)", "")
+    if not server_host:
+        print("SERVER_HOST is required", file=sys.stderr)
+        return False
+    text = _CONFIG_TEMPLATE.format(
+        server_host=server_host,
+        ssh_port=ask("SSH port", "22"),
+        server_user=ask("Transport user (SERVER_USER)", "snappersend"),
+        ssh_key=ask("Transport SSH key path", "/etc/snappersend/ssh/id_ed25519"),
+        recv_base=ask("Receive base on destination (btrfs)", "/srv/snapshots-recv"),
+    )
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"could not write {path}: {e}", file=sys.stderr)
+        return False
+    print(f"  wrote {path}")
+    return True
+
+
+def _setup_dest(config_path: str, admin: Optional[str] = None) -> int:
+    """Bootstrap the transport after total loss: ensure config + transport key,
+    pin the host key, provision the destination over the admin login, then
+    verify end-to-end. The embedded copy of `snappersend setup-dest`."""
+    if os.geteuid() != 0:
+        print("key bootstrap must run as root (writes /etc/snappersend + "
+              "/root/.ssh)", file=sys.stderr)
+        return 2
+    if not _ensure_config(config_path):
+        return 2
+    try:
+        cfg = Config(**load_config(config_path))
+    except Exception as e:
+        print(f"invalid config {config_path}: {e}", file=sys.stderr)
+        return 2
+
+    resolved = _resolve_admin(admin, cfg)
+    if not resolved:
+        return 2
+    admin_user, host, port = resolved
+
+    if not _ensure_transport_key(cfg):
+        return 2
+    try:
+        pub = open(cfg.ssh_key + ".pub", encoding="utf-8").read().strip()
+    except OSError as e:
+        print(f"cannot read public key {cfg.ssh_key}.pub: {e}", file=sys.stderr)
+        return 2
+
+    _pin_host_key(cfg.server_host, cfg.server_ssh_port)
+
+    print(f"Provisioning {cfg.server_user}@{cfg.server_host} (recv {cfg.recv_base}) "
+          f"via admin login {admin_user}@{host} ...")
+    rc, out, err = _run_admin_script(admin_user, host, port,
+                                     _provision_script(cfg.server_user, pub, cfg.recv_base))
+    # Interactive runs return no captured output (terminal inherited so sudo can
+    # prompt); success is the exit code. When captured (non-interactive), also confirm
+    # the sentinel and echo the detail line.
+    if rc != 0 or (out and "PROVISION_OK" not in out):
+        print(f"  provisioning FAILED (rc={rc}): {(err or out).strip() or 'see above'}",
+              file=sys.stderr)
+        return 1
+    if out:
+        print("  " + out.strip().splitlines()[-1])
+
+    ok, msg = _verify_transport(cfg)
+    print(("  verify: OK — " + msg) if ok else ("  verify: FAILED — " + msg))
+    return 0 if ok else 1
+
+
+# ============================================================================
+# RESTORE  (the wizard: preflight -> plan -> partition -> receive -> chroot)
+# ============================================================================
+# On-disk/runtime names deliberately retain the snappersend- prefix: the state
+# file must survive the split (a restore started under `snappersend restore`
+# resumes under snapperrestore), and the manifest path is written by
+# snappersend on the source.
+
+_RESTORE_TOP_MNT = "/mnt/snappersend-btrfs"      # btrfs top level (subvolid=5)
+_RESTORE_TARGET_MNT = "/mnt/snappersend-target"  # assembled tree for the chroot
+_RESTORE_STAGE_DIRNAME = ".snappersend-restore-stage"
+_RESTORE_STATE_FILENAME = ".snappersend-restore-state"
+_RESTORE_DEFAULT_LABEL = "luks-btrfs"
+# The RUNTIME mapper name for the target's LUKS container. Deliberately NOT the
+# crypttab template's name: that name may already be live on the machine running
+# the restore (it is, when rehearsing on the source itself), and colliding with
+# an existing /dev/mapper entry risks formatting the RUNNING system. The
+# crypttab name only matters inside the written crypttab — at first boot the
+# initramfs opens the container under it; during the restore any name works.
+_RESTORE_MAPPER_NAME = "snappersend-restore"
+
+
+class RestoreError(Exception):
+    """Fatal restore-step failure: abort the wizard (state stays resumable)."""
+
+
+def run_interactive(argv: list[str], *, input_text: Optional[str] = None) -> int:
+    """Run a command with the terminal inherited (so cryptsetup can prompt for a
+    passphrase on the tty). With `input_text`, stdin is fed from it instead —
+    the non-tty/scripted path."""
+    log_debug("interactive: " + " ".join(shlex.quote(a) for a in argv))
+    try:
+        if input_text is not None:
+            cp = subprocess.run(argv, input=input_text, text=True,
+                                capture_output=True)
+            if cp.returncode != 0 and (cp.stderr or "").strip():
+                log_error(f"  {argv[0]}: {cp.stderr.strip()}")
+            return cp.returncode
+        return subprocess.run(argv).returncode
+    except FileNotFoundError:
+        return 127
+
+
+def _ask(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        v = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        v = ""
+    return v or (default or "")
+
+
+def _must(argv: list[str], what: Optional[str] = None) -> subprocess.CompletedProcess:
+    """run_local that raises RestoreError (with stderr) on failure — every
+    destructive restore command goes through here so a failure aborts the step
+    cleanly and the run stays resumable."""
+    cp = run_local(argv, check=False)
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or "").strip().splitlines()
+        raise RestoreError(f"{what or argv[0]} failed (rc={cp.returncode})"
+                           + (f": {detail[-1]}" if detail else ""))
+    return cp
+
+
+# --- plan ------------------------------------------------------------------
+
+@dataclass
+class RestorePlan:
+    """Everything derived from the backup + operator flags, computed BEFORE any
+    destructive step. --plan prints this and exits; the confirmation gate shows
+    it too."""
+    host: str
+    root_server_name: str
+    chosen: dict                       # server subvol name -> snapshot label
+    fstab_text: str
+    crypttab_text: str
+    manifest: Optional[RestoreManifest]
+    entries: list                      # every FstabEntry from the template
+    root_entry: FstabEntry
+    esp_entry: FstabEntry
+    boot_entry: Optional[FstabEntry]
+    crypt_name: str
+    crypt_keyspec: str
+    crypt_options: str
+    old_luks_uuid: Optional[str]
+    btrfs_label: str
+    receive: dict                      # btrfs subvol name -> server subvol name
+    create_empty: list                 # btrfs subvol names recreated empty
+    forced_empty: dict                 # subvol -> reason (always-empty rule)
+    unmapped_server: list              # server subvols with no fstab entry
+    nested: list                       # (btrfs subvol, relpath, nocow)
+    swapfile: Optional[str]            # absolute swapfile path from fstab
+    swap_subvol: Optional[str]
+    swap_mountpoint: Optional[str]
+    bootmirror_subvol: Optional[str]   # btrfs subvol holding the /boot mirror
+    unknown_uuids: list                # template UUIDs we cannot rewrite
+    esp_size: str
+    boot_size: str
+    swap_size: str
+
+    @property
+    def epoch(self) -> str:
+        return _epoch_of(self.chosen[self.root_server_name])
+
+    @property
+    def boot_mounts(self) -> list:
+        """Disk-backed non-btrfs mounts (parent first): [/boot,] /boot/efi."""
+        out = ([self.boot_entry] if self.boot_entry else []) + [self.esp_entry]
+        return sorted(out, key=lambda e: len([p for p in e.mountpoint.split("/") if p]))
+
+
+def _epoch_of(label: str) -> str:
+    m = _NAME_RE.match(label)
+    return m.group(1) if m else label
+
+
+def _mount_depth(e: FstabEntry) -> int:
+    return len([p for p in e.mountpoint.split("/") if p])
+
+
+# --- preflight / environment guards ----------------------------------------
+
+def _restore_env_guard() -> None:
+    """Refuse to run destructively outside a live environment (LIVE_ENV=1 is the
+    escape hatch for e.g. a VM restoring onto a spare disk); require UEFI. The
+    per-disk mounted-filesystem guard in _restore_select_disk applies always."""
+    if not os.path.isdir("/sys/firmware/efi"):
+        raise RestoreError("not booted in UEFI mode — cannot install GRUB EFI")
+    if os.path.isdir("/run/live/medium") or os.environ.get("LIVE_ENV"):
+        return
+    log_warn("this does not look like a live environment (no /run/live/medium).")
+    log_warn("restore is designed to run from a live ISO (e.g. grml). If the target")
+    log_warn("is a spare disk and NOT the one this system runs from, set LIVE_ENV=1.")
+    raise RestoreError("refusing to run outside a live environment "
+                       "(LIVE_ENV=1 to override)")
+
+
+def _restore_check_tools(plan: RestorePlan) -> None:
+    tools = ["cryptsetup", "sgdisk", "wipefs", "partprobe", "udevadm", "btrfs",
+             "mkfs.btrfs", "rsync", "chroot", "blkid", "blockdev", "findmnt",
+             "mount", "umount", "chattr"]
+    for e in plan.boot_mounts:
+        tools.append("mkfs.fat" if e.fstype == "vfat" else "mkfs." + e.fstype)
+    missing = sorted({t for t in tools if shutil.which(t) is None})
+    if missing:
+        raise RestoreError("required tools missing: " + " ".join(missing))
+
+
+# --- transport / discovery --------------------------------------------------
+
+def _restore_transport(args: argparse.Namespace) -> Config:
+    """Build the transport Config from config file + flags + prompts, bootstrap
+    the key if it's gone (total-loss case), and verify end-to-end."""
+    kwargs: dict = {}
+    if os.path.isfile(args.config):
+        try:
+            kwargs = load_config(args.config)
+            log_info(f"transport defaults from {args.config}")
+        except Exception as e:
+            log_warn(f"could not read {args.config} ({e}); using flags/prompts")
+            kwargs = {}
+    if getattr(args, "server", None):
+        kwargs["server_host"] = args.server
+    if getattr(args, "port", None):
+        kwargs["server_ssh_port"] = args.port
+    if getattr(args, "user", None):
+        kwargs["server_user"] = args.user
+    if getattr(args, "ssh_key", None):
+        kwargs["ssh_key"] = args.ssh_key
+    if getattr(args, "recv_base", None):
+        kwargs["recv_base"] = args.recv_base
+    if getattr(args, "no_mbuffer", False):
+        kwargs["use_mbuffer"] = False
+    if not kwargs.get("server_host"):
+        host = _ask("Destination server host (SERVER_HOST)")
+        if not host:
+            raise RestoreError("a destination server is required (--server)")
+        kwargs["server_host"] = host
+    cfg = Config(**kwargs)
+
+    if not os.path.isfile(cfg.ssh_key):
+        # Total loss: the transport private key died with the machine. Either the
+        # operator has an offline copy (--ssh-key; keep one in a password manager)
+        # or we bootstrap a fresh key via the embedded setup-dest flow.
+        print(f"transport key {cfg.ssh_key} not found (it died with the machine?).")
+        print("  a) re-run with --ssh-key PATH pointing at your offline copy, or")
+        print("  b) provision a fresh key over your admin login (setup-dest flow).")
+        ans = _ask("Provision a fresh transport key now via setup-dest? (yes/no)",
+                   "yes")
+        if ans.lower() not in ("y", "yes"):
+            raise RestoreError("no transport key — pass --ssh-key or run "
+                               "`snappersend setup-dest admin@host` first")
+        if _setup_dest(args.config) != 0:
+            raise RestoreError("setup-dest bootstrap failed")
+        kwargs = load_config(args.config)
+        if getattr(args, "recv_base", None):
+            kwargs["recv_base"] = args.recv_base
+        if getattr(args, "no_mbuffer", False):
+            kwargs["use_mbuffer"] = False
+        cfg = Config(**kwargs)
+
+    ok, msg = _verify_transport(cfg)
+    if not ok:
+        # A fresh live environment has no pinned host key in /root/.ssh — pin it
+        # (as setup-dest would) and retry once before giving up.
+        _pin_host_key(cfg.server_host, cfg.server_ssh_port)
+        ok, msg = _verify_transport(cfg)
+    if not ok:
+        raise RestoreError(f"destination transport failed: {msg}")
+    log_ok(f"connected: {msg}")
+    return cfg
+
+
+def _remote_ls(cfg: Config, path: str) -> list[str]:
+    """`sudo ls -1` on the destination; [] for a missing dir; RemoteUnreachable
+    on a transport failure (a blip must abort cleanly, never look like 'empty')."""
+    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(path)}", check=False)
+    if cp.returncode != 0:
+        if _is_ssh_transport_failure(cp):
+            raise RemoteUnreachable((cp.stderr or "").strip().splitlines()[-1]
+                                    if (cp.stderr or "").strip()
+                                    else f"ssh exited {cp.returncode}")
+        return []
+    return [n for n in cp.stdout.split() if n]
+
+
+def _remote_cat(cfg: Config, path: str) -> Optional[str]:
+    """Read a small file from the destination (plain cat — received snapshots
+    preserve the source's world-readable perms on fstab/crypttab/manifest).
+    None when absent; RemoteUnreachable on transport failure."""
+    cp = run_remote(cfg, f"cat {shlex.quote(path)}", check=False)
+    if cp.returncode != 0:
+        if _is_ssh_transport_failure(cp):
+            raise RemoteUnreachable((cp.stderr or "").strip().splitlines()[-1]
+                                    if (cp.stderr or "").strip()
+                                    else f"ssh exited {cp.returncode}")
+        return None
+    return cp.stdout
+
+
+def _restore_discover(cfg: Config, args: argparse.Namespace):
+    """List hostnames under RECV_BASE, pick one, and list each server-held
+    subvol's snapshots. Returns (host, {server_subvol: [labels newest-last]},
+    root_server_name)."""
+    hosts = _remote_ls(cfg, cfg.recv_base)
+    if not hosts:
+        raise RestoreError(f"nothing under {cfg.recv_base} on {cfg.server_host}")
+    host = getattr(args, "source_host", None)
+    if host and host not in hosts:
+        raise RestoreError(f"host {host!r} not on the server (has: {', '.join(hosts)})")
+    if not host:
+        if len(hosts) == 1:
+            host = hosts[0]
+        else:
+            print("Hosts with backups on the server:")
+            for i, h in enumerate(hosts, 1):
+                print(f"  {i}) {h}")
+            sel = _ask("Restore which host", "1")
+            host = hosts[int(sel) - 1] if sel.isdigit() and \
+                1 <= int(sel) <= len(hosts) else sel
+            if host not in hosts:
+                raise RestoreError(f"unknown host {host!r}")
+    log_info(f"restoring host {host!r} from {cfg.server_host}")
+
+    subvols: dict = {}
+    for sv in _remote_ls(cfg, os.path.join(cfg.recv_base, host)):
+        labels = sorted(l for l in _remote_ls(cfg, os.path.join(cfg.recv_base,
+                                                                host, sv))
+                        if not l.endswith(".latest") and _NAME_RE.match(l))
+        if labels:
+            subvols[sv] = labels
+    if not subvols:
+        raise RestoreError(f"no restorable snapshots for {host} on the server")
+    root_name = "root"
+    if root_name not in subvols:
+        print(f"Server subvols for {host}: {', '.join(sorted(subvols))}")
+        root_name = _ask("Which one is the OS root (holds etc/fstab)?")
+        if root_name not in subvols:
+            raise RestoreError(f"{root_name!r} is not a server subvol")
+    return host, subvols, root_name
+
+
+def _restore_choose_snapshots(subvols: dict, root_name: str,
+                              args: argparse.Namespace,
+                              interactive: bool) -> dict:
+    """Pick one snapshot label per server subvol. Default: the newest set
+    matched on the root snapshot's epoch (root/home/bootmirror are epoch-matched
+    by design); --snapshot EPOCH-or-PREFIX selects an older set. Warn when the
+    chosen set spans epochs."""
+    chosen: dict = {}
+    want = getattr(args, "snapshot", None)
+    if want and want != "latest":
+        for sv, labels in subvols.items():
+            match = [l for l in labels if l.startswith(want)]
+            chosen[sv] = match[-1] if match else labels[-1]
+            if not match:
+                log_warn(f"[{sv}] no snapshot matching {want!r}; using latest "
+                         f"{labels[-1]}")
+    else:
+        root_epoch = _epoch_of(subvols[root_name][-1])
+        for sv, labels in subvols.items():
+            match = [l for l in labels if _epoch_of(l) == root_epoch]
+            chosen[sv] = match[-1] if match else labels[-1]
+
+    print("\nSnapshot set to restore:")
+    for sv in sorted(chosen):
+        print(f"  {sv:<12} {chosen[sv]}   ({len(subvols[sv])} available)")
+    if len({_epoch_of(l) for l in chosen.values()}) > 1:
+        log_warn("chosen snapshots SPAN EPOCHS — root/home/bootmirror are "
+                 "epoch-matched by design; a mixed set may skew state")
+
+    if interactive and not want:
+        ans = _ask("Use this snapshot set? (yes = accept, no = choose per-subvol)",
+                   "yes")
+        if ans.lower() not in ("y", "yes"):
+            for sv, labels in sorted(subvols.items()):
+                print(f"\nAvailable snapshots for {sv}:")
+                for i, l in enumerate(labels, 1):
+                    print(f"  {i:2d}) {l}")
+                sel = _ask(f"Choose for {sv} (number)",
+                           str(labels.index(chosen[sv]) + 1))
+                if sel.isdigit() and 1 <= int(sel) <= len(labels):
+                    chosen[sv] = labels[int(sel) - 1]
+            if len({_epoch_of(l) for l in chosen.values()}) > 1:
+                log_warn("chosen snapshots span epochs — proceed with care")
+    return chosen
+
+
+# --- plan construction -------------------------------------------------------
+
+def _restore_build_plan(args: argparse.Namespace, host: str, chosen: dict,
+                        root_name: str, fstab_text: str, crypttab_text: str,
+                        manifest_text: Optional[str]) -> RestorePlan:
+    """Derive the full plan from the fetched templates. Pure computation — no
+    disk or network IO — so it is directly testable and --plan stays read-only."""
+    entries = parse_fstab_template(fstab_text)
+    btrfs_entries = [e for e in entries if e.fstype == "btrfs" and e.subvol]
+    root_entry = next((e for e in btrfs_entries if e.mountpoint == "/"), None)
+    if root_entry is None:
+        raise RestoreError("fstab template has no btrfs '/' entry — cannot restore")
+
+    ct = parse_crypttab_template(crypttab_text or "")
+    if ct is None:
+        raise RestoreError("crypttab template is empty/unreadable — refusing to "
+                           "build an unbootable system")
+    crypt_name, old_luks_uuid, crypt_keyspec, crypt_options, _raw = ct
+
+    manifest = parse_restore_manifest(manifest_text) if manifest_text else None
+    if manifest is None:
+        log_warn("no restore-manifest in the root snapshot (backup predates the "
+                 "feature?) — nested subvolumes will NOT be recreated")
+
+    # Map server subvol names -> fstab subvols: manifest name->mountpoint map
+    # first, then the @name/@ naming convention as fallback.
+    by_mount = {e.mountpoint: e for e in btrfs_entries}
+    by_subvol = {e.subvol: e for e in btrfs_entries}
+    receive: dict = {}
+    unmapped: list = []
+    for sname in chosen:
+        mnt = (manifest.subvol_map.get(sname) if manifest else None) or \
+            ("/" if sname == root_name else None)
+        e = by_mount.get(mnt) if mnt else None
+        if e is None:
+            e = by_subvol.get("@" if sname == root_name else "@" + sname)
+        if e is None:
+            unmapped.append(sname)
+            receive["@" + sname] = sname
+            log_warn(f"server subvol {sname!r} has no fstab entry — will be "
+                     f"received as @{sname} but not mounted")
+        else:
+            receive[e.subvol] = sname
+
+    # Swapfile: the fstab swap line whose device is a path names the swapfile;
+    # its containing btrfs mountpoint names the swap-container subvol.
+    swapfile = next((e.device for e in entries
+                     if e.fstype == "swap" and e.device.startswith("/")), None)
+    swap_subvol = swap_mountpoint = None
+    if swapfile:
+        cands = [e for e in btrfs_entries
+                 if swapfile.startswith(e.mountpoint.rstrip("/") + "/")]
+        if cands:
+            best = max(cands, key=lambda e: len(e.mountpoint))
+            swap_subvol, swap_mountpoint = best.subvol, best.mountpoint
+
+    # The explicit always-recreate-empty rules (see the section header).
+    forced_empty: dict = {}
+    for e in btrfs_entries:
+        if os.path.basename(e.mountpoint) == ".snapshots":
+            forced_empty[e.subvol] = ("snapper store — old snapshot history is "
+                                      "parented to the dead filesystem's UUID")
+        elif e.subvol == swap_subvol:
+            forced_empty[e.subvol] = "swap container — the swapfile is recreated"
+    for sv, reason in forced_empty.items():
+        if sv in receive:
+            log_warn(f"{sv} is held on the server but is ALWAYS recreated empty "
+                     f"({reason})")
+            del receive[sv]
+    create_empty = [e.subvol for e in btrfs_entries if e.subvol not in receive]
+
+    # Nested subvolumes from the manifest, remapped onto fstab subvol names.
+    nested: list = []
+    if manifest:
+        for cname, rel, nocow in manifest.nested:
+            mnt = manifest.subvol_map.get(cname)
+            e = by_mount.get(mnt) if mnt else None
+            sv = e.subvol if e else ("@" if cname == root_name else "@" + cname)
+            nested.append((sv, rel, nocow))
+
+    # Boot tier: disk-backed non-btrfs mounts. Exactly one vfat ESP is required
+    # (UEFI); at most one further boot filesystem is supported.
+    disk_backed = [e for e in entries
+                   if e.fstype in ("vfat", "ext4", "ext3", "ext2", "xfs")
+                   and (e.device.startswith(("UUID=", "LABEL=", "PARTUUID=",
+                                             "/dev/")))]
+    esps = [e for e in disk_backed if e.fstype == "vfat"]
+    if len(esps) != 1:
+        raise RestoreError(f"fstab template has {len(esps)} vfat entries — "
+                           "exactly one ESP is required for a UEFI restore")
+    esp_entry = esps[0]
+    boots = [e for e in disk_backed if e is not esp_entry]
+    if len(boots) > 1:
+        raise RestoreError("fstab template has more than one non-ESP boot "
+                           "filesystem — this layout is not supported; restore "
+                           "by hand from the server tree")
+    boot_entry = boots[0] if boots else None
+
+    bootmirror_subvol = next((sv for sv, sn in receive.items()
+                              if sn == "bootmirror"), None)
+    if disk_backed and bootmirror_subvol is None:
+        log_warn("no 'bootmirror' subvol on the server — /boot and the ESP "
+                 "cannot be populated from the backup; the restored system "
+                 "will NOT boot without a manual kernel/bootloader install")
+
+    label = (manifest.btrfs_label if manifest and manifest.btrfs_label else
+             (root_entry.device[6:] if root_entry.device.startswith("LABEL=")
+              else _RESTORE_DEFAULT_LABEL))
+
+    known_old = {root_entry.uuid, esp_entry.uuid,
+                 boot_entry.uuid if boot_entry else None, old_luks_uuid}
+    unknown = sorted({e.uuid for e in entries if e.uuid} - known_old)
+
+    return RestorePlan(
+        host=host, root_server_name=root_name, chosen=chosen,
+        fstab_text=fstab_text, crypttab_text=crypttab_text, manifest=manifest,
+        entries=entries, root_entry=root_entry, esp_entry=esp_entry,
+        boot_entry=boot_entry, crypt_name=crypt_name,
+        crypt_keyspec=crypt_keyspec, crypt_options=crypt_options,
+        old_luks_uuid=old_luks_uuid, btrfs_label=label, receive=receive,
+        create_empty=create_empty, forced_empty=forced_empty,
+        unmapped_server=unmapped, nested=nested, swapfile=swapfile,
+        swap_subvol=swap_subvol, swap_mountpoint=swap_mountpoint,
+        bootmirror_subvol=bootmirror_subvol, unknown_uuids=unknown,
+        esp_size=args.esp_size, boot_size=args.boot_size,
+        swap_size=args.swap_size)
+
+
+def _restore_print_plan(cfg: Config, plan: RestorePlan) -> None:
+    print(f"\n=== restore plan — {plan.host} from "
+          f"{cfg.server_user}@{cfg.server_host} ===")
+    print(f"Snapshot epoch: {plan.epoch}")
+    for sv in sorted(plan.chosen):
+        print(f"  {sv:<12} {plan.chosen[sv]}")
+    tpm = "TPM unlock configured" if "tpm2" in plan.crypt_options else "no TPM options"
+    print(f"LUKS:  name {plan.crypt_name!r}, key {plan.crypt_keyspec!r}, "
+          f"options {plan.crypt_options!r} ({tpm})")
+    print(f"Btrfs: label {plan.btrfs_label!r}")
+    parts = [f"1: EFI {plan.esp_size} ({plan.esp_entry.fstype} "
+             f"{plan.esp_entry.mountpoint})"]
+    if plan.boot_entry:
+        parts.append(f"2: boot {plan.boot_size} ({plan.boot_entry.fstype} "
+                     f"{plan.boot_entry.mountpoint})")
+    parts.append(f"{len(parts) + 1}: LUKS2 (rest of disk)")
+    print("Partitions: " + "; ".join(parts))
+    print("Subvolumes:")
+    for sv, sname in sorted(plan.receive.items()):
+        print(f"  {sv:<22} <- receive {sname}/{plan.chosen[sname]}")
+    for sv in sorted(plan.create_empty):
+        reason = plan.forced_empty.get(sv, "not held on the server")
+        print(f"  {sv:<22} <- recreate EMPTY ({reason})")
+    if plan.nested:
+        print("Nested subvolumes (recreated empty by design — contents are not "
+              "in the backup):")
+        for sv, rel, nocow in sorted(plan.nested):
+            print(f"  {sv}/{rel}" + ("   [No-COW]" if nocow else ""))
+    else:
+        print("Nested subvolumes: none recorded"
+              + ("" if plan.manifest else " (NO MANIFEST — see warning above)"))
+    nocow_map = plan.manifest.toplevel_nocow if plan.manifest else {}
+    nocow_list = sorted(sv for sv in plan.create_empty if nocow_map.get(sv))
+    if nocow_list:
+        print("No-COW (+ no compression) on: " + ", ".join(nocow_list))
+    if plan.swapfile:
+        print(f"Swapfile: {plan.swapfile} ({plan.swap_size}, in "
+              f"{plan.swap_subvol or 'UNKNOWN subvol'})")
+    for e in plan.boot_mounts:
+        src = (f"{plan.bootmirror_subvol}{e.mountpoint}" if plan.bootmirror_subvol
+               else "NO BOOTMIRROR ON SERVER")
+        print(f"Boot tier: {e.mountpoint} ({e.fstype}) <- rsync from {src}")
+    print("UUID rewrites: btrfs, ESP" + (", boot" if plan.boot_entry else "")
+          + ", LUKS — all rewritten from the new target's blkid")
+    if plan.unknown_uuids:
+        print("WARNING: fstab references UUIDs this restore does not recreate "
+              "(left as-is — check them before first boot):")
+        for u in plan.unknown_uuids:
+            print(f"  {u}")
+    print()
+
+
+# --- disk selection / resume detection ---------------------------------------
+
+def _restore_select_disk(args: argparse.Namespace) -> str:
+    print()
+    cp = run_local(["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,MOUNTPOINTS"],
+                   check=False)
+    print(cp.stdout)
+    disk = getattr(args, "disk", None) or \
+        _ask("TARGET disk to WIPE and restore onto (e.g. /dev/nvme0n1)")
+    if not disk:
+        raise RestoreError("no target disk given")
+    probe = run_local(["lsblk", "-rno", "TYPE", disk], check=False)
+    if probe.returncode != 0 or "disk" not in probe.stdout.split():
+        raise RestoreError(f"{disk} is not a whole-disk block device")
+    # HARD guard (no escape hatch): never touch a disk that backs anything
+    # currently mounted — that is the running system's disk, live env or not.
+    mounts = run_local(["lsblk", "-rno", "MOUNTPOINTS", disk], check=False)
+    mounted = sorted({m for m in mounts.stdout.split() if m})
+    if mounted:
+        raise RestoreError(f"{disk} backs mounted filesystems "
+                           f"({', '.join(mounted[:4])}) — refusing to touch it")
+    return disk
+
+
+def _resolve_partition(disk: str, partlabel: str) -> Optional[str]:
+    """Resolve a partition on `disk` by PARTLABEL, waiting for udev."""
+    for _ in range(5):
+        cp = run_local(["blkid", "-o", "device", "-t", f"PARTLABEL={partlabel}"],
+                       check=False)
+        for dev in cp.stdout.split():
+            if re.fullmatch(re.escape(disk) + r"p?\d+", dev):
+                return dev
+        time.sleep(1)
+        run_local(["udevadm", "settle"], check=False)
+    return None
+
+
+def _restore_detect_resume(disk: str) -> bool:
+    """A prior attempt leaves our PARTLABELs + a LUKS signature. Offer to resume
+    (skip completed steps) instead of blindly re-wiping."""
+    crypt_dev = _resolve_partition(disk, "cryptroot")
+    if not crypt_dev:
+        return False
+    cp = run_local(["blkid", "-o", "value", "-s", "TYPE", crypt_dev], check=False)
+    if "crypto_LUKS" not in cp.stdout:
+        return False
+    log_warn(f"{disk} already carries a snapperrestore layout "
+             "(a prior attempt?).")
+    ans = _ask("Resume the previous restore (yes) or wipe and start over (no)",
+               "yes")
+    return ans.lower() in ("y", "yes")
+
+
+def _restore_confirm(disk: str, resume: bool) -> None:
+    print()
+    if resume:
+        log_warn(f"RESUMING onto {disk}: completed steps are skipped; the rest "
+                 "will write to it.")
+    else:
+        log_warn(f"TARGET DISK: {disk} — ALL DATA ON IT WILL BE DESTROYED.")
+    typed = _ask(f"Type the device path ({disk}) to confirm")
+    if typed != disk:
+        raise RestoreError("confirmation mismatch — aborted, nothing touched")
+
+
+# --- state file (resumability) -----------------------------------------------
+
+def _state_path() -> str:
+    return os.path.join(_RESTORE_TOP_MNT, _RESTORE_STATE_FILENAME)
+
+
+def _state_read() -> set:
+    try:
+        with open(_state_path(), encoding="utf-8") as f:
+            return {ln.split()[0] for ln in f if ln.strip()}
+    except OSError:
+        return set()
+
+
+def _state_mark(step: str) -> None:
+    try:
+        with open(_state_path(), "a", encoding="utf-8") as f:
+            f.write(f"{step} done {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except OSError as e:
+        log_warn(f"could not record restore state ({e}) — resume will rely on "
+                 "idempotency probes only")
+
+
+# --- execution steps ----------------------------------------------------------
+
+def _restore_partition(plan: RestorePlan, disk: str) -> None:
+    run_local(["blockdev", "--flushbufs", disk], check=False)
+    _must(["wipefs", "-a", disk], "wipefs")
+    _must(["sgdisk", "-Z", disk], "sgdisk -Z")
+    _must(["sgdisk", "-o", disk], "sgdisk -o")
+    n = 1
+    _must(["sgdisk", "-n", f"{n}:1MiB:+{plan.esp_size}", "-t", f"{n}:ef00",
+           "-c", f"{n}:EFI", disk], "sgdisk (ESP)")
+    if plan.boot_entry:
+        n += 1
+        _must(["sgdisk", "-n", f"{n}:0:+{plan.boot_size}", "-t", f"{n}:8300",
+               "-c", f"{n}:boot", disk], "sgdisk (boot)")
+    n += 1
+    _must(["sgdisk", "-n", f"{n}:0:0", "-t", f"{n}:8309",
+           "-c", f"{n}:cryptroot", disk], "sgdisk (cryptroot)")
+    _must(["partprobe", disk], "partprobe")
+    run_local(["udevadm", "settle"], check=False)
+    log_ok("partitions created")
+
+
+def _cryptsetup_prompting(argv: list[str]) -> int:
+    """cryptsetup with a passphrase: on a tty, inherit the terminal so it prompts
+    (and verifies) itself; piped/scripted, read one passphrase line from our
+    stdin and feed it."""
+    if sys.stdin.isatty():
+        return run_interactive(argv)
+    pw = _ask("LUKS passphrase")
+    if not pw:
+        return 1
+    return run_interactive([argv[0], "-q"] + argv[1:], input_text=pw + "\n")
+
+
+def _restore_luks(plan: RestorePlan, crypt_dev: str, resume: bool) -> str:
+    mapper = f"/dev/mapper/{_RESTORE_MAPPER_NAME}"
+    cp = run_local(["blkid", "-o", "value", "-s", "TYPE", crypt_dev], check=False)
+    if resume and "crypto_LUKS" in cp.stdout:
+        log_info("LUKS container already formatted — skipping luksFormat")
+    else:
+        log_step(f"cryptsetup luksFormat {crypt_dev} — set the machine's LUKS "
+                 "passphrase")
+        if _cryptsetup_prompting(["cryptsetup", "luksFormat", "--type", "luks2",
+                                  crypt_dev]) != 0:
+            raise RestoreError("cryptsetup luksFormat failed")
+    if os.path.exists(mapper):
+        # Reuse only if it is OUR container on the right partition (a prior
+        # resumable attempt); anything else gets closed and reopened.
+        st = run_local(["cryptsetup", "status", _RESTORE_MAPPER_NAME],
+                       check=False)
+        if crypt_dev not in st.stdout:
+            log_warn(f"{mapper} is open on a different device — closing it")
+            _must(["cryptsetup", "close", _RESTORE_MAPPER_NAME],
+                  "cryptsetup close (stale mapping)")
+    if not os.path.exists(mapper):
+        log_info(f"opening LUKS container as {_RESTORE_MAPPER_NAME} "
+                 f"(boots as {plan.crypt_name!r} per crypttab)")
+        if _cryptsetup_prompting(["cryptsetup", "open", crypt_dev,
+                                  _RESTORE_MAPPER_NAME]) != 0:
+            raise RestoreError("cryptsetup open failed")
+    return mapper
+
+
+def _restore_mkfs(plan: RestorePlan, esp_dev: str, boot_dev: Optional[str],
+                  mapper: str, resume: bool) -> None:
+    cp = run_local(["blkid", "-o", "value", "-s", "TYPE", mapper], check=False)
+    if resume and "btrfs" in cp.stdout:
+        log_info("target filesystems already formatted — skipping mkfs")
+        return
+    log_step("formatting ESP" + (", /boot" if boot_dev else "")
+             + f" and btrfs (label {plan.btrfs_label!r})")
+    _must(["mkfs.fat", "-F32", esp_dev], "mkfs.fat")
+    if boot_dev and plan.boot_entry:
+        fstype = plan.boot_entry.fstype
+        force = "-f" if fstype == "xfs" else "-F"
+        _must([f"mkfs.{fstype}", force, boot_dev], f"mkfs.{fstype}")
+    _must(["mkfs.btrfs", "-f", "-L", plan.btrfs_label, mapper], "mkfs.btrfs")
+    log_ok("filesystems created")
+
+
+def _blkid_uuid(dev: str) -> str:
+    return run_local(["blkid", "-s", "UUID", "-o", "value", dev],
+                     check=False).stdout.strip()
+
+
+def _collect_uuids(crypt_dev: str, esp_dev: str, boot_dev: Optional[str],
+                   mapper: str) -> dict:
+    u = {"luks": _blkid_uuid(crypt_dev), "btrfs": _blkid_uuid(mapper),
+         "esp": _blkid_uuid(esp_dev)}
+    if boot_dev:
+        u["boot"] = _blkid_uuid(boot_dev)
+    for k, v in u.items():
+        if not v:
+            raise RestoreError(f"could not read the new {k} UUID from blkid")
+    log_info("new UUIDs: " + "  ".join(f"{k}={v}" for k, v in u.items()))
+    return u
+
+
+def _is_mounted(path: str) -> bool:
+    return run_local(["findmnt", "-n", path], check=False).returncode == 0
+
+
+def _mount_top(mapper: str) -> None:
+    os.makedirs(_RESTORE_TOP_MNT, exist_ok=True)
+    if not _is_mounted(_RESTORE_TOP_MNT):
+        _must(["mount", "-o", "subvolid=5", mapper, _RESTORE_TOP_MNT],
+              "mount btrfs top level")
+
+
+def _subvol_exists(path: str) -> bool:
+    return run_local(["btrfs", "subvolume", "show", path],
+                     check=False).returncode == 0
+
+
+def _restore_create_empty(plan: RestorePlan) -> None:
+    log_step("creating empty subvolumes")
+    for sv in plan.create_empty:
+        path = os.path.join(_RESTORE_TOP_MNT, sv)
+        if _subvol_exists(path):
+            log_info(f"  {sv} already exists — skipping")
+            continue
+        _must(["btrfs", "subvolume", "create", path], f"create {sv}")
+        reason = plan.forced_empty.get(sv, "not held on the server")
+        log_ok(f"  created {sv} empty ({reason})")
+
+
+def _restore_receive(cfg: Config, plan: RestorePlan, state: set) -> None:
+    """Stream each server-held subvol and promote it: receive the RO subvol into
+    a staging dir on the NEW filesystem, `btrfs subvolume snapshot` it into its
+    final writable @name position, delete the RO original (the standard
+    receive->promote pattern; never rsync, never flip the RO flag)."""
+    stage_base = os.path.join(_RESTORE_TOP_MNT, _RESTORE_STAGE_DIRNAME)
+    for sv, sname in plan.receive.items():
+        step = f"receive:{sv}"
+        final = os.path.join(_RESTORE_TOP_MNT, sv)
+        if step in state and _subvol_exists(final):
+            log_info(f"[resume] {sv} already received — skipping")
+            continue
+        label = plan.chosen[sname]
+        src = os.path.join(cfg.recv_base, plan.host, sname, label, "snapshot")
+        log_step(f"receiving {sname}/{label} -> {sv}")
+        stage = os.path.join(stage_base, sname)
+        staged = os.path.join(stage, "snapshot")
+        if os.path.isdir(staged):          # partial from a prior attempt
+            run_local(["btrfs", "subvolume", "delete", staged], check=False)
+        os.makedirs(stage, exist_ok=True)
+        ok = _run_pipe(ssh_argv(cfg, f"sudo btrfs send {shlex.quote(src)}"),
+                       ["btrfs", "receive", stage], cfg.use_mbuffer)
+        received = show_local(staged)
+        if not ok or received is None or not received.is_valid_received:
+            run_local(["btrfs", "subvolume", "delete", staged], check=False)
+            raise RestoreError(f"receive of {sname}/{label} failed or was "
+                               "garbled — re-run `snapperrestore` to resume")
+        if _subvol_exists(final):          # leftover placeholder/partial promote
+            run_local(["btrfs", "subvolume", "delete", final], check=False)
+        _must(["btrfs", "subvolume", "snapshot", staged, final],
+              f"promote {sv}")
+        run_local(["btrfs", "subvolume", "delete", staged], check=False)
+        with contextlib.suppress(OSError):
+            os.rmdir(stage)
+        _state_mark(step)
+        state.add(step)
+        log_ok(f"  {sv} restored from {sname}/{label}")
+    with contextlib.suppress(OSError):
+        os.rmdir(stage_base)
+
+
+def _restore_nested(plan: RestorePlan, state: set) -> None:
+    """Recreate nested subvolumes from the manifest at their recorded paths.
+    btrfs send emitted each as an EMPTY DIRECTORY in the received tree — its
+    mode/ownership is captured and re-applied to the new subvolume. Explicitly
+    NOT data loss: their contents were never in the backup, by design."""
+    if "nested" in state:
+        log_info("[resume] nested subvolumes already handled — skipping")
+        return
+    log_step("recreating nested subvolumes (empty, by design)")
+    for sv, rel, nocow in plan.nested:
+        base = os.path.join(_RESTORE_TOP_MNT, sv)
+        if not os.path.isdir(base):
+            log_warn(f"  {sv} missing — cannot recreate {sv}/{rel}")
+            continue
+        path = os.path.join(base, rel)
+        if _subvol_exists(path):
+            log_info(f"  {sv}/{rel} already a subvolume — skipping")
+            continue
+        mode = uid = gid = None
+        if os.path.isdir(path):
+            st = os.stat(path)
+            mode, uid, gid = st.st_mode & 0o7777, st.st_uid, st.st_gid
+            try:
+                os.rmdir(path)
+            except OSError as e:
+                log_warn(f"  cannot replace {path} with a subvolume ({e}) — "
+                         "skipping")
+                continue
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        _must(["btrfs", "subvolume", "create", path], f"create {sv}/{rel}")
+        if mode is not None:
+            os.chmod(path, mode)
+            os.chown(path, uid, gid)
+        if nocow:
+            run_local(["chattr", "+C", path], check=False)
+            run_local(["btrfs", "property", "set", path, "compression", ""],
+                      check=False)
+        log_ok(f"  {sv}/{rel} recreated empty (by design — contents are not in "
+               "the backup)" + ("  [No-COW]" if nocow else ""))
+
+    # Scrub stale parent-tree remnants inside the restored root: the send stream
+    # turned each old clone into a plain `<label>/snapshot` DIRECTORY, and a
+    # plain dir at that path would make the next forward run's
+    # `btrfs subvolume snapshot -r` land INSIDE it instead of AT it — silently
+    # corrupting the new parent tree. The clones themselves are useless anyway
+    # (parented to the dead filesystem); the forward run reseeds from scratch.
+    ptb = (plan.manifest.parent_tree_base if plan.manifest
+           else "/.snappersend").lstrip("/")
+    remnant = os.path.join(_RESTORE_TOP_MNT, plan.root_entry.subvol, ptb)
+    if os.path.isdir(remnant):
+        shutil.rmtree(remnant, ignore_errors=True)
+        log_info(f"  scrubbed stale parent-tree remnants at /{ptb} (the next "
+                 "forward run reseeds a new lineage)")
+    _state_mark("nested")
+    state.add("nested")
+
+
+def _restore_nocow_swap(plan: RestorePlan, state: set) -> None:
+    """chattr +C (+ compression off) per the manifest's top-level record, then
+    recreate the swapfile."""
+    log_step("applying No-COW and creating the swapfile")
+    nocow_map = plan.manifest.toplevel_nocow if plan.manifest else {}
+    if plan.manifest is None and plan.swap_subvol:
+        # No manifest: the swapfile still REQUIRES No-COW; other conventions are
+        # unknown — warned, not guessed.
+        nocow_map = {plan.swap_subvol: True}
+        log_warn("no manifest — applying No-COW to the swap container only; "
+                 "re-check container/docker subvols by hand")
+    for sv in plan.create_empty:
+        if not nocow_map.get(sv):
+            continue
+        path = os.path.join(_RESTORE_TOP_MNT, sv)
+        if not os.path.isdir(path):
+            continue
+        _must(["chattr", "+C", path], f"chattr +C {sv}")
+        run_local(["btrfs", "property", "set", path, "compression", ""],
+                  check=False)
+        log_ok(f"  {sv}: No-COW + no compression")
+
+    if not (plan.swapfile and plan.swap_subvol and plan.swap_mountpoint):
+        if plan.swapfile:
+            log_warn(f"swapfile {plan.swapfile} is not inside a template btrfs "
+                     "mount — skipping (create it by hand)")
+        _state_mark("swapfile")
+        state.add("swapfile")
+        return
+    rel = os.path.relpath(plan.swapfile, plan.swap_mountpoint)
+    target = os.path.join(_RESTORE_TOP_MNT, plan.swap_subvol, rel)
+    if "swapfile" in state and os.path.isfile(target):
+        log_info("[resume] swapfile already created — skipping")
+        return
+    if not os.path.isfile(target):
+        cp = run_local(["btrfs", "filesystem", "mkswapfile", "--size",
+                        plan.swap_size, "--uuid", "clear", target], check=False)
+        if cp.returncode != 0:
+            # Older btrfs-progs without mkswapfile: the manual sequence.
+            log_info("  btrfs mkswapfile unavailable — falling back to "
+                     "truncate/chattr/fallocate/mkswap")
+            _must(["truncate", "-s", "0", target], "truncate swapfile")
+            _must(["chattr", "+C", target], "chattr +C swapfile")
+            _must(["fallocate", "-l", plan.swap_size.upper(), target],
+                  "fallocate swapfile")
+            os.chmod(target, 0o600)
+            _must(["mkswap", target], "mkswap")
+    log_ok(f"  swapfile {plan.swapfile} created ({plan.swap_size})")
+    _state_mark("swapfile")
+    state.add("swapfile")
+
+
+def _restore_mount_target(plan: RestorePlan, mapper: str, devs: dict) -> None:
+    """Assemble the restored tree at the target mount using the TEMPLATE's own
+    mount options (they carry subvol= and the per-subvol compress/noatime)."""
+    log_step(f"mounting the restored tree at {_RESTORE_TARGET_MNT}")
+    os.makedirs(_RESTORE_TARGET_MNT, exist_ok=True)
+    if not _is_mounted(_RESTORE_TARGET_MNT):
+        _must(["mount", "-o", plan.root_entry.options, mapper,
+               _RESTORE_TARGET_MNT], "mount /")
+    btrfs_rest = [e for e in plan.entries
+                  if e.fstype == "btrfs" and e.subvol
+                  and e is not plan.root_entry]
+    for e in sorted(btrfs_rest + plan.boot_mounts, key=_mount_depth):
+        mp = _RESTORE_TARGET_MNT + e.mountpoint
+        os.makedirs(mp, exist_ok=True)
+        if _is_mounted(mp):
+            continue
+        if e.fstype == "btrfs":
+            _must(["mount", "-o", e.options, mapper, mp],
+                  f"mount {e.mountpoint}")
+        else:
+            _must(["mount", devs[e.mountpoint], mp], f"mount {e.mountpoint}")
+    log_ok("restored tree mounted")
+
+
+def _restore_boot_sync(plan: RestorePlan, state: set) -> None:
+    """Populate the fresh /boot + ESP from the received @bootmirror (which
+    mirrors the live absolute paths: <mirror>/boot, <mirror>/boot/efi). vfat
+    targets get the same 2-second mtime window the send side uses."""
+    if not plan.boot_mounts:
+        return
+    if "boot" in state:
+        log_info("[resume] boot tier already synced — skipping")
+        return
+    if not plan.bootmirror_subvol:
+        raise RestoreError("no bootmirror subvol was received — cannot populate "
+                           "/boot and the ESP (the restored system would not "
+                           "boot); restore them by hand, then resume")
+    log_step("populating the boot tier from @bootmirror")
+    mirror_root = os.path.join(_RESTORE_TOP_MNT, plan.bootmirror_subvol)
+    boot_paths = tuple(e.mountpoint for e in plan.boot_mounts)
+    for e in plan.boot_mounts:                       # parent first (/boot, then ESP)
+        src = os.path.join(mirror_root, e.mountpoint.strip("/"))
+        dst = _RESTORE_TARGET_MNT + e.mountpoint
+        if not os.path.isdir(src):
+            raise RestoreError(f"boot mirror is missing {src} — was "
+                               "--bootmirror-sync running on the source?")
+        window = ["--modify-window=1"] if e.fstype in ("vfat", "msdos") else []
+        argv = ["rsync", "-aAX", "--delete", *window,
+                *_nested_boot_excludes(e.mountpoint, boot_paths),
+                src.rstrip("/") + "/", dst.rstrip("/") + "/"]
+        cp = run_local(argv, check=False)
+        if cp.returncode not in (0, 24):
+            raise RestoreError(f"rsync of {e.mountpoint} failed "
+                               f"(rc={cp.returncode}): "
+                               f"{(cp.stderr or '').strip()}")
+        log_ok(f"  {e.mountpoint} populated from the mirror")
+    _state_mark("boot")
+    state.add("boot")
+
+
+def _restore_write_tables(plan: RestorePlan, uuids: dict) -> None:
+    """Write fstab + crypttab into the target: the templates verbatim with every
+    UUID rewritten from the live blkid of the new target (constraint 1)."""
+    log_step("writing fstab + crypttab (templates, UUIDs rewritten)")
+    uuid_map = {}
+    if plan.root_entry.uuid:
+        uuid_map[plan.root_entry.uuid] = uuids["btrfs"]
+    if plan.esp_entry.uuid:
+        uuid_map[plan.esp_entry.uuid] = uuids["esp"]
+    if plan.boot_entry and plan.boot_entry.uuid and "boot" in uuids:
+        uuid_map[plan.boot_entry.uuid] = uuids["boot"]
+    if plan.old_luks_uuid:
+        uuid_map[plan.old_luks_uuid] = uuids["luks"]
+    for role, e in (("/", plan.root_entry), ("ESP", plan.esp_entry),
+                    ("/boot", plan.boot_entry)):
+        if e is not None and e.uuid is None:
+            log_warn(f"  template {role} entry does not use UUID= "
+                     f"({e.device}) — left as-is; verify it before first boot")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = (f"# regenerated by `snapperrestore` {stamp} from snapshot "
+              f"epoch {plan.epoch}\n"
+              "# structure/options preserved from the source template; UUIDs "
+              "rewritten from the\n# freshly created target filesystems.\n")
+    etc = os.path.join(_RESTORE_TARGET_MNT, "etc")
+    os.makedirs(etc, exist_ok=True)
+    with open(os.path.join(etc, "fstab"), "w", encoding="utf-8") as f:
+        f.write(header + rewrite_uuids(plan.fstab_text, uuid_map))
+    with open(os.path.join(etc, "crypttab"), "w", encoding="utf-8") as f:
+        f.write(header + rewrite_uuids(plan.crypttab_text, uuid_map))
+    os.chmod(os.path.join(etc, "crypttab"), 0o644)
+    log_ok("  fstab + crypttab written")
+
+
+def _crypttab_with_initramfs_option(text: str) -> str:
+    """The crypttab text with Debian's `initramfs` option appended to each
+    entry (idempotent). WHY: inside the restore chroot, the cryptsetup hook
+    detects 'devices needed at early boot' from the LIVE environment's root —
+    which is the live ISO's overlay, never the target — so without this forced-
+    inclusion option the generated initramfs gets an EMPTY crypttab and the
+    restored system cannot unlock its root at boot. (Found empirically.) The
+    option is only needed for chroot-time generation, so the pristine template
+    is restored after the chroot step."""
+    out = []
+    for line in text.splitlines():
+        fields = line.split()
+        if line.strip() and not line.strip().startswith("#") and len(fields) >= 2:
+            while len(fields) < 4:
+                fields.append("none" if len(fields) == 2 else "initramfs")
+            if "initramfs" not in fields[3].split(","):
+                fields[3] += ",initramfs"
+            line = "  ".join(fields)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _chroot_run(argv: list[str], what: str) -> None:
+    log_info(f"  chroot: {' '.join(argv)}")
+    cp = run_local(["chroot", _RESTORE_TARGET_MNT] + argv, check=False)
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or "").strip().splitlines()
+        raise RestoreError(f"{what} failed in chroot (rc={cp.returncode})"
+                           + (f": {detail[-1]}" if detail else ""))
+
+
+def _restore_bootloader_id(plan: RestorePlan) -> str:
+    """Derive the grub --bootloader-id from the mirrored ESP's EFI/ directory
+    (the non-fallback vendor dir), defaulting to 'debian'."""
+    efi_dir = _RESTORE_TARGET_MNT + plan.esp_entry.mountpoint + "/EFI"
+    try:
+        vendors = sorted(d for d in os.listdir(efi_dir)
+                         if os.path.isdir(os.path.join(efi_dir, d))
+                         and d.upper() != "BOOT")
+    except OSError:
+        vendors = []
+    return vendors[0] if vendors else "debian"
+
+
+def _restore_chroot(plan: RestorePlan, disk: str, state: set) -> None:
+    t = _RESTORE_TARGET_MNT
+    if "chroot" in state:
+        log_info("[resume] chroot (initramfs/GRUB) already done — skipping")
+        return
+    # The unbootable-system guard: never enter the chroot without a crypttab
+    # in place.
+    if not os.path.isfile(os.path.join(t, "etc/crypttab")):
+        raise RestoreError("crypttab missing in the target — aborting to "
+                           "prevent an unbootable system")
+    log_step("chroot: update-initramfs, grub-install, update-grub")
+    for src, rel in (("/dev", "dev"), ("/dev/pts", "dev/pts"),
+                     ("/proc", "proc"), ("/sys", "sys"), ("/run", "run")):
+        mp = os.path.join(t, rel)
+        os.makedirs(mp, exist_ok=True)
+        if not _is_mounted(mp):
+            _must(["mount", "--bind", src, mp], f"bind {src}")
+    efivars = os.path.join(t, "sys/firmware/efi/efivars")
+    os.makedirs(efivars, exist_ok=True)
+    if not _is_mounted(efivars):
+        cp = run_local(["mount", "-t", "efivarfs", "efivarfs", efivars],
+                       check=False)
+        if cp.returncode != 0:
+            log_warn("  could not mount efivarfs — the GRUB EFI boot entry may "
+                     "not register (removable-path fallback still installs)")
+    # Temporarily force the crypttab entries into the initramfs (see
+    # _crypttab_with_initramfs_option for why the hook can't detect them from
+    # inside a chroot); the pristine template is restored right after.
+    ct_path = os.path.join(t, "etc/crypttab")
+    pristine = open(ct_path, encoding="utf-8").read()
+    with open(ct_path, "w", encoding="utf-8") as f:
+        f.write(_crypttab_with_initramfs_option(pristine))
+    try:
+        _chroot_run(["update-initramfs", "-u", "-k", "all"], "update-initramfs")
+    finally:
+        with open(ct_path, "w", encoding="utf-8") as f:
+            f.write(pristine)
+    boot_id = _restore_bootloader_id(plan)
+    _chroot_run(["grub-install", "--target=x86_64-efi",
+                 f"--efi-directory={plan.esp_entry.mountpoint}",
+                 f"--bootloader-id={boot_id}", "--force-extra-removable",
+                 "--recheck", disk], "grub-install")
+    _chroot_run(["update-grub"], "update-grub")
+    _state_mark("chroot")
+    state.add("chroot")
+    log_ok("initramfs + GRUB installed")
+
+
+def _verify_initramfs_crypttab(plan: RestorePlan, uuids: dict) -> Optional[bool]:
+    """THE unbootable-system check: the freshly generated initramfs must embed a
+    cryptroot crypttab referencing the NEW LUKS UUID (the chroot-generation gap
+    _crypttab_with_initramfs_option plugs produced an EMPTY one). Extraction
+    runs inside the chroot — the target owns initramfs-tools; the live ISO may
+    not. Returns None when it cannot check (warn, don't block)."""
+    t = _RESTORE_TARGET_MNT
+    boot_mnt = plan.boot_entry.mountpoint if plan.boot_entry else "/boot"
+    try:
+        initrds = sorted(f for f in os.listdir(t + boot_mnt)
+                         if f.startswith("initrd.img-"))
+    except OSError:
+        initrds = []
+    if not initrds:
+        return None
+    scratch = "/tmp/snapperrestore-initrd-check"
+    run_local(["chroot", t, "rm", "-rf", scratch], check=False)
+    cp = run_local(["chroot", t, "unmkinitramfs",
+                    os.path.join(boot_mnt, initrds[-1]), scratch], check=False)
+    content = None
+    if cp.returncode == 0:
+        for sub in ("main/cryptroot/crypttab", "cryptroot/crypttab"):
+            p = os.path.join(t, scratch.lstrip("/"), sub)
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as f:
+                    content = f.read()
+                break
+    run_local(["chroot", t, "rm", "-rf", scratch], check=False)
+    if content is None:
+        return None
+    return uuids["luks"] in content
+
+
+def _restore_verify(plan: RestorePlan, uuids: dict) -> bool:
+    """Cross-check the written tables against live blkid, confirm the GRUB
+    binary landed on the ESP and the subvol default is sane. Warns rather than
+    dies — the operator reviews before reboot."""
+    log_step("verify")
+    ok = True
+    t = _RESTORE_TARGET_MNT
+    try:
+        fstab_out = open(os.path.join(t, "etc/fstab"), encoding="utf-8").read()
+        crypttab_out = open(os.path.join(t, "etc/crypttab"),
+                            encoding="utf-8").read()
+    except OSError as e:
+        log_error(f"  cannot re-read written tables: {e}")
+        return False
+    checks = [("btrfs", uuids["btrfs"], fstab_out),
+              ("ESP", uuids["esp"], fstab_out),
+              ("LUKS", uuids["luks"], crypttab_out)]
+    if "boot" in uuids:
+        checks.append(("/boot", uuids["boot"], fstab_out))
+    for label, new, text in checks:
+        if new in text:
+            log_ok(f"  {label} UUID present in the written tables")
+        else:
+            log_warn(f"  {label} UUID {new} NOT found in the written tables")
+            ok = False
+    for old in [plan.root_entry.uuid, plan.esp_entry.uuid, plan.old_luks_uuid,
+                plan.boot_entry.uuid if plan.boot_entry else None]:
+        if old and (old in fstab_out or old in crypttab_out):
+            log_warn(f"  OLD UUID {old} still present — rewrite incomplete!")
+            ok = False
+    esp = t + plan.esp_entry.mountpoint
+    grub_bin = None
+    for root, _dirs, files in os.walk(os.path.join(esp, "EFI")):
+        for fn in files:
+            if fn.lower().endswith(".efi") and "grub" in fn.lower():
+                grub_bin = os.path.join(root, fn)
+    if grub_bin:
+        log_ok(f"  GRUB EFI binary present ({os.path.relpath(grub_bin, esp)})")
+    else:
+        log_warn("  no GRUB EFI binary found on the ESP")
+        ok = False
+    snap_entry = next((e for e in plan.entries if e.fstype == "btrfs"
+                       and os.path.basename(e.mountpoint) == ".snapshots"
+                       and e.subvol), None)
+    if snap_entry:
+        if _is_mounted(t + snap_entry.mountpoint):
+            log_ok(f"  {snap_entry.mountpoint} mounted (snapper starts a fresh "
+                   "timeline)")
+        else:
+            log_warn(f"  {snap_entry.mountpoint} not mounted — check its fstab "
+                     "entry")
+    ir = _verify_initramfs_crypttab(plan, uuids)
+    if ir is True:
+        log_ok("  initramfs embeds the new LUKS UUID (root will unlock at boot)")
+    elif ir is False:
+        log_warn("  initramfs does NOT embed the new LUKS UUID — the system "
+                 "would not unlock its root at boot!")
+        ok = False
+    else:
+        log_warn("  could not inspect the initramfs cryptroot — verify by hand "
+                 "(unmkinitramfs <initrd> …/cryptroot/crypttab)")
+    dflt = run_local(["btrfs", "subvolume", "get-default", _RESTORE_TOP_MNT],
+                     check=False)
+    if dflt.returncode == 0 and (" 5 " in f" {dflt.stdout.strip()} "
+                                 or "(FS_TREE)" in dflt.stdout
+                                 or dflt.stdout.strip().startswith("ID 5")):
+        log_ok("  subvolume default is the top level (fstab's subvol= governs)")
+    else:
+        log_warn(f"  unexpected default subvolume: {dflt.stdout.strip()}")
+    return ok
+
+
+def _restore_summary(cfg: Config, plan: RestorePlan, disk: str) -> None:
+    print(f"""
+=== restore complete — {plan.host} rebuilt on {disk} ===
+Restored from : {cfg.server_user}@{cfg.server_host} (epoch {plan.epoch})
+Next steps:
+  1. Detach the live medium / move the disk, boot, and unlock LUKS
+     ({plan.crypt_name!r}) with the passphrase you set.
+  2. Snapper starts a fresh timeline (the snapshot stores were recreated empty
+     — old history stays on the server, browsable there).
+  3. Nested subvolumes were recreated EMPTY by design (caches, container
+     storage); they refill in use.
+  4. The next `snappersend` run starts a NEW lineage on the server: a FULL send
+     per subvol is expected. The old history is untouched.
+""")
+
+
+def _restore_teardown(crypt_name: str, close_luks: bool) -> None:
+    """Unmount everything best-effort (deepest first). On failure the LUKS
+    container is left open so the operator can inspect / resume without
+    re-typing the passphrase."""
+    t = _RESTORE_TARGET_MNT
+    for rel in ("sys/firmware/efi/efivars", "dev/pts", "dev", "proc", "sys",
+                "run"):
+        run_local(["umount", "-l", os.path.join(t, rel)], check=False)
+    run_local(["umount", "-R", t], check=False)
+    run_local(["umount", _RESTORE_TOP_MNT], check=False)
+    run_local(["sync"], check=False)
+    run_local(["udevadm", "settle", "--timeout=5"], check=False)
+    if close_luks:
+        run_local(["cryptsetup", "close", crypt_name], check=False)
+
+
+def _restore_execute(cfg: Config, plan: RestorePlan, disk: str,
+                     resume: bool) -> int:
+    mapper = f"/dev/mapper/{_RESTORE_MAPPER_NAME}"
+    completed = False
+    try:
+        esp_dev = boot_dev = crypt_dev = None
+        if resume:
+            esp_dev = _resolve_partition(disk, "EFI")
+            boot_dev = _resolve_partition(disk, "boot") if plan.boot_entry else None
+            crypt_dev = _resolve_partition(disk, "cryptroot")
+            if not (esp_dev and crypt_dev
+                    and (boot_dev or not plan.boot_entry)):
+                log_warn("could not resolve the prior partition layout — "
+                         "starting over")
+                resume = False
+        if not resume:
+            log_step(f"partitioning {disk} (EFI {plan.esp_size}"
+                     + (f", boot {plan.boot_size}" if plan.boot_entry else "")
+                     + ", rest LUKS2)")
+            _restore_partition(plan, disk)
+            esp_dev = _resolve_partition(disk, "EFI")
+            boot_dev = _resolve_partition(disk, "boot") if plan.boot_entry else None
+            crypt_dev = _resolve_partition(disk, "cryptroot")
+        if not (esp_dev and crypt_dev and (boot_dev or not plan.boot_entry)):
+            raise RestoreError(f"could not resolve partitions on {disk}")
+        log_info(f"partitions: EFI={esp_dev}"
+                 + (f" boot={boot_dev}" if boot_dev else "")
+                 + f" LUKS={crypt_dev}")
+
+        _restore_luks(plan, crypt_dev, resume)
+        _restore_mkfs(plan, esp_dev, boot_dev, mapper, resume)
+        uuids = _collect_uuids(crypt_dev, esp_dev, boot_dev, mapper)
+        _mount_top(mapper)
+        state = _state_read()
+        for m in ("partition", "luks", "mkfs"):
+            if m not in state:
+                _state_mark(m)
+                state.add(m)
+
+        _restore_create_empty(plan)
+        _restore_receive(cfg, plan, state)
+        _restore_nested(plan, state)
+        _restore_nocow_swap(plan, state)
+        devs = {plan.esp_entry.mountpoint: esp_dev}
+        if plan.boot_entry:
+            devs[plan.boot_entry.mountpoint] = boot_dev
+        _restore_mount_target(plan, mapper, devs)
+        _restore_boot_sync(plan, state)
+        _restore_write_tables(plan, uuids)
+        _restore_chroot(plan, disk, state)
+        verified = _restore_verify(plan, uuids)
+        with contextlib.suppress(OSError):        # the fs is finished: drop the
+            os.remove(_state_path())              # resume markers
+        completed = True
+        _restore_summary(cfg, plan, disk)
+        if not verified:
+            log_warn("verify reported warnings — review them before booting")
+        return 0 if verified else 1
+    finally:
+        _restore_teardown(_RESTORE_MAPPER_NAME, close_luks=completed)
+        if not completed:
+            log_warn(f"restore did not complete — {mapper} was left open; "
+                     "re-run `sudo snapperrestore` and choose resume.")
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """The restore wizard. Order: preflight -> connect -> discover -> plan
+    (+gate; --plan stops here, read-only) -> partition -> LUKS -> mkfs ->
+    subvols -> receive -> nested -> No-COW/swap -> boot -> tables -> chroot ->
+    verify."""
+    plan_only = bool(getattr(args, "plan", False))
+    if os.geteuid() != 0:
+        print("restore must run as root. Try: sudo snapperrestore",
+              file=sys.stderr)
+        return 2
+    log_step("snapperrestore"
+             + (" — PLAN ONLY (read-only rehearsal)" if plan_only else ""))
+    try:
+        if not plan_only:
+            _restore_env_guard()
+        cfg = _restore_transport(args)
+        host, subvols, root_name = _restore_discover(cfg, args)
+        chosen = _restore_choose_snapshots(subvols, root_name, args,
+                                           interactive=not plan_only)
+        snap_base = os.path.join(cfg.recv_base, host, root_name,
+                                 chosen[root_name], "snapshot")
+        log_info(f"fetching templates from {root_name}/{chosen[root_name]}")
+        fstab_text = _remote_cat(cfg, os.path.join(snap_base, "etc/fstab"))
+        crypttab_text = _remote_cat(cfg, os.path.join(snap_base, "etc/crypttab"))
+        manifest_text = _remote_cat(cfg, os.path.join(snap_base,
+                                                      _RESTORE_MANIFEST_REL))
+        if fstab_text is None:
+            raise RestoreError(f"cannot read etc/fstab from {snap_base} — "
+                               "not a system root snapshot?")
+        if crypttab_text is None:
+            raise RestoreError(f"cannot read etc/crypttab from {snap_base} — "
+                               "refusing to build an unbootable system")
+        plan = _restore_build_plan(args, host, chosen, root_name, fstab_text,
+                                   crypttab_text, manifest_text)
+        _restore_print_plan(cfg, plan)
+        if plan_only:
+            log_ok("plan complete — nothing was written (re-run without --plan "
+                   "to execute)")
+            return 0
+
+        _restore_check_tools(plan)
+        disk = _restore_select_disk(args)
+        resume = _restore_detect_resume(disk)
+        _restore_confirm(disk, resume)
+        return _restore_execute(cfg, plan, disk, resume)
+    except RemoteUnreachable as e:
+        log_error(f"destination unreachable ({e}) — aborting cleanly; re-run "
+                  "to retry/resume")
+        return 1
+    except RestoreError as e:
+        log_error(str(e))
+        return 1
+    except KeyboardInterrupt:
+        log_error("interrupted — re-run `sudo snapperrestore` to resume")
+        return 130
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="snapperrestore",
+        description="Bare-metal disaster recovery from a snappersend "
+                    "destination's received snapshot tree (run from a live ISO).",
+    )
+    p.add_argument("--plan", action="store_true",
+                   help="read-only rehearsal: connect, discover, fetch the "
+                        "templates and print the derived plan; performs zero "
+                        "writes")
+    p.add_argument("--disk",
+                   help="target disk to WIPE and rebuild (e.g. /dev/nvme0n1; "
+                        "prompted with lsblk if omitted)")
+    p.add_argument("--source-host",
+                   help="hostname directory under RECV_BASE to restore "
+                        "(default: the only one, else prompted)")
+    p.add_argument("--snapshot",
+                   help="snapshot label / epoch prefix to restore (default: "
+                        "the newest epoch-matched set)")
+    p.add_argument("--server", help="destination server host (overrides config)")
+    p.add_argument("--port", type=int, help="destination SSH port")
+    p.add_argument("--user", help="transport user (default snappersend)")
+    p.add_argument("--ssh-key", dest="ssh_key",
+                   help="transport private key (your offline copy after a "
+                        "total loss; default /etc/snappersend/ssh/id_ed25519)")
+    p.add_argument("--recv-base", dest="recv_base",
+                   help="receive base on the server (default /srv/snapshots-recv)")
+    p.add_argument("--esp-size", default="512MiB",
+                   help="ESP partition size (default 512MiB)")
+    p.add_argument("--boot-size", default="2GiB",
+                   help="/boot partition size (default 2GiB)")
+    p.add_argument("--swap-size", default="2g",
+                   help="swapfile size (default 2g)")
+    p.add_argument("--no-mbuffer", action="store_true",
+                   help="do not pipe the receive through mbuffer")
+    p.add_argument("--config",
+                   default=os.environ.get("SNAPPERSEND_CONFIG",
+                                          "/etc/snappersend/config"),
+                   help="snappersend config for transport defaults (default "
+                        "/etc/snappersend/config; absent on a live ISO is fine)")
+    p.add_argument("-v", "--verbose", action="store_true", default=False,
+                   help="log every shell command and extra detail")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    global _VERBOSE
+    _VERBOSE = getattr(args, "verbose", False)
+    return cmd_restore(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

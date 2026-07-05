@@ -12,8 +12,10 @@ This produces a `snappersend` package that installs:
 | `snappersend` | `/usr/bin/snappersend` |
 | `snappersend.service` | `/lib/systemd/system/snappersend.service` |
 | `bootmirror-sync.service` | `/lib/systemd/system/bootmirror-sync.service` |
+| `snappersend-manifest.service` | `/lib/systemd/system/snappersend-manifest.service` |
 | `10-snappersend.conf` (timeline drop-in) | `/usr/lib/systemd/system/snapper-timeline.service.d/` |
 | `20-bootmirror.conf` (timeline drop-in) | `/usr/lib/systemd/system/snapper-timeline.service.d/` |
+| `30-manifest.conf` (timeline drop-in) | `/usr/lib/systemd/system/snapper-timeline.service.d/` |
 | `config.example` | `/usr/share/doc/snappersend/examples/` |
 | `README.md` | `/usr/share/doc/snappersend/` |
 
@@ -97,12 +99,14 @@ cat > debian/rules <<'EOF'
 %:
 	dh $@
 
-# Neither unit has an [Install] section — both are triggered by the timeline
-# drop-ins — so never enable or start them at install time. The second
-# dh_installsystemd call picks up debian/snappersend.bootmirror-sync.service.
+# None of the units has an [Install] section — all are triggered by the
+# timeline drop-ins — so never enable or start them at install time. The
+# --name calls pick up debian/snappersend.bootmirror-sync.service and
+# debian/snappersend.snappersend-manifest.service.
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
 	dh_installsystemd --no-enable --no-start --name=bootmirror-sync
+	dh_installsystemd --no-enable --no-start --name=snappersend-manifest
 EOF
 chmod +x debian/rules
 
@@ -112,6 +116,7 @@ snappersend usr/bin
 config.example usr/share/doc/snappersend/examples
 debian/snapper-timeline.service.d/10-snappersend.conf usr/lib/systemd/system/snapper-timeline.service.d
 debian/snapper-timeline.service.d/20-bootmirror.conf usr/lib/systemd/system/snapper-timeline.service.d
+debian/snapper-timeline.service.d/30-manifest.conf usr/lib/systemd/system/snapper-timeline.service.d
 EOF
 
 # --- README into the doc dir -----------------------------------------------
@@ -120,17 +125,20 @@ echo 'README.md' > debian/docs
 # --- systemd units: the shipped units already use the canonical /usr/bin
 #     binary path; only the Documentation= doc path needs the packaged
 #     /usr/share/doc location. dh_installsystemd picks up debian/<pkg>.service
-#     automatically and debian/<pkg>.bootmirror-sync.service via the --name
-#     call in debian/rules. --------------------------------------------------
+#     automatically and the other two units via the --name calls in
+#     debian/rules. -------------------------------------------------------------
 sed -e 's#/usr/local/share/doc/snappersend#/usr/share/doc/snappersend#' \
     systemd/snappersend.service > debian/snappersend.service
 cp systemd/bootmirror-sync.service debian/snappersend.bootmirror-sync.service
+cp systemd/snappersend-manifest.service debian/snappersend.snappersend-manifest.service
 
 # --- timeline drop-ins (verbatim from the repo) ----------------------------
 cp systemd/snapper-timeline.service.d/10-snappersend.conf \
    debian/snapper-timeline.service.d/10-snappersend.conf
 cp systemd/snapper-timeline.service.d/20-bootmirror.conf \
    debian/snapper-timeline.service.d/20-bootmirror.conf
+cp systemd/snapper-timeline.service.d/30-manifest.conf \
+   debian/snapper-timeline.service.d/30-manifest.conf
 ```
 
 ## 3. Build the package

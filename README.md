@@ -431,8 +431,10 @@ layout is hardcoded:
   rewritten** from live `blkid` of the freshly created target.
 - `root.latest/etc/crypttab` — the LUKS mapping name and unlock options (TPM or
   not is read from here, never assumed). Also UUID-rewritten.
-- `root.latest/etc/snappersend/restore-manifest` — written automatically by every
-  send run (it rides to the server inside the next Snapper snapshot). It records
+- `root.latest/etc/snappersend/restore-manifest` — refreshed automatically just
+  before every Snapper timeline tick (`snappersend --write-manifest`, a pre-tick
+  oneshot like the bootmirror sync), so the snapshot that rides to the server
+  carries the manifest describing itself. It records
   what a `btrfs send` stream cannot carry: **nested subvolumes** (they arrive as
   empty directories — e.g. `@home/.snapshots`, a nested `~/.cache`) with their
   No-COW flags, the configured name→mountpoint map, the parent-tree base, the
@@ -540,9 +542,12 @@ Wants=snappersend.service               # pull us in each timeline run…
 Before=snappersend.service              # …ordered after the snapshot completes
 ```
 
-The boot tier hangs off the **same** timeline service, on the other side: a
-`bootmirror-sync.service` oneshot ordered strictly *before* the snapshot (so snapper
-captures a fresh `/.bootmirror` in the same tick), pulled in by its own drop-in.
+Two more oneshots hang off the **same** timeline service, on the other side —
+each ordered strictly *before* the snapshot and pulled in by its own drop-in, so
+snapper captures their output in the same tick: `bootmirror-sync.service`
+(a fresh `/.bootmirror`) and `snappersend-manifest.service` (a fresh
+`/etc/snappersend/restore-manifest`). Both writes MUST precede the tick:
+anything written after the snapshot is frozen can only ride the *next* one.
 
 `/etc/systemd/system/bootmirror-sync.service` — the pre-tick mirror refresh:
 
@@ -564,26 +569,51 @@ TimeoutStartSec=90
 Wants=bootmirror-sync.service
 ```
 
+`/etc/systemd/system/snappersend-manifest.service` — the pre-tick manifest refresh
+(same shape, smaller timeout — it is one atomic file write, not an rsync):
+
+```ini
+[Unit]
+Description=SnapperSend: refresh the restore manifest before snapper timeline
+Before=snapper-timeline.service
+# NO Requires/BindsTo — ordering only.
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/snappersend --write-manifest
+TimeoutStartSec=15
+```
+
+`/etc/systemd/system/snapper-timeline.service.d/30-manifest.conf` — its trigger:
+
+```ini
+[Unit]
+Wants=snappersend-manifest.service
+```
+
 ```sh
 sudo install -m0644 systemd/snappersend.service systemd/bootmirror-sync.service \
-     /etc/systemd/system/
+     systemd/snappersend-manifest.service /etc/systemd/system/
 sudo install -Dm0644 systemd/snapper-timeline.service.d/10-snappersend.conf \
      /etc/systemd/system/snapper-timeline.service.d/10-snappersend.conf
 sudo install -m0644 systemd/snapper-timeline.service.d/20-bootmirror.conf \
      /etc/systemd/system/snapper-timeline.service.d/20-bootmirror.conf
+sudo install -m0644 systemd/snapper-timeline.service.d/30-manifest.conf \
+     /etc/systemd/system/snapper-timeline.service.d/30-manifest.conf
 sudo systemctl daemon-reload
 # verify the ordering graph:
 systemctl show snapper-timeline.service -p Wants -p Before -p After | grep -E 'snappersend|bootmirror'
 systemctl show snappersend.service -p After | grep snapper-timeline
 systemctl show bootmirror-sync.service -p Before | grep snapper-timeline
+systemctl show snappersend-manifest.service -p Before | grep snapper-timeline
 ```
 
-So one timeline tick runs, in order: `bootmirror-sync.service` (refresh the mirror) →
+So one timeline tick runs, in order: `bootmirror-sync.service` (refresh the mirror)
+and `snappersend-manifest.service` (refresh the restore manifest) →
 `snapper-timeline.service` (snapshot `@`, `@home`, `@bootmirror` in one epoch) →
-`snappersend.service` (replicate them all). Both couplings are `Wants=`-soft: a
-failure on either side never propagates into snapper's own health, and snapper never
-waits on the sync's exit status — a wedged sync is cut off by `TimeoutStartSec` and
-the tick proceeds with a one-tick-stale mirror.
+`snappersend.service` (replicate them all). All three couplings are `Wants=`-soft: a
+failure on any side never propagates into snapper's own health, and snapper never
+waits on their exit status — a wedged pre-tick step is cut off by `TimeoutStartSec`
+and the tick proceeds with a one-tick-stale mirror or manifest.
 
 Why this shape:
 

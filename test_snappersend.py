@@ -8,9 +8,10 @@ the bulk of this file drives the real `replicate_subvol` orchestration against a
 in-memory fake of the two stateful worlds it touches — the destination's received
 snapshots and the source's parent-clone tree — by monkeypatching the btrfs/ssh IO
 boundary. The pure logic (correlation, WYSIWYG GFS incl. yearly, config parsing) is
-unit-tested directly. The bootmirror sync (section 10) drives the real
-bootmirror_sync against faked-out rsync, asserting above all that it stays
-SOURCE-LOCAL (any remote command is an instant failure). Real end-to-end btrfs
+unit-tested directly. The two pre-tick oneshots — bootmirror sync (section 10)
+and the restore-manifest write (section 11) — drive the real functions against
+faked-out IO, asserting above all that they stay SOURCE-LOCAL (any remote
+command is an instant failure). Real end-to-end btrfs
 send/receive and rsync are covered separately by the VM validation (see the build
 report), not here.
 """
@@ -1123,6 +1124,67 @@ def test_cli_bootmirror_sync_flag_and_skip_boot_removed():
     assert ss.build_parser().parse_args([]).bootmirror_sync is False
     with pytest.raises(SystemExit):                      # boot is just a subvol now
         ss.build_parser().parse_args(["--skip-boot"])
+
+
+# ============================================================================
+# (11) --write-manifest — pre-tick refresh of /etc/snappersend/restore-manifest,
+#      the same shape as --bootmirror-sync: it runs just BEFORE snapper's
+#      timeline tick so the SAME snapshot ships the manifest (a send-time write
+#      can never reach the snapshot being sent — it was frozen before the send
+#      run started). Load-bearing properties: source-local, atomic, and a
+#      failure is an exit code for the oneshot's status, never an exception.
+# ============================================================================
+
+def _drive_manifest(monkeypatch, tmp_path, content="version 1\n", fail=False,
+                    **cfg_kw):
+    """Run the REAL write_restore_manifest against a tmp manifest path with the
+    builder canned (build_restore_manifest has its own round-trip coverage in
+    test_snapperrestore.py). run_remote is booby-trapped: the write must be
+    source-local, so ANY remote command fails the test."""
+    path = tmp_path / "etc" / "restore-manifest"
+    monkeypatch.setattr(ss, "_RESTORE_MANIFEST_PATH", str(path))
+
+    def fake_build(cfg, fstab_text=None):
+        if fail:
+            raise OSError("boom")
+        return content
+    monkeypatch.setattr(ss, "build_restore_manifest", fake_build)
+    monkeypatch.setattr(ss, "run_remote",
+                        lambda *a, **k: pytest.fail("manifest write went remote"))
+    return ss.write_restore_manifest(_sync_cfg(**cfg_kw)), path
+
+
+def test_write_manifest_writes_atomically_source_local(monkeypatch, tmp_path):
+    rc, path = _drive_manifest(monkeypatch, tmp_path, content="version 1\nx\n")
+    assert rc == 0
+    assert path.read_text() == "version 1\nx\n"
+    assert not path.with_name(path.name + ".tmp").exists()   # tmp file replaced
+
+
+def test_write_manifest_dry_run_writes_nothing(monkeypatch, tmp_path):
+    rc, path = _drive_manifest(monkeypatch, tmp_path, dry_run=True)
+    assert rc == 0 and not path.exists()
+
+
+def test_write_manifest_failure_is_exit_code_not_exception(monkeypatch, tmp_path):
+    # Best-effort by design: the Wants= coupling keeps snapper's tick healthy
+    # regardless, and the nonzero rc is only for the oneshot's own status.
+    rc, path = _drive_manifest(monkeypatch, tmp_path, fail=True)
+    assert rc == 1 and not path.exists()
+
+
+def test_cli_write_manifest_flag():
+    assert ss.build_parser().parse_args(["--write-manifest"]).write_manifest is True
+    assert ss.build_parser().parse_args([]).write_manifest is False
+
+
+def test_send_run_no_longer_writes_manifest(monkeypatch):
+    # The manifest write lives ONLY in the pre-tick path now — a send-time
+    # write is perpetually one tick stale, so _run must not quietly regrow one.
+    monkeypatch.setattr(ss, "write_restore_manifest",
+                        lambda *a, **k: pytest.fail("_run wrote the manifest"))
+    cfg2 = _sync_cfg(subvols={}, dry_run=True)
+    assert ss._run(cfg2, ss.build_parser().parse_args([])) == 0
 
 
 if __name__ == "__main__":

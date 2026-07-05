@@ -1,0 +1,24 @@
+# snappersend-manifest.service — refresh /etc/snappersend/restore-manifest just
+# before snapper's timeline snapshot, so the manifest is already inside @ when
+# the tick freezes root and the SAME snapshot carries it to the destination.
+# (A send-time write cannot help the snapshot it is shipping — that snapshot
+# was frozen before the send run started — so the write lives here instead.)
+#
+# The coupling to snapper is ORDERING-ONLY and lives in the drop-in
+# snapper-timeline.service.d/30-manifest.conf (Wants= this unit). There is
+# deliberately no Requires=/BindsTo= in either direction: snapper never waits
+# on this unit's exit status, and a manifest failure never marks the timeline
+# failed. Worst case a restore falls back to the last successfully written
+# manifest — degraded, not broken.
+[Unit]
+Description=SnapperSend: refresh the restore manifest before snapper timeline
+Before=snapper-timeline.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/snappersend --write-manifest
+# The write is source-local (no SSH, no network, no rsync — see
+# --write-manifest): a handful of btrfs/lsattr queries and one atomic file
+# write, normally sub-second. The bound is a backstop so a wedged query can
+# never hold up the ordering queue indefinitely.
+TimeoutStartSec=15

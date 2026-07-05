@@ -115,9 +115,11 @@ The destination doubles as a bare-metal restore source: the companion
 received tree, driven by the received root snapshot itself — etc/fstab +
 etc/crypttab as UUID-rewritten TEMPLATES and etc/snappersend/restore-manifest
 for what a send stream cannot carry (nested subvols, No-COW map). snappersend's
-part of that contract is the SEND side: it writes the restore manifest on
-every run (see the RESTORE MANIFEST section) and its setup-dest sudoers grant
-includes `btrfs send` so the restore direction can stream back. See the README.
+part of that contract is the SEND side: it refreshes the restore manifest just
+before each snapper timeline tick (`--write-manifest`, systemd-ordered like
+`--bootmirror-sync` — see the RESTORE MANIFEST section) and its setup-dest
+sudoers grant includes `btrfs send` so the restore direction can stream back.
+See the README.
 """
 
 from __future__ import annotations
@@ -1256,14 +1258,22 @@ def parse_fstab_template(text: str) -> list[FstabEntry]:
 
 
 # ============================================================================
-# RESTORE MANIFEST  (send-side: record what a btrfs send stream cannot carry)
+# RESTORE MANIFEST  (--write-manifest: record what a send stream cannot carry)
 # ============================================================================
 # Nested subvolumes (e.g. ~/.cache as a nested subvol, or @home/.snapshots)
 # arrive in a send stream as EMPTY DIRECTORIES — invisible in fstab and
-# indistinguishable from ordinary dirs in the received tree. So each send run
-# records them here, on the source filesystem inside @, and Snapper's next
-# timeline snapshot carries the file to the destination automatically — no new
-# transport, no server-side state, at most one snapshot-cycle stale. The file
+# indistinguishable from ordinary dirs in the received tree. So they are
+# recorded here, on the source filesystem inside @, and Snapper's timeline
+# snapshot carries the file to the destination automatically — no new
+# transport, no server-side state. `--write-manifest` runs from its own
+# systemd oneshot ordered just BEFORE snapper's timeline tick (the same
+# pre-tick pattern as --bootmirror-sync, same Wants=/Before= drop-in coupling,
+# same bounded-timeout / never-fail-snapper isolation), so the manifest is
+# already on disk when the tick freezes @ and the SAME snapshot ships it.
+# (Writing it at send time instead cannot work: the snapshot being sent was
+# frozen before the send run started, so a send-time write is perpetually one
+# tick stale.) Like the bootmirror sync it is deliberately SOURCE-LOCAL — no
+# SSH, no destination, no lock shared with the send run. The file
 # also records the send-time facts a restore cannot derive on its own: the
 # configured subvol-name -> mountpoint map (how server directories map onto
 # fstab entries), the parent-tree base (its remnants are scrubbed on restore),
@@ -1321,7 +1331,8 @@ def build_restore_manifest(cfg: Config, fstab_text: Optional[str] = None) -> str
     read off the live fstab's btrfs mountpoints. `fstab_text` is injectable for
     tests; None reads /etc/fstab."""
     lines = [
-        "# snappersend restore-manifest — written automatically by each snappersend run.",
+        "# snappersend restore-manifest — refreshed automatically before each snapper",
+        "# timeline tick (snappersend --write-manifest).",
         "# Consumed by `snapperrestore`. Nested subvolumes travel in a btrfs send",
         "# stream as EMPTY DIRECTORIES, so their layout and No-COW flags are recorded",
         "# here. NOTE: the CONTENTS of nested subvols are NOT in the backup by design;",
@@ -1356,14 +1367,17 @@ def build_restore_manifest(cfg: Config, fstab_text: Optional[str] = None) -> str
     return "\n".join(lines) + "\n"
 
 
-def write_restore_manifest(cfg: Config) -> None:
-    """Send-side: refresh the on-source manifest so Snapper's next timeline
-    snapshot carries it to the destination inside @. Best-effort by design — a
-    failure here degrades the restore of nested subvols, it must never fail the
-    replication run."""
+def write_restore_manifest(cfg: Config) -> int:
+    """--write-manifest: refresh the on-source manifest so the imminent snapper
+    timeline tick ships it inside the root snapshot, then exit. Best-effort by
+    design — a failure degrades the restore of nested subvols and is reported
+    in the exit code for the oneshot's status, but the Wants= coupling means it
+    can never fail or block the timeline (worst case a restore falls back to
+    the last successfully written manifest, one or more ticks stale)."""
+    log_step(f"restore manifest refresh -> {_RESTORE_MANIFEST_PATH}")
     if cfg.dry_run:
         log_info(f"[dry-run] would refresh {_RESTORE_MANIFEST_PATH}")
-        return
+        return 0
     try:
         content = build_restore_manifest(cfg)
         os.makedirs(os.path.dirname(_RESTORE_MANIFEST_PATH), exist_ok=True)
@@ -1372,10 +1386,12 @@ def write_restore_manifest(cfg: Config) -> None:
             fh.write(content)
         os.chmod(tmp, 0o644)
         os.replace(tmp, _RESTORE_MANIFEST_PATH)
-        log_debug(f"refreshed {_RESTORE_MANIFEST_PATH}")
+        log_ok(f"refreshed {_RESTORE_MANIFEST_PATH}")
+        return 0
     except Exception as e:
         log_warn(f"could not refresh restore manifest: {e} — a future restore "
                  "will fall back to the last successfully written one")
+        return 1
 
 
 # ============================================================================
@@ -2288,6 +2304,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only rsync the BOOT_PATHS into the @bootmirror subvolume "
                         "(source-local, no SSH), then exit — the pre-snapper-timeline "
                         "step; honours --dry-run")
+    p.add_argument("--write-manifest", dest="write_manifest", action="store_true",
+                   help="only refresh /etc/snappersend/restore-manifest (source-"
+                        "local, no SSH, no replication), then exit — the other "
+                        "pre-snapper-timeline step; honours --dry-run")
     p.add_argument("--no-mbuffer", action="store_true",
                    help="do not pipe through mbuffer even if configured")
     p.add_argument("-v", "--verbose", action="store_true", default=False,
@@ -2368,6 +2388,12 @@ def main(argv: list[str]) -> int:
     if args.bootmirror_sync:
         return bootmirror_sync(cfg)
 
+    # --write-manifest is the same shape: source-local file write only, then
+    # exit, no run lock (the write is atomic and nothing else touches the
+    # manifest). Both pre-tick oneshots must stay unblockable by a send run.
+    if args.write_manifest:
+        return write_restore_manifest(cfg)
+
     # --report is read-only and mutually exclusive with a real run: report, then exit
     # WITHOUT taking the run lock or entering replicate_subvol (it mutates nothing).
     if args.report:
@@ -2384,10 +2410,6 @@ def _run(cfg: Config, args: argparse.Namespace) -> int:
     hostname = socket.gethostname()
     log_step(f"snappersend on {hostname} -> {cfg.server_user}@{cfg.server_host}"
              + (" [DRY-RUN]" if cfg.dry_run else ""))
-
-    # Refresh the restore manifest FIRST, so Snapper's next timeline tick ships
-    # it inside the root snapshot (see the RESTORE MANIFEST section).
-    write_restore_manifest(cfg)
 
     snapshots_ok = True
     for name, sv in cfg.subvols.items():

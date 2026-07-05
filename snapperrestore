@@ -1237,20 +1237,24 @@ def _restore_transport(args: argparse.Namespace) -> Config:
             raise RestoreError("the backup server address is required (--server)")
         kwargs["server_host"] = host
 
-    # --- login mode: explicit flags win; a bare config-less interactive run
-    #     gets the menu; anything else falls back to the key transport ---
+    # --- login mode: explicit flags win. Otherwise, when there's no usable
+    #     transport key (a fresh ISO, or the key died with the machine — even if
+    #     a config file survived), an interactive run gets the login menu rather
+    #     than dead-ending on setup-dest. A present, working key stays silent
+    #     (the normal restore path); a non-interactive run falls back to key. ---
     login_user = getattr(args, "login", None)
     interactive = sys.stdin.isatty()
+    resolved_key = kwargs.get("ssh_key", _DEFAULT_SSH_KEY)
+    key_present = os.path.isfile(resolved_key)
     if getattr(args, "password", False) or login_user:
         mode = "password"
     elif getattr(args, "ssh_key", None):
         mode = "key"
-    elif interactive and not os.path.isfile(args.config):
+    elif interactive and not key_present:
         choice = _login_menu(kwargs["server_host"])
         if choice == "2":
             mode = "key"
-            kwargs["ssh_key"] = _ask("Path to your backup key file",
-                                     kwargs.get("ssh_key", _DEFAULT_SSH_KEY))
+            kwargs["ssh_key"] = _ask("Path to your backup key file", resolved_key)
         elif choice == "3":
             mode = "setup"
         else:

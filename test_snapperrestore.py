@@ -422,6 +422,46 @@ def test_parse_flat_config_unterminated_quote_keeps_key(tmp_path):
     assert d["SERVER_HOST"] == "10.0.0.9"
 
 
+# --- login-mode resolution: a surviving config must not force setup-dest ------
+
+def _transport_args(cfg_path, **kw):
+    return _restore_args(config=str(cfg_path), dry_run=False, **kw)
+
+
+def test_key_missing_shows_login_menu_even_with_config(monkeypatch, tmp_path):
+    # The bug this guards against: a config file can survive on the rescue media
+    # while the transport key died with the machine. Interactive, no auth flag,
+    # key absent -> the LOGIN MENU must appear (not the setup-dest dead-end).
+    import types
+    cfg_file = tmp_path / "config"
+    cfg_file.write_text('SERVER_HOST="d"\nSSH_KEY="%s"\n' % (tmp_path / "gone-key"))
+    monkeypatch.setattr(sr.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    seen = {}
+    monkeypatch.setattr(sr, "_login_menu",
+                        lambda host: seen.setdefault("host", host) or "1")
+    monkeypatch.setattr(sr, "_password_login",
+                        lambda a, k, lu, inter: sr.Config(
+                            server_host=k["server_host"], auth_mode="password"))
+    monkeypatch.setattr(sr, "_verify_transport", lambda cfg: (True, "ok"))
+    cfg = sr._restore_transport(_transport_args(cfg_file))
+    assert seen.get("host") == "d"            # menu was shown
+    assert cfg.auth_mode == "password"        # choice 1 -> password mode
+
+
+def test_present_key_stays_silent_key_mode(monkeypatch, tmp_path):
+    # The normal path: config + a real key present -> no menu, silent key mode.
+    import types
+    key = tmp_path / "key"; key.write_text("k")
+    cfg_file = tmp_path / "config"
+    cfg_file.write_text('SERVER_HOST="d"\nSSH_KEY="%s"\n' % key)
+    monkeypatch.setattr(sr.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(sr, "_login_menu",
+                        lambda host: pytest.fail("menu shown despite a usable key"))
+    monkeypatch.setattr(sr, "_verify_transport", lambda cfg: (True, "ok"))
+    cfg = sr._restore_transport(_transport_args(cfg_file))
+    assert cfg.auth_mode == "key"
+
+
 # --- transport config: the snappersend file is read for transport keys ONLY --
 
 def test_transport_config_reads_subset_of_snappersend_config(tmp_path):

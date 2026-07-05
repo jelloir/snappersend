@@ -93,8 +93,9 @@ _LABEL = "20260703-140008+1000-144-b6f513a0"
 def _restore_args(**kw):
     import argparse
     ns = argparse.Namespace(esp_size="512MiB", boot_size="2GiB", swap_size="2g",
-                            plan=True, disk=None, source_host=None, snapshot=None,
+                            dry_run=True, disk=None, source_host=None, snapshot=None,
                             server=None, port=None, user=None, ssh_key=None,
+                            login=None, password=False,
                             recv_base=None, no_mbuffer=False, config="/nonexistent")
     for k, v in kw.items():
         setattr(ns, k, v)
@@ -358,6 +359,69 @@ def test_provision_scripts_stay_in_sync():
     assert "$BTRFS receive *" in s
 
 
+# --- cross-file pin: the flat-config parser must never drift -----------------
+
+def test_parse_flat_config_stays_in_sync():
+    # Both tools carry their own copy of the pure-stdlib KEY="value" parser (no
+    # python3-dotenv on a live rescue ISO). A drifted copy would read the SAME
+    # config file differently in the two directions — the source is pinned
+    # byte-identical, exactly like _provision_script.
+    import inspect
+    assert (inspect.getsource(sr._parse_flat_config)
+            == inspect.getsource(ss._parse_flat_config))
+
+
+def test_parse_flat_config_parses_example():
+    # The shipped config.example must parse to the values it documents.
+    example = os.path.join(os.path.dirname(__file__), "config.example")
+    d = sr._parse_flat_config(example)
+    assert d["SERVER_HOST"] == "dest-host"      # inline comment stripped
+    assert d["SSH_PORT"] == "22"
+    assert d["SERVER_USER"] == "snappersend"
+    assert d["RECV_BASE"] == "/srv/snapshots-recv"
+    assert d["USE_MBUFFER"] == "yes"
+    assert d["SUBVOLUMES"] == "root:/ home:/home bootmirror:/.bootmirror"
+    assert d["TIMELINE_LIMIT_DAILY"] == "14"
+    assert d["ROOT_TIMELINE_LIMIT_DAILY"] == "30"
+
+
+def test_parse_flat_config_edge_cases(tmp_path):
+    p = tmp_path / "cfg"
+    p.write_text(
+        "# a full-line comment\n"
+        "\n"
+        'SERVER_HOST="10.0.0.9"   # inline comment after quoted value\n'
+        "EMPTY=\n"                              # empty value must not crash
+        'QUOTED_EMPTY=""\n'
+        'HASHVAL="a#b"\n'                       # hash inside quotes preserved
+        "SPACED = value here\n"                 # spaces around '='
+        "UNQUOTED=plain # trailing comment\n"   # inline comment on unquoted value
+        'EQVAL="a=b=c"\n'                       # '=' inside the value
+        "NAKED\n"                               # no '=' -> skipped
+        "BAD-KEY=1\n"                           # non-identifier key -> skipped
+        'DUP="first"\n'
+        'DUP="second"\n')                       # last assignment wins
+    d = sr._parse_flat_config(str(p))
+    assert d["SERVER_HOST"] == "10.0.0.9"
+    assert d["EMPTY"] == ""
+    assert d["QUOTED_EMPTY"] == ""
+    assert d["HASHVAL"] == "a#b"
+    assert d["SPACED"] == "value here"
+    assert d["UNQUOTED"] == "plain"
+    assert d["EQVAL"] == "a=b=c"
+    assert "NAKED" not in d
+    assert "BAD-KEY" not in d
+    assert d["DUP"] == "second"
+
+
+def test_parse_flat_config_unterminated_quote_keeps_key(tmp_path):
+    # A DR must not silently lose SERVER_HOST to a stray quote typo.
+    p = tmp_path / "cfg"
+    p.write_text('SERVER_HOST="10.0.0.9\n')     # missing closing quote
+    d = sr._parse_flat_config(str(p))
+    assert d["SERVER_HOST"] == "10.0.0.9"
+
+
 # --- transport config: the snappersend file is read for transport keys ONLY --
 
 def test_transport_config_reads_subset_of_snappersend_config(tmp_path):
@@ -380,16 +444,21 @@ def test_transport_config_reads_subset_of_snappersend_config(tmp_path):
 
 
 def test_cli_parses():
-    a = sr.build_parser().parse_args(["--plan"])
-    assert a.plan is True
+    a = sr.build_parser().parse_args(["--dry-run"])
+    assert a.dry_run is True
     a = sr.build_parser().parse_args([
         "--disk", "/dev/nvme0n1", "--esp-size", "1GiB",
         "--boot-size", "1GiB", "--swap-size", "4g", "--ssh-key", "/x/key",
         "--server", "10.0.0.1", "--snapshot", "20260703-140008+1000"])
     assert a.disk == "/dev/nvme0n1" and a.esp_size == "1GiB"
     assert a.ssh_key == "/x/key" and a.snapshot == "20260703-140008+1000"
-    a = sr.build_parser().parse_args(["--config", "/tmp/c", "--plan"])
+    a = sr.build_parser().parse_args(["--config", "/tmp/c", "--dry-run"])
     assert a.config == "/tmp/c"
+    # password / own-login flags
+    a = sr.build_parser().parse_args(["--login", "james", "--server", "d"])
+    assert a.login == "james" and a.password is False
+    a = sr.build_parser().parse_args(["--password"])
+    assert a.password is True
 
 
 def test_crypttab_initramfs_option_injection():

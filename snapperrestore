@@ -56,6 +56,7 @@ import argparse
 import atexit
 import base64
 import contextlib
+import getpass
 import os
 import re
 import shlex
@@ -138,16 +139,23 @@ def log_debug(m: str) -> None:
 # SHELL + SSH TRANSPORT  (kept in sync with snappersend)
 # ============================================================================
 
-def run_local(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def run_local(argv: list[str], *, check: bool = True,
+              input_text: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run a local command, capturing output. Missing executables degrade to a
-    rc=127 CompletedProcess when check=False."""
+    rc=127 CompletedProcess when check=False. `input_text`, when given, is fed on
+    stdin (the password-mode `sudo -S` path); otherwise stdin is DEVNULL."""
     log_debug("local: " + " ".join(shlex.quote(a) for a in argv))
     try:
         # stdin=DEVNULL: a captured command must never read the terminal/pipe —
         # ssh in particular drains inherited stdin into its channel, which would
-        # eat input meant for the wizard's own prompts.
-        cp = subprocess.run(argv, check=False, capture_output=True, text=True,
-                            stdin=subprocess.DEVNULL)
+        # eat input meant for the wizard's own prompts. The exception is an
+        # explicit `input_text` (a sudo password for `sudo -S`).
+        if input_text is not None:
+            cp = subprocess.run(argv, check=False, capture_output=True, text=True,
+                                input=input_text)
+        else:
+            cp = subprocess.run(argv, check=False, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
     except FileNotFoundError as e:
         if check:
             raise
@@ -194,17 +202,107 @@ def _cleanup_ssh_masters() -> None:
 
 
 def ssh_argv(cfg: Config, remote_cmd: str) -> list[str]:
-    return [
-        "ssh", "-i", cfg.ssh_key, "-p", str(cfg.server_ssh_port),
-        "-o", "BatchMode=yes",
-        *_ssh_control_opts(),
-        f"{cfg.server_user}@{cfg.server_host}",
-        remote_cmd,
-    ]
+    """The ssh argv for a non-interactive remote command. Two auth modes:
+
+    - key (the default transport): `-i <key>` + BatchMode — the dedicated
+      transport user, no prompts ever.
+    - password (own-login recovery): no key, password auth only. The one
+      interactive password is typed into the ControlMaster (see
+      `_open_ssh_master`); every command here rides that socket, so it never
+      prompts. accept-new pins the host on first contact (the master does the
+      real accepting)."""
+    argv = ["ssh"]
+    if cfg.auth_mode == "password":
+        argv += ["-o", "PubkeyAuthentication=no",
+                 "-o", "PreferredAuthentications=password",
+                 "-o", "StrictHostKeyChecking=accept-new"]
+    else:
+        argv += ["-i", cfg.ssh_key, "-o", "BatchMode=yes"]
+    argv += ["-p", str(cfg.server_ssh_port),
+             *_ssh_control_opts(),
+             f"{cfg.server_user}@{cfg.server_host}",
+             remote_cmd]
+    return argv
 
 
 def run_remote(cfg: Config, remote_cmd: str, *, check: bool = True):
     return run_local(ssh_argv(cfg, remote_cmd), check=check)
+
+
+# --- password-mode login (ControlMaster) + remote sudo -----------------------
+# In password mode the operator logs in as themselves (an ordinary admin, e.g.
+# `james`) — no dedicated user, no key, no provisioning. The password is typed
+# ONCE into a ControlMaster; every later command multiplexes over that socket.
+# An ordinary admin also has no NOPASSWD sudo grant, so remote root commands go
+# through `sudo -S` with the sudo password fed on stdin. Both passwords live in
+# memory only, never written anywhere.
+_SUDO_PASSWORD: Optional[str] = None
+
+
+def _open_ssh_master(cfg: Config) -> None:
+    """Open the password-mode ControlMaster once, terminal inherited so the
+    operator types their login password a single time. Every subsequent
+    `run_remote` (discovery ls/cat, the receive `btrfs send`) reuses this socket
+    with no further prompt. Raises RestoreError if the login fails."""
+    _ssh_control_opts()                      # ensure the socket dir + atexit hook
+    argv = ["ssh",
+            "-o", "ControlMaster=yes",
+            "-o", f"ControlPath={_SSH_CONTROL_DIR}/%C",
+            "-o", "ControlPersist=600",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PreferredAuthentications=password",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", str(cfg.server_ssh_port),
+            f"{cfg.server_user}@{cfg.server_host}", "true"]
+    log_debug("master: " + " ".join(shlex.quote(a) for a in argv))
+    print(f"\nLogging in to {cfg.server_user}@{cfg.server_host} — "
+          "enter your password when prompted.")
+    try:
+        cp = subprocess.run(argv)            # terminal inherited: ssh prompts
+    except FileNotFoundError as e:
+        raise RestoreError(f"ssh not found: {e}")
+    if cp.returncode != 0:
+        raise RestoreError(f"login to {cfg.server_user}@{cfg.server_host} failed "
+                           "(wrong password, or password auth disabled on the server)")
+
+
+def _ensure_sudo_password(cfg: Config) -> None:
+    """Prompt once (getpass) for the remote sudo password in password mode and
+    cache it in memory. Key mode never calls this (NOPASSWD)."""
+    global _SUDO_PASSWORD
+    if cfg.auth_mode != "password" or _SUDO_PASSWORD is not None:
+        return
+    try:
+        _SUDO_PASSWORD = getpass.getpass(
+            f"[sudo] password for {cfg.server_user}@{cfg.server_host} "
+            "(usually the same as your login): ")
+    except EOFError:
+        _SUDO_PASSWORD = ""
+
+
+def _sudo_send_source(cfg: Config, remote_cmd: str):
+    """(ssh argv, stdin text) for a `sudo <remote_cmd>` PRODUCER feeding
+    `_run_pipe` (the receive `btrfs send`). Key mode: plain `sudo`, no stdin.
+    Password mode: `sudo -S -p ''` with the sudo password on stdin — the pipe's
+    first stage reads that one line, then `btrfs send` streams to stdout."""
+    if cfg.auth_mode == "password":
+        _ensure_sudo_password(cfg)
+        return (ssh_argv(cfg, f"sudo -S -p '' {remote_cmd}"),
+                (_SUDO_PASSWORD or "") + "\n")
+    return ssh_argv(cfg, f"sudo {remote_cmd}"), None
+
+
+def run_remote_sudo(cfg: Config, remote_cmd: str, *, check: bool = True):
+    """Run `remote_cmd` as root on the destination, auth-mode aware. All of
+    restore's remote root commands (ls, the transport probe) funnel through
+    here so password mode's `sudo -S` and key mode's NOPASSWD both work. Key
+    mode routes through `run_remote` (shared with the forward transport); only
+    password mode needs the direct stdin-fed path."""
+    if cfg.auth_mode == "password":
+        _ensure_sudo_password(cfg)
+        return run_local(ssh_argv(cfg, f"sudo -S -p '' {remote_cmd}"),
+                         check=check, input_text=(_SUDO_PASSWORD or "") + "\n")
+    return run_remote(cfg, f"sudo {remote_cmd}", check=check)
 
 
 class RemoteUnreachable(Exception):
@@ -247,18 +345,47 @@ class Config:
     ssh_key: str = "/etc/snappersend/ssh/id_ed25519"
     recv_base: str = "/srv/snapshots-recv"
     use_mbuffer: bool = True
+    # "key": dedicated transport user + key + NOPASSWD sudo (unchanged default).
+    # "password": operator's own admin login (no key/user provisioning); the
+    # login rides a ControlMaster and remote root uses `sudo -S`.
+    auth_mode: str = "key"
+
+
+def _parse_flat_config(path):
+    """Parse snapper/snappersend-shaped KEY="value" lines. Pure stdlib — a live
+    ISO has no python3-dotenv. Full-line and inline comments handled; one layer
+    of matching quotes stripped; hashes inside quotes preserved; empty values
+    OK; last assignment wins. Lenient on an unterminated quote (keeps the value
+    rather than dropping the key — a typo must not lose SERVER_HOST in a DR)."""
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if not key or not key.replace("_", "").isalnum():
+                continue
+            if val and val[0] in ("\"", "'"):
+                q = val[0]
+                end = val.find(q, 1)
+                val = val[1:end] if end > 0 else val[1:]
+            else:
+                val = val.split("#", 1)[0].strip()
+            out[key] = val
+    return out
 
 
 def load_config(path: str = "/etc/snappersend/config") -> dict:
     """Parse the transport keys out of snappersend's flat config into kwargs
-    for Config (python-dotenv — tolerant of a Snapper-shaped file). Raises
-    FileNotFoundError if the file is absent and KeyError only if SERVER_HOST
-    (the one required key) is missing."""
-    from dotenv import dotenv_values
-
+    for Config (pure-stdlib _parse_flat_config — tolerant of a Snapper-shaped
+    file). Raises FileNotFoundError if the file is absent and KeyError only if
+    SERVER_HOST (the one required key) is missing."""
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
-    d = dotenv_values(path)
+    d = _parse_flat_config(path)
 
     def s(key, default=None):
         v = d.get(key)
@@ -366,7 +493,8 @@ def _parse_mbuffer_summary(text: str) -> Optional[str]:
 
 
 def _run_pipe(send_argv, recv_argv, use_mbuffer,
-              names=("ssh send", "btrfs receive")) -> bool:
+              names=("ssh send", "btrfs receive"),
+              send_input: Optional[str] = None) -> bool:
     """
     Connect the producer -> [mbuffer ->] consumer and return True iff EVERY
     stage exits 0 (a failure in the sender must not be masked by a 0 from the
@@ -377,6 +505,11 @@ def _run_pipe(send_argv, recv_argv, use_mbuffer,
     When mbuffer is in the pipe it also writes its stats to a logfile (`-l`),
     and the end-of-run summary — stream size, duration, average rate — is
     logged at INFO in every mode, including `-q`.
+
+    `send_input` (password mode only) is a short string written to the producer's
+    stdin — the sudo password line for `sudo -S`. It fits the pipe buffer, so a
+    single write+close before the stages are waited on cannot deadlock; `btrfs
+    send` ignores the rest of stdin.
     """
     stages: list[tuple[str, list[str], bool]] = [(names[0], list(send_argv), True)]
     mb = bool(use_mbuffer) and shutil.which("mbuffer") is not None
@@ -403,11 +536,18 @@ def _run_pipe(send_argv, recv_argv, use_mbuffer,
             if errf is not None:
                 errfiles.append(errf)
             is_last = (i == len(stages) - 1)
+            # First stage: DEVNULL, never the inherited stdin — the ssh producer
+            # would drain the terminal/pipe the wizard reads. Exception: a
+            # password-mode sudo password (send_input) needs a real stdin pipe.
+            if prev_stdout is not None:
+                first_stdin = prev_stdout
+            elif send_input is not None:
+                first_stdin = subprocess.PIPE
+            else:
+                first_stdin = subprocess.DEVNULL
             p = subprocess.Popen(
                 argv,
-                # First stage: DEVNULL, never the inherited stdin — the ssh
-                # producer would drain the terminal/pipe the wizard reads.
-                stdin=(subprocess.DEVNULL if prev_stdout is None else prev_stdout),
+                stdin=first_stdin,
                 stdout=(subprocess.DEVNULL if is_last else subprocess.PIPE),
                 stderr=errf,
             )
@@ -415,6 +555,13 @@ def _run_pipe(send_argv, recv_argv, use_mbuffer,
                 prev_stdout.close()
             procs.append((name, p, errf))
             prev_stdout = p.stdout
+        # Feed the producer its sudo password (password mode). One short line
+        # into a fresh pipe buffer — write and close before waiting on any stage.
+        if send_input is not None and procs:
+            producer = procs[0][1]
+            with contextlib.suppress(Exception):
+                producer.stdin.write(send_input.encode())
+                producer.stdin.close()
     except (FileNotFoundError, OSError) as e:
         log_error(f"failed to start pipe: {e}")
         for _, p, _ef in procs:
@@ -759,7 +906,7 @@ def _pin_host_key(host: str, port: int) -> bool:
 def _verify_transport(cfg: Config):
     """Prove the transport end-to-end (host key + key auth + remote sudo) with an
     allowlisted `sudo ls` of RECV_BASE. Returns (ok, message)."""
-    cp = run_remote(cfg, f"sudo ls -1d {shlex.quote(cfg.recv_base)}", check=False)
+    cp = run_remote_sudo(cfg, f"ls -1d {shlex.quote(cfg.recv_base)}", check=False)
     if cp.returncode == 0 and cfg.recv_base in (cp.stdout or ""):
         return True, (f"{cfg.server_user}@{cfg.server_host} reachable, remote sudo OK, "
                       f"{cfg.recv_base} present")
@@ -817,16 +964,16 @@ def _ensure_config(path: str) -> bool:
         v = input(f"  {prompt} [{default}]: ").strip()
         return v or default
 
-    server_host = ask("Destination host (SERVER_HOST)", "")
+    server_host = ask("Backup server address", "")
     if not server_host:
-        print("SERVER_HOST is required", file=sys.stderr)
+        print("the backup server address is required", file=sys.stderr)
         return False
     text = _CONFIG_TEMPLATE.format(
         server_host=server_host,
         ssh_port=ask("SSH port", "22"),
-        server_user=ask("Transport user (SERVER_USER)", "snappersend"),
-        ssh_key=ask("Transport SSH key path", "/etc/snappersend/ssh/id_ed25519"),
-        recv_base=ask("Receive base on destination (btrfs)", "/srv/snapshots-recv"),
+        server_user=ask("Backup transport user", "snappersend"),
+        ssh_key=ask("Path to your backup key file", "/etc/snappersend/ssh/id_ed25519"),
+        recv_base=ask("Where backups live on the server", "/srv/snapshots-recv"),
     )
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -958,8 +1105,8 @@ def _must(argv: list[str], what: Optional[str] = None) -> subprocess.CompletedPr
 @dataclass
 class RestorePlan:
     """Everything derived from the backup + operator flags, computed BEFORE any
-    destructive step. --plan prints this and exits; the confirmation gate shows
-    it too."""
+    destructive step. --dry-run prints this and exits; the confirmation gate
+    shows it too."""
     host: str
     root_server_name: str
     chosen: dict                       # server subvol name -> snapshot label
@@ -1039,9 +1186,25 @@ def _restore_check_tools(plan: RestorePlan) -> None:
 
 # --- transport / discovery --------------------------------------------------
 
+_DEFAULT_SSH_KEY = "/etc/snappersend/ssh/id_ed25519"
+
+
+def _login_menu(host: str) -> str:
+    """The interactive login chooser shown on a bare, config-less run (the
+    stressed-operator entry point). Returns the raw choice string ('1'..'3')."""
+    print(f"\nHow do you want to log in to the backup server ({host})?")
+    print("  1) As yourself, with a password           (easiest — recommended)")
+    print("  2) With a backup key file you kept safe    (advanced)")
+    print("  3) Set up a fresh key over an admin login  (advanced)")
+    return _ask("Choice", "1").strip()
+
+
 def _restore_transport(args: argparse.Namespace) -> Config:
-    """Build the transport Config from config file + flags + prompts, bootstrap
-    the key if it's gone (total-loss case), and verify end-to-end."""
+    """Build the transport Config from config file + flags + prompts, pick a
+    login mode (password / key / setup-dest), authenticate, and verify
+    end-to-end. Password mode logs in as the operator over a ControlMaster; key
+    mode uses the dedicated transport user (and bootstraps a fresh key if it
+    died with the machine)."""
     kwargs: dict = {}
     if os.path.isfile(args.config):
         try:
@@ -1050,6 +1213,10 @@ def _restore_transport(args: argparse.Namespace) -> Config:
         except Exception as e:
             log_warn(f"could not read {args.config} ({e}); using flags/prompts")
             kwargs = {}
+    elif sys.stdin.isatty() and not getattr(args, "server", None):
+        # The live-ISO norm: no saved config. Reassure the operator and gather
+        # the essentials interactively rather than dead-ending.
+        print("\nNo saved settings — let's find your backup.")
     if getattr(args, "server", None):
         kwargs["server_host"] = args.server
     if getattr(args, "port", None):
@@ -1062,14 +1229,87 @@ def _restore_transport(args: argparse.Namespace) -> Config:
         kwargs["recv_base"] = args.recv_base
     if getattr(args, "no_mbuffer", False):
         kwargs["use_mbuffer"] = False
-    if not kwargs.get("server_host"):
-        host = _ask("Destination server host (SERVER_HOST)")
-        if not host:
-            raise RestoreError("a destination server is required (--server)")
-        kwargs["server_host"] = host
-    cfg = Config(**kwargs)
 
-    if not os.path.isfile(cfg.ssh_key):
+    # --- the backup server address ---
+    if not kwargs.get("server_host"):
+        host = _ask("Backup server address")
+        if not host:
+            raise RestoreError("the backup server address is required (--server)")
+        kwargs["server_host"] = host
+
+    # --- login mode: explicit flags win; a bare config-less interactive run
+    #     gets the menu; anything else falls back to the key transport ---
+    login_user = getattr(args, "login", None)
+    interactive = sys.stdin.isatty()
+    if getattr(args, "password", False) or login_user:
+        mode = "password"
+    elif getattr(args, "ssh_key", None):
+        mode = "key"
+    elif interactive and not os.path.isfile(args.config):
+        choice = _login_menu(kwargs["server_host"])
+        if choice == "2":
+            mode = "key"
+            kwargs["ssh_key"] = _ask("Path to your backup key file",
+                                     kwargs.get("ssh_key", _DEFAULT_SSH_KEY))
+        elif choice == "3":
+            mode = "setup"
+        else:
+            mode = "password"
+    else:
+        mode = "key"
+
+    if mode == "password":
+        cfg = _password_login(args, kwargs, login_user, interactive)
+    else:
+        cfg = _key_login(args, kwargs, force_setup=(mode == "setup"))
+
+    ok, msg = _verify_transport(cfg)
+    if not ok and cfg.auth_mode == "key":
+        # A fresh live environment has no pinned host key in /root/.ssh — pin it
+        # (as setup-dest would) and retry once before giving up. Password mode's
+        # host key was accepted when the master opened, so no pinning is needed.
+        _pin_host_key(cfg.server_host, cfg.server_ssh_port)
+        ok, msg = _verify_transport(cfg)
+    if not ok:
+        raise RestoreError(f"destination transport failed: {msg}")
+    log_ok(f"connected: {msg}")
+    return cfg
+
+
+def _password_login(args: argparse.Namespace, kwargs: dict,
+                    login_user: Optional[str], interactive: bool) -> Config:
+    """Own-login: log in as an ordinary admin (no dedicated user, no key). The
+    login password is typed once into a ControlMaster; remote root uses
+    `sudo -S`. server_user becomes the login user, not `snappersend`."""
+    if login_user:
+        kwargs["server_user"] = login_user
+    elif interactive:
+        # Default to the invoking admin ($SUDO_USER) — never `snappersend`, which
+        # is the KEY-mode transport user, not a human login.
+        default_user = os.environ.get("SUDO_USER") or None
+        u = _ask("Your username on the backup server", default_user)
+        if not u:
+            raise RestoreError("a username is required for password login "
+                               "(--login USER)")
+        kwargs["server_user"] = u
+    else:
+        raise RestoreError("password login needs a username (--login USER)")
+    kwargs["auth_mode"] = "password"
+    cfg = Config(**kwargs)
+    _open_ssh_master(cfg)          # operator types their login password once
+    _ensure_sudo_password(cfg)     # then the sudo password (default: same)
+    return cfg
+
+
+def _key_login(args: argparse.Namespace, kwargs: dict,
+               force_setup: bool = False) -> Config:
+    """Key transport: the dedicated user + private key + NOPASSWD sudo. If the
+    key is gone (total loss) — or the operator explicitly chose the setup-dest
+    menu option — provision a fresh key over their own admin login."""
+    kwargs["auth_mode"] = "key"
+    cfg = Config(**kwargs)
+    need_setup = force_setup
+    if not need_setup and not os.path.isfile(cfg.ssh_key):
         # Total loss: the transport private key died with the machine. Either the
         # operator has an offline copy (--ssh-key; keep one in a password manager)
         # or we bootstrap a fresh key via the embedded setup-dest flow.
@@ -1081,6 +1321,8 @@ def _restore_transport(args: argparse.Namespace) -> Config:
         if ans.lower() not in ("y", "yes"):
             raise RestoreError("no transport key — pass --ssh-key or run "
                                "`snappersend setup-dest admin@host` first")
+        need_setup = True
+    if need_setup:
         if _setup_dest(args.config) != 0:
             raise RestoreError("setup-dest bootstrap failed")
         kwargs = load_config(args.config)
@@ -1088,24 +1330,15 @@ def _restore_transport(args: argparse.Namespace) -> Config:
             kwargs["recv_base"] = args.recv_base
         if getattr(args, "no_mbuffer", False):
             kwargs["use_mbuffer"] = False
+        kwargs["auth_mode"] = "key"
         cfg = Config(**kwargs)
-
-    ok, msg = _verify_transport(cfg)
-    if not ok:
-        # A fresh live environment has no pinned host key in /root/.ssh — pin it
-        # (as setup-dest would) and retry once before giving up.
-        _pin_host_key(cfg.server_host, cfg.server_ssh_port)
-        ok, msg = _verify_transport(cfg)
-    if not ok:
-        raise RestoreError(f"destination transport failed: {msg}")
-    log_ok(f"connected: {msg}")
     return cfg
 
 
 def _remote_ls(cfg: Config, path: str) -> list[str]:
     """`sudo ls -1` on the destination; [] for a missing dir; RemoteUnreachable
     on a transport failure (a blip must abort cleanly, never look like 'empty')."""
-    cp = run_remote(cfg, f"sudo ls -1 {shlex.quote(path)}", check=False)
+    cp = run_remote_sudo(cfg, f"ls -1 {shlex.quote(path)}", check=False)
     if cp.returncode != 0:
         if _is_ssh_transport_failure(cp):
             raise RemoteUnreachable((cp.stderr or "").strip().splitlines()[-1]
@@ -1223,7 +1456,8 @@ def _restore_build_plan(args: argparse.Namespace, host: str, chosen: dict,
                         root_name: str, fstab_text: str, crypttab_text: str,
                         manifest_text: Optional[str]) -> RestorePlan:
     """Derive the full plan from the fetched templates. Pure computation — no
-    disk or network IO — so it is directly testable and --plan stays read-only."""
+    disk or network IO — so it is directly testable and --dry-run stays
+    read-only."""
     entries = parse_fstab_template(fstab_text)
     btrfs_entries = [e for e in entries if e.fstype == "btrfs" and e.subvol]
     root_entry = next((e for e in btrfs_entries if e.mountpoint == "/"), None)
@@ -1451,15 +1685,19 @@ def _restore_detect_resume(disk: str) -> bool:
 
 
 def _restore_confirm(disk: str, resume: bool) -> None:
+    """The single destructive gate: nothing above this point has written a byte.
+    The operator must type RESTORE (not y/yes — a deliberate, unambiguous word)
+    before the wipe begins. `--dry-run` never reaches here."""
     print()
     if resume:
         log_warn(f"RESUMING onto {disk}: completed steps are skipped; the rest "
                  "will write to it.")
     else:
         log_warn(f"TARGET DISK: {disk} — ALL DATA ON IT WILL BE DESTROYED.")
-    typed = _ask(f"Type the device path ({disk}) to confirm")
-    if typed != disk:
-        raise RestoreError("confirmation mismatch — aborted, nothing touched")
+    typed = _ask(f"This ERASES {disk}. Type RESTORE to continue, or Ctrl-C to stop")
+    if typed != "RESTORE":
+        raise RestoreError("not confirmed (RESTORE not typed) — aborted, "
+                           "nothing touched")
 
 
 # --- state file (resumability) -----------------------------------------------
@@ -1631,8 +1869,10 @@ def _restore_receive(cfg: Config, plan: RestorePlan, state: set) -> None:
         if os.path.isdir(staged):          # partial from a prior attempt
             run_local(["btrfs", "subvolume", "delete", staged], check=False)
         os.makedirs(stage, exist_ok=True)
-        ok = _run_pipe(ssh_argv(cfg, f"sudo btrfs send {shlex.quote(src)}"),
-                       ["btrfs", "receive", stage], cfg.use_mbuffer)
+        send_argv, send_input = _sudo_send_source(cfg,
+                                                  f"btrfs send {shlex.quote(src)}")
+        ok = _run_pipe(send_argv, ["btrfs", "receive", stage], cfg.use_mbuffer,
+                       send_input=send_input)
         received = show_local(staged)
         if not ok or received is None or not received.is_valid_received:
             run_local(["btrfs", "subvolume", "delete", staged], check=False)
@@ -2149,25 +2389,40 @@ def _restore_execute(cfg: Config, plan: RestorePlan, disk: str,
                      "re-run `sudo snapperrestore` and choose resume.")
 
 
+def _restore_banner(dry_run: bool) -> None:
+    """The bare-invocation greeting for a stressed operator: what this is, and
+    the promise that nothing is written until they type RESTORE."""
+    print("=" * 70)
+    print("snapperrestore — rebuild this machine from your backup server.")
+    if dry_run:
+        print("DRY RUN: I will connect and show the plan, but write NOTHING.")
+    else:
+        print("Nothing is written to any disk until you review the plan and")
+        print("type RESTORE to confirm. Ctrl-C stops safely at any prompt.")
+    print("=" * 70)
+
+
 def cmd_restore(args: argparse.Namespace) -> int:
     """The restore wizard. Order: preflight -> connect -> discover -> plan
-    (+gate; --plan stops here, read-only) -> partition -> LUKS -> mkfs ->
-    subvols -> receive -> nested -> No-COW/swap -> boot -> tables -> chroot ->
-    verify."""
-    plan_only = bool(getattr(args, "plan", False))
+    (--dry-run stops here, read-only) -> disk -> RESTORE gate -> partition ->
+    LUKS -> mkfs -> subvols -> receive -> nested -> No-COW/swap -> boot ->
+    tables -> chroot -> verify."""
+    dry_run = bool(getattr(args, "dry_run", False))
     if os.geteuid() != 0:
         print("restore must run as root. Try: sudo snapperrestore",
               file=sys.stderr)
         return 2
+    if sys.stdin.isatty():
+        _restore_banner(dry_run)
     log_step("snapperrestore"
-             + (" — PLAN ONLY (read-only rehearsal)" if plan_only else ""))
+             + (" — DRY RUN (read-only rehearsal, no writes)" if dry_run else ""))
     try:
-        if not plan_only:
+        if not dry_run:
             _restore_env_guard()
         cfg = _restore_transport(args)
         host, subvols, root_name = _restore_discover(cfg, args)
         chosen = _restore_choose_snapshots(subvols, root_name, args,
-                                           interactive=not plan_only)
+                                           interactive=not dry_run)
         snap_base = os.path.join(cfg.recv_base, host, root_name,
                                  chosen[root_name], "snapshot")
         log_info(f"fetching templates from {root_name}/{chosen[root_name]}")
@@ -2184,9 +2439,9 @@ def cmd_restore(args: argparse.Namespace) -> int:
         plan = _restore_build_plan(args, host, chosen, root_name, fstab_text,
                                    crypttab_text, manifest_text)
         _restore_print_plan(cfg, plan)
-        if plan_only:
-            log_ok("plan complete — nothing was written (re-run without --plan "
-                   "to execute)")
+        if dry_run:
+            log_ok("dry run complete — nothing was written (re-run without "
+                   "--dry-run to execute)")
             return 0
 
         _restore_check_tools(plan)
@@ -2216,10 +2471,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Bare-metal disaster recovery from a snappersend "
                     "destination's received snapshot tree (run from a live ISO).",
     )
-    p.add_argument("--plan", action="store_true",
+    p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="read-only rehearsal: connect, discover, fetch the "
-                        "templates and print the derived plan; performs zero "
-                        "writes")
+                        "templates and print the derived plan; guaranteed zero "
+                        "writes and no confirmation gate (a bare run instead "
+                        "prints the plan, then gates on typing RESTORE, then "
+                        "executes)")
     p.add_argument("--disk",
                    help="target disk to WIPE and rebuild (e.g. /dev/nvme0n1; "
                         "prompted with lsblk if omitted)")
@@ -2229,12 +2486,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snapshot",
                    help="snapshot label / epoch prefix to restore (default: "
                         "the newest epoch-matched set)")
-    p.add_argument("--server", help="destination server host (overrides config)")
-    p.add_argument("--port", type=int, help="destination SSH port")
-    p.add_argument("--user", help="transport user (default snappersend)")
+    p.add_argument("--server", help="backup server address (overrides config)")
+    p.add_argument("--port", type=int, help="server SSH port")
+    p.add_argument("--user", help="transport user for key mode (default "
+                                  "snappersend)")
+    p.add_argument("--login", metavar="USER",
+                   help="log in as yourself with a password (own-login "
+                        "recovery) as USER — no key, no dedicated user; implies "
+                        "--password")
+    p.add_argument("--password", action="store_true",
+                   help="log in with a password instead of a key (prompted for "
+                        "the username if --login is not given)")
     p.add_argument("--ssh-key", dest="ssh_key",
-                   help="transport private key (your offline copy after a "
-                        "total loss; default /etc/snappersend/ssh/id_ed25519)")
+                   help="backup key file to log in with (your offline copy "
+                        "after a total loss; default "
+                        "/etc/snappersend/ssh/id_ed25519)")
     p.add_argument("--recv-base", dest="recv_base",
                    help="receive base on the server (default /srv/snapshots-recv)")
     p.add_argument("--esp-size", default="512MiB",

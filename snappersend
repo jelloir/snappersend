@@ -268,22 +268,27 @@ def is_correlated(a: Subvol, b: Subvol) -> bool:
 
 
 # ============================================================================
-# CONFIG  (Snapper-schema-aligned, flat KEY="value" — parsed by python-dotenv)
+# CONFIG  (Snapper-schema-aligned, flat KEY="value" — parsed by _parse_flat_config)
 # ============================================================================
 # The retention block mirrors Snapper's own config: a flat KEY="value" file using
 # Snapper's TIMELINE_LIMIT_* names (incl. YEARLY), so a Snapper user reads it and
 # immediately understands it. Transport/layout keys live in the same flat file.
 #
-# WHY python-dotenv (python3-dotenv, Trixie main) and not configobj/configparser:
+# WHY a pure-stdlib parser (_parse_flat_config) and not python-dotenv/configobj/
+# configparser:
 #   * configparser (stdlib) requires a [section] header that Snapper files lack;
 #     synthesising one is a hack.
 #   * configobj parses flat files but RAISES on a duplicate key — a sharp edge
 #     against the goal of tolerantly reading a Snapper-shaped file.
-#   * python-dotenv is purpose-built for exactly KEY="value": it strips inline
-#     comments, tolerates spaces around '=', quoted values with spaces, empties,
-#     and malformed/duplicate lines (best-effort, never raises) — so a user can
-#     literally point snappersend at a Snapper config and the keys it doesn't use
-#     are ignored gracefully. Verified against the real /etc/snapper/configs/root.
+#   * python-dotenv did the job but is a THIRD-PARTY dep (python3-dotenv) absent
+#     from a live grml/rescue ISO — where snapperrestore has to read this very
+#     file. _parse_flat_config is ~15 lines of stdlib doing exactly KEY="value":
+#     it strips inline comments, tolerates spaces around '=', quoted values with
+#     spaces, empties, and malformed/duplicate lines (best-effort, never raises)
+#     — so a user can literally point snappersend at a Snapper config and the
+#     keys it doesn't use are ignored gracefully. The function is pinned
+#     byte-identical across both tools by the drift test (like _provision_script).
+#     Verified against the real /etc/snapper/configs/root.
 
 # Snapper-only keys snappersend deliberately IGNORES (documented; never an error):
 _SNAPPER_IGNORED_KEYS = (
@@ -391,9 +396,37 @@ def _tier_override(d: dict, prefix: str, default_keep: dict) -> Optional[dict]:
     return merged
 
 
+def _parse_flat_config(path):
+    """Parse snapper/snappersend-shaped KEY="value" lines. Pure stdlib — a live
+    ISO has no python3-dotenv. Full-line and inline comments handled; one layer
+    of matching quotes stripped; hashes inside quotes preserved; empty values
+    OK; last assignment wins. Lenient on an unterminated quote (keeps the value
+    rather than dropping the key — a typo must not lose SERVER_HOST in a DR)."""
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if not key or not key.replace("_", "").isalnum():
+                continue
+            if val and val[0] in ("\"", "'"):
+                q = val[0]
+                end = val.find(q, 1)
+                val = val[1:end] if end > 0 else val[1:]
+            else:
+                val = val.split("#", 1)[0].strip()
+            out[key] = val
+    return out
+
+
 def load_config(path: str = "/etc/snappersend/config") -> dict:
     """
-    Parse the flat KEY="value" config into kwargs for Config (python-dotenv).
+    Parse the flat KEY="value" config into kwargs for Config (pure-stdlib
+    _parse_flat_config).
 
     Retention uses Snapper's vocabulary: a bare TIMELINE_LIMIT_* set is the default
     policy for every subvol; an optional `<SUBVOL>_TIMELINE_LIMIT_*` (e.g.
@@ -401,11 +434,9 @@ def load_config(path: str = "/etc/snappersend/config") -> dict:
     present in the file are ignored without error. Raises FileNotFoundError if the
     file is absent and KeyError only if SERVER_HOST (the one required key) is missing.
     """
-    from dotenv import dotenv_values
-
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
-    d = dotenv_values(path)
+    d = _parse_flat_config(path)
 
     def s(key, default=None):
         v = d.get(key)
@@ -2356,7 +2387,7 @@ def main(argv: list[str]) -> int:
     except FileNotFoundError:
         log_error(f"config not found: {args.config}")
         return 2
-    except Exception as e:   # KeyError / ValueError / dotenv issues
+    except Exception as e:   # KeyError / ValueError / parse issues
         log_error(f"invalid config {args.config}: {e}")
         return 2
 

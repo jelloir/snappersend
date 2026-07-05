@@ -230,10 +230,10 @@ sudo snappersend --bootmirror-sync
 ## Configuration
 
 snappersend reads a flat `KEY="value"` file (default `/etc/snappersend/config`), the
-**same format as Snapper's own config files**, parsed by
-[`python-dotenv`](https://pypi.org/project/python-dotenv/) (`python3-dotenv`, in Debian
-main). The retention block uses Snapper's exact `TIMELINE_LIMIT_*` names — including
-`TIMELINE_LIMIT_YEARLY` — so a Snapper user reads it and immediately understands it.
+**same format as Snapper's own config files**, parsed by a small pure-stdlib parser
+(`_parse_flat_config`, no third-party dependency). The retention block uses Snapper's
+exact `TIMELINE_LIMIT_*` names — including `TIMELINE_LIMIT_YEARLY` — so a Snapper user
+reads it and immediately understands it.
 
 - **Honoured keys:** `SERVER_HOST` (required), `SSH_PORT`, `SERVER_USER`, `SSH_KEY`,
   `RECV_BASE`, `USE_MBUFFER`, `SUBVOLUMES`, `PARENT_TREE_BASE`, `PARENT_KEEP`,
@@ -248,12 +248,15 @@ main). The retention block uses Snapper's exact `TIMELINE_LIMIT_*` names — inc
 
 See `config.example` for an annotated starting point.
 
-> **Why python-dotenv** (not `configparser` or `configobj`): a Snapper config is a flat
-> `KEY="value"` file with no `[section]` header, so `configparser` can't read it without
-> a synthesised fake section. `configobj` can, but raises on a duplicate key.
-> `python-dotenv` is purpose-built for exactly this format and degrades gracefully on
-> malformed input — the right fit for "read a Snapper-shaped file tolerantly". It's the
-> one packaged dependency, and it's in Debian (Trixie) main.
+> **Why a hand-rolled parser** (not `configparser`, `configobj`, or `python-dotenv`): a
+> Snapper config is a flat `KEY="value"` file with no `[section]` header, so
+> `configparser` can't read it without a synthesised fake section, and `configobj` raises
+> on a duplicate key. `python-dotenv` handles the format well but is a third-party
+> dependency — and `snapperrestore` has to read this very file from a live rescue ISO
+> (grml), which ships no `python3-dotenv`. So both tools share `_parse_flat_config`: ~15
+> lines of stdlib that strip inline comments, tolerate spaces around `=`, quoted values,
+> empties, and malformed/duplicate lines without ever raising. It is pinned byte-identical
+> across the two scripts by the drift test, exactly like the destination provision script.
 
 ## CLI
 
@@ -335,7 +338,7 @@ which `snappersend setup-dest` writes for you over your own admin login.
 
 ```sh
 sudo install -m 0755 snappersend /usr/bin/snappersend
-sudo apt-get install -y python3-dotenv btrfs-progs openssh-client mbuffer rsync
+sudo apt-get install -y btrfs-progs openssh-client mbuffer rsync
 sudo install -d -m 0755 /etc/snappersend
 sudo cp -n config.example /etc/snappersend/config
 sudoedit /etc/snappersend/config     # set SERVER_HOST + SUBVOLUMES (setup-dest can also

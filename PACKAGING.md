@@ -57,7 +57,6 @@ Package: snappersend
 Architecture: all
 Depends: ${misc:Depends},
          python3,
-         python3-dotenv,
          btrfs-progs,
          openssh-client,
          rsync,

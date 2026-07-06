@@ -542,5 +542,63 @@ def test_epoch_matching_defaults_and_span_warning(monkeypatch):
     assert not any("SPAN EPOCHS" in w for w in warns)
 
 
+def test_reconstruct_nested_symlink_targets(monkeypatch, tmp_path):
+    """Dangling symlinks into a recreated-empty nested subvol get their target
+    dirs rebuilt (mkdir -p, chowned to the link's owner) — including targets
+    reached only VIA another symlink (the deep Brave CacheStorage case).
+    Healthy links and links pointing outside any nested root are untouched."""
+    import types
+    home = tmp_path / "@home" / "u"
+    nocow = home / ".nocow"          # stands in for the recreated-empty subvol
+    nocow.mkdir(parents=True)
+    # dangling: ~/.cache -> .nocow/cache
+    (home / ".cache").symlink_to(".nocow/cache")
+    # dangling, two hops + depth: resolves through ~/.cache into .nocow/cache
+    sw = home / ".config/BraveSoftware/Brave-Browser/Default/Service Worker"
+    sw.mkdir(parents=True)
+    (sw / "CacheStorage").symlink_to(
+        "../../../../../.cache/BraveSoftware/Brave-Browser/Default/CacheStorage")
+    # NOT dangling: target already exists — must be left alone
+    (nocow / "iso").mkdir()
+    (home / "ISO").symlink_to(".nocow/iso")
+    # dangling but OUTSIDE any nested root — must be left alone
+    (home / "stray").symlink_to("elsewhere/place")
+
+    monkeypatch.setattr(sr, "_RESTORE_TOP_MNT", str(tmp_path))
+    chowns = []
+    monkeypatch.setattr(sr.os, "chown",
+                        lambda path, uid, gid: chowns.append((path, uid, gid)))
+    plan = types.SimpleNamespace(
+        nested=[("@home", "u/.nocow", True)],
+        entries=[types.SimpleNamespace(fstype="btrfs", subvol="@home"),
+                 types.SimpleNamespace(fstype="btrfs", subvol=None),
+                 types.SimpleNamespace(fstype="ext4", subvol=None)])
+    sr._reconstruct_nested_symlink_targets(plan)
+
+    real_nocow = nocow.resolve()
+    assert (real_nocow / "cache").is_dir()
+    deep = real_nocow / "cache/BraveSoftware/Brave-Browser/Default/CacheStorage"
+    assert deep.is_dir()
+    # every created dir (leaf + intermediates up to, not past, the nested root)
+    # chowned to the link owner's uid/gid
+    st = os.lstat(home / ".cache")
+    chowned = {p for p, _, _ in chowns}
+    want = {str(deep)}
+    for parent in [deep.parent, deep.parent.parent, deep.parent.parent.parent,
+                   real_nocow / "cache"]:
+        want.add(str(parent))
+    assert want <= chowned
+    assert all(u == st.st_uid and g == st.st_gid for _, u, g in chowns)
+    assert str(real_nocow) not in chowned          # nested root itself untouched
+    # healthy link's target untouched, stray link still dangling, nothing made
+    assert (real_nocow / "iso").is_dir()
+    assert not (home / "elsewhere").exists()
+
+    # idempotent: a second pass (resumed restore) is a no-op
+    chowns.clear()
+    sr._reconstruct_nested_symlink_targets(plan)
+    assert chowns == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

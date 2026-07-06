@@ -1896,6 +1896,78 @@ def _restore_receive(cfg: Config, plan: RestorePlan, state: set) -> None:
         os.rmdir(stage_base)
 
 
+def _chown_tree_under(leaf: str, nested_roots: list, uid: int, gid: int) -> None:
+    """chown `leaf` and each parent up to (but not past) the enclosing nested
+    subvol root, so newly-minted intermediate dirs (e.g. BraveSoftware/…/
+    Default/) get the link owner's ownership; the nested root itself keeps the
+    ownership re-applied when it was recreated."""
+    stop = next((nr for nr in nested_roots
+                 if leaf == nr or leaf.startswith(nr + os.sep)), None)
+    if stop is None:
+        return
+    cur = leaf
+    while cur.startswith(stop + os.sep):
+        with contextlib.suppress(OSError):
+            os.chown(cur, uid, gid)
+        cur = os.path.dirname(cur)
+
+
+def _reconstruct_nested_symlink_targets(plan: RestorePlan) -> None:
+    """For each nested subvol just recreated empty, find symlinks anywhere in
+    the restored subvol trees whose resolved target falls INSIDE that nested
+    subvol, and mkdir -p the target (chowned to the symlink's owner). This
+    repopulates the directory skeleton apps expect (e.g. ~/.cache ->
+    .nocow/cache needs .nocow/cache to exist) without the backup ever having
+    carried those contents — otherwise the links ride in with the send stream
+    but dangle, and apps have nowhere to write. Derived from the links
+    themselves (not the manifest) so any layout self-heals; only targets
+    something links to can dangle. Idempotent: existing targets are skipped."""
+    # realpath, not normpath: a target may reach a nested root only VIA another
+    # symlink (…/Service Worker/CacheStorage -> ~/.cache/… -> .nocow/cache);
+    # non-strict realpath resolves existing link components and keeps the
+    # dangling tail lexical.
+    nested_roots = [os.path.realpath(os.path.join(_RESTORE_TOP_MNT, sv, rel))
+                    for sv, rel, _nocow in plan.nested]
+    if not nested_roots:
+        return
+    # @home is the usual home of these links, but scan every btrfs subvol tree
+    # so links at other levels are covered too.
+    scan_roots = {os.path.realpath(os.path.join(_RESTORE_TOP_MNT, e.subvol))
+                  for e in plan.entries if e.fstype == "btrfs" and e.subvol}
+    made = 0
+    for root in sorted(scan_roots):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            # don't descend INTO a nested subvol (its contents aren't ours)
+            dirnames[:] = [d for d in dirnames
+                           if os.path.join(dirpath, d) not in nested_roots]
+            for name in filenames + dirnames:
+                p = os.path.join(dirpath, name)
+                if not os.path.islink(p):
+                    continue
+                # resolve the target relative to the link's own directory
+                tgt = os.path.realpath(os.path.join(dirpath, os.readlink(p)))
+                if not any(tgt == nr or tgt.startswith(nr + os.sep)
+                           for nr in nested_roots):
+                    continue
+                if os.path.exists(tgt):
+                    continue
+                try:
+                    st = os.lstat(p)             # the symlink's own ownership
+                    os.makedirs(tgt, exist_ok=True)
+                    _chown_tree_under(tgt, nested_roots, st.st_uid, st.st_gid)
+                    made += 1
+                    log_ok(f"  reconstructed {tgt} for dangling link {p}")
+                except OSError as e:
+                    log_warn(f"  could not reconstruct {tgt} ({e})")
+    if made:
+        log_info(f"  reconstructed {made} nested symlink target dir(s) "
+                 "(empty — apps refill them)")
+    else:
+        log_info("  no dangling nested symlink targets to reconstruct")
+
+
 def _restore_nested(plan: RestorePlan, state: set) -> None:
     """Recreate nested subvolumes from the manifest at their recorded paths.
     btrfs send emitted each as an EMPTY DIRECTORY in the received tree — its
@@ -1936,6 +2008,8 @@ def _restore_nested(plan: RestorePlan, state: set) -> None:
                       check=False)
         log_ok(f"  {sv}/{rel} recreated empty (by design — contents are not in "
                "the backup)" + ("  [No-COW]" if nocow else ""))
+
+    _reconstruct_nested_symlink_targets(plan)
 
     # Scrub stale parent-tree remnants inside the restored root: the send stream
     # turned each old clone into a plain `<label>/snapshot` DIRECTORY, and a
